@@ -8,6 +8,7 @@ Copyright 2022 The Microsoft DeepSpeed Team
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <cassert>

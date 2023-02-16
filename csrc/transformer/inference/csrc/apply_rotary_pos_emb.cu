@@ -57,6 +57,52 @@ __global__ void apply_rotary_pos_emb(float* mixed_query,
     }
 }
 
+__global__ void apply_rotary_pos_emb(__nv_bfloat16* mixed_query,
+                                     __nv_bfloat16* key_layer,
+                                     unsigned rotary_dim,
+                                     unsigned seq_len,
+                                     unsigned seq_offset,
+                                     unsigned num_heads,
+                                     unsigned head_size,
+                                     unsigned total_count,
+                                     int max_out_tokens)
+{
+    cg::thread_block b = cg::this_thread_block();
+    cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
+
+    int id = threadIdx.x;
+    int gid = id >> 5;
+    int lane = id & 0x1f;
+
+    unsigned head_id = blockIdx.x * MAX_WARP_NUM + gid;
+    unsigned offset = head_id * head_size;
+
+    unsigned seq_id = (head_id / num_heads) % seq_len + seq_offset;
+    unsigned seq_index = head_id % seq_len;
+    unsigned k_offset = (seq_index + (head_id / seq_len) * max_out_tokens) * head_size;
+
+    if (head_id < total_count) {
+        while (lane < rotary_dim) {
+            float inv_freq = (float)((lane / 2) * 2) / (float)rotary_dim;
+            inv_freq = 1.0 / powf(10000.0, inv_freq) * (float)seq_id;
+            float q = __bfloat162float(mixed_query[offset + lane]);
+            float k = __bfloat162float(key_layer[k_offset + lane]);
+            float rotary_sign = (lane % 2 == 1 ? -1.0 : 1.0);
+            float q_rot = (q * rotary_sign);
+            float k_rot = (k * rotary_sign);
+            q_rot = g.shfl_xor(q_rot, 1);
+            k_rot = g.shfl_xor(k_rot, 1);
+            q = q * cosf(inv_freq) + q_rot * sinf(inv_freq);
+            k = k * cosf(inv_freq) + k_rot * sinf(inv_freq);
+
+            mixed_query[offset + lane] = __float2bfloat16(q);
+            key_layer[k_offset + lane] = __float2bfloat16(k);
+
+            lane += WARP_SIZE;
+        }
+    }
+}
+
 __global__ void apply_rotary_pos_emb(__half* mixed_query,
                                      __half* key_layer,
                                      unsigned rotary_dim,
@@ -102,6 +148,7 @@ __global__ void apply_rotary_pos_emb(__half* mixed_query,
         }
     }
 }
+
 __global__ void apply_rotary_pos_emb1(float* mixed_query,
                                       float* key_layer,
                                       unsigned rotary_dim,
@@ -147,6 +194,64 @@ __global__ void apply_rotary_pos_emb1(float* mixed_query,
         }
     }
 }
+
+__global__ void apply_rotary_pos_emb1(__nv_bfloat16* mixed_query,
+                                      __nv_bfloat16* key_layer,
+                                      unsigned rotary_dim,
+                                      unsigned seq_len,
+                                      unsigned seq_offset,
+                                      unsigned num_heads,
+                                      unsigned head_size,
+                                      unsigned total_count,
+                                      int max_out_tokens)
+{
+    cg::thread_block b = cg::this_thread_block();
+    cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
+
+    int id = threadIdx.x;
+    int gid = id >> 5;
+    int lane = id & 0x1f;
+
+    unsigned head_id = blockIdx.x * MAX_WARP_NUM + gid;
+    unsigned seq_index = head_id % seq_len;
+    unsigned offset = head_id * head_size;
+    unsigned k_offset = (seq_index + (head_id / seq_len) * max_out_tokens) * head_size;
+
+    constexpr unsigned mask[32] = {
+        0x1 | 0x1000,     0x2 | 0x2000,     0x4 | 0x4000,     0x8 | 0x8000,     0x10 | 0x10000,
+        0x20 | 0x20000,   0x40 | 0x40000,   0x80 | 0x80000,   0x100 | 0x100000, 0x200 | 0x200000,
+        0x400 | 0x400000, 0x800 | 0x800000, 0x1000 | 0x1,     0x2000 | 0x2,     0x4000 | 0x4,
+        0x8000 | 0x8,     0x10000 | 0x10,   0x20000 | 0x20,   0x40000 | 0x40,   0x80000 | 0x80,
+        0x100000 | 0x100, 0x200000 | 0x200, 0x400000 | 0x400, 0x800000 | 0x800, 0x1000000,
+        0x2000000,        0x4000000,        0x8000000,        0x10000000,       0x20000000,
+        0x40000000,       0x80000000};
+
+    unsigned seq_id = (head_id / num_heads) % seq_len + seq_offset;
+    unsigned half_dim = rotary_dim >> 1;
+    if (head_id < total_count) {
+        while (lane < rotary_dim) {
+            float inv_freq = (float)((lane % half_dim) * 2) / (float)rotary_dim;
+            inv_freq = 1.0 / powf(10000.0, inv_freq) * (float)seq_id;
+            float q = __bfloat162float(mixed_query[offset + lane]);
+            float k = __bfloat162float(key_layer[k_offset + lane]);
+            float rotary_sign = (lane > (half_dim - 1) ? -1.0 : 1.0);
+            float q_rot = (q * rotary_sign);
+            float k_rot = (k * rotary_sign);
+            auto q_rot_tmp = lane < half_dim ? __shfl_sync(mask[lane], q_rot, lane + half_dim)
+                                             : __shfl_sync(mask[lane], q_rot, lane - half_dim);
+            auto k_rot_tmp = lane < half_dim ? __shfl_sync(mask[lane], k_rot, lane + half_dim)
+                                             : __shfl_sync(mask[lane], k_rot, lane - half_dim);
+            q = q * cosf(inv_freq) + q_rot_tmp * sinf(inv_freq);
+            k = k * cosf(inv_freq) + k_rot_tmp * sinf(inv_freq);
+
+            mixed_query[offset + lane] = __float2bfloat16(q);
+            key_layer[k_offset + lane] = __float2bfloat16(k);
+
+            lane += WARP_SIZE;
+        }
+    }
+}
+
 __global__ void apply_rotary_pos_emb1(__half* mixed_query,
                                       __half* key_layer,
                                       unsigned rotary_dim,
@@ -255,6 +360,18 @@ template void launch_apply_rotary_pos_emb<float>(float*,
                                                  bool,
                                                  cudaStream_t,
                                                  int);
+template void launch_apply_rotary_pos_emb<__nv_bfloat16>(__nv_bfloat16*,
+                                                         __nv_bfloat16*,
+                                                         unsigned,
+                                                         unsigned,
+                                                         unsigned,
+                                                         unsigned,
+                                                         unsigned,
+                                                         unsigned,
+                                                         bool,
+                                                         bool,
+                                                         cudaStream_t,
+                                                         int);
 template void launch_apply_rotary_pos_emb<__half>(__half*,
                                                   __half*,
                                                   unsigned,
