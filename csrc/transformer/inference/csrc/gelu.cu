@@ -65,6 +65,11 @@ void launch_bias_gelu(T* input,
 }
 
 template void launch_bias_gelu<float>(float*, const float*, int, int, cudaStream_t);
+template void launch_bias_gelu<__nv_bfloat16>(__nv_bfloat16*,
+                                              const __nv_bfloat16*,
+                                              int,
+                                              int,
+                                              cudaStream_t);
 template void launch_bias_gelu<__half>(__half*, const __half*, int, int, cudaStream_t);
 
 /*
@@ -115,6 +120,11 @@ void launch_bias_add(T* input,
 }
 
 template void launch_bias_add<float>(float*, const float*, int, int, cudaStream_t);
+template void launch_bias_add<__nv_bfloat16>(__nv_bfloat16*,
+                                             const __nv_bfloat16*,
+                                             int,
+                                             int,
+                                             cudaStream_t);
 template void launch_bias_add<__half>(__half*, const __half*, int, int, cudaStream_t);
 
 __global__ void fused_bias_residual(float* residual,
@@ -159,6 +169,77 @@ __global__ void fused_bias_residual(float* residual,
             res_fl4.w = res_fl4.w + hs_fl4.w + bias_fl4.w;
         }
         res_fl4_ptr[offset] = res_fl4;
+    }
+}
+
+__global__ void fused_bias_residual(__nv_bfloat16* residual,
+                                    const __nv_bfloat16* hidden_state,
+                                    const __nv_bfloat16* attn,
+                                    const __nv_bfloat16* bias,
+                                    const __nv_bfloat16* attn_bias,
+                                    const int total_count,
+                                    const int intermediate_size,
+                                    const float mp_scale,
+                                    const bool preln)
+{
+    float2* res_fl2_ptr = reinterpret_cast<float2*>(residual);
+    const float2* hs_fl2_ptr = reinterpret_cast<const float2*>(hidden_state);
+    const float2* attn_fl2_ptr = reinterpret_cast<const float2*>(attn);
+    const float2* bias_fl2_ptr = reinterpret_cast<const float2*>(bias);
+    const float2* attn_bias_fl2_ptr = reinterpret_cast<const float2*>(attn_bias);
+    const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (offset < total_count) {
+        float2 res_fl2 = res_fl2_ptr[offset];
+        const float2 hs_fl2 = hs_fl2_ptr[offset];
+        const float2 attn_fl2 = attn_fl2_ptr[offset];
+        const float2 bias_fl2 = bias_fl2_ptr[offset % intermediate_size];
+        const float2 attn_bias_fl2 = attn_bias_fl2_ptr[offset % intermediate_size];
+
+        __nv_bfloat162* res_half2 = reinterpret_cast<__nv_bfloat162*>(&res_fl2);
+        const __nv_bfloat162* hs_half2 = reinterpret_cast<const __nv_bfloat162*>(&hs_fl2);
+        const __nv_bfloat162* attn_half2 = reinterpret_cast<const __nv_bfloat162*>(&attn_fl2);
+        const __nv_bfloat162* bias_half2 = reinterpret_cast<const __nv_bfloat162*>(&bias_fl2);
+        const __nv_bfloat162* attn_bias_half2 =
+            reinterpret_cast<const __nv_bfloat162*>(&attn_bias_fl2);
+
+        float2 res_low = __bfloat1622float2(res_half2[0]);
+        float2 res_high = __bfloat1622float2(res_half2[1]);
+
+        const float2 hs_low = __bfloat1622float2(hs_half2[0]);
+        const float2 hs_high = __bfloat1622float2(hs_half2[1]);
+
+        const float2 attn_low = __bfloat1622float2(attn_half2[0]);
+        const float2 attn_high = __bfloat1622float2(attn_half2[1]);
+
+        const float2 bias_low = __bfloat1622float2(bias_half2[0]);
+        const float2 bias_high = __bfloat1622float2(bias_half2[1]);
+
+        const float2 attn_bias_low = __bfloat1622float2(attn_bias_half2[0]);
+        const float2 attn_bias_high = __bfloat1622float2(attn_bias_half2[1]);
+
+        if (preln) {
+            // residual = (residual + attention + bias + attention_bias) *
+            // mp_scale + hidden_state
+            res_low.x =
+                (res_low.x + attn_low.x + bias_low.x + attn_bias_low.x) * mp_scale + hs_low.x;
+            res_low.y =
+                (res_low.y + attn_low.y + bias_low.y + attn_bias_low.y) * mp_scale + hs_low.y;
+            res_high.x =
+                (res_high.x + attn_high.x + bias_high.x + attn_bias_high.x) * mp_scale + hs_high.x;
+            res_high.y =
+                (res_high.y + attn_high.y + bias_high.y + attn_bias_high.y) * mp_scale + hs_high.y;
+        } else {
+            // residual += hidden_state + bias
+            res_low.x = (res_low.x + hs_low.x + bias_low.x);
+            res_low.y = (res_low.y + hs_low.y + bias_low.y);
+            res_high.x = (res_high.x + hs_high.x + bias_high.x);
+            res_high.y = (res_high.y + hs_high.y + bias_high.y);
+        }
+        res_half2[0] = __float22bfloat162_rn(res_low);
+        res_half2[1] = __float22bfloat162_rn(res_high);
+
+        res_fl2_ptr[offset] = res_fl2;
     }
 }
 
@@ -261,6 +342,16 @@ void launch_bias_residual(T* residual,
 
 template void launch_bias_residual<
     float>(float*, float*, float*, float*, float*, int, int, int, bool, cudaStream_t);
+template void launch_bias_residual<__nv_bfloat16>(__nv_bfloat16*,
+                                                  __nv_bfloat16*,
+                                                  __nv_bfloat16*,
+                                                  __nv_bfloat16*,
+                                                  __nv_bfloat16*,
+                                                  int,
+                                                  int,
+                                                  int,
+                                                  bool,
+                                                  cudaStream_t);
 template void launch_bias_residual<
     __half>(__half*, __half*, __half*, __half*, __half*, int, int, int, bool, cudaStream_t);
 
@@ -301,6 +392,70 @@ __global__ void gptj_residual_add(float* residual,
         res_fl4.w = hs_fl4.w + attn_fl4.w + (res_fl4.w + bias_fl4.w) * mp_scale;
 
         res_fl4_ptr[offset] = res_fl4;
+    }
+}
+
+__global__ void gptj_residual_add(__nv_bfloat16* residual,
+                                  const __nv_bfloat16* hidden_state,
+                                  const __nv_bfloat16* attn,
+                                  const __nv_bfloat16* bias,
+                                  const __nv_bfloat16* attn_bias,
+                                  const int total_count,
+                                  const int intermediate_size,
+                                  const float mp_scale)
+{
+    float2* res_fl2_ptr = reinterpret_cast<float2*>(residual);
+    const float2* hs_fl2_ptr = reinterpret_cast<const float2*>(hidden_state);
+    const float2* attn_fl2_ptr = reinterpret_cast<const float2*>(attn);
+    const float2* bias_fl2_ptr = reinterpret_cast<const float2*>(bias);
+    const float2* attn_bias_fl2_ptr = reinterpret_cast<const float2*>(attn_bias);
+    const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (offset < total_count) {
+        float2 res_fl2 = res_fl2_ptr[offset];
+        const float2 hs_fl2 = hs_fl2_ptr[offset];
+        const float2 attn_fl2 = attn_fl2_ptr[offset];
+        const float2 bias_fl2 = bias_fl2_ptr[offset % intermediate_size];
+
+        __nv_bfloat162* res_half2 = reinterpret_cast<__nv_bfloat162*>(&res_fl2);
+        const __nv_bfloat162* hs_half2 = reinterpret_cast<const __nv_bfloat162*>(&hs_fl2);
+        const __nv_bfloat162* attn_half2 = reinterpret_cast<const __nv_bfloat162*>(&attn_fl2);
+        const __nv_bfloat162* bias_half2 = reinterpret_cast<const __nv_bfloat162*>(&bias_fl2);
+
+        float2 res_low = __bfloat1622float2(res_half2[0]);
+        float2 res_high = __bfloat1622float2(res_half2[1]);
+
+        const float2 hs_low = __bfloat1622float2(hs_half2[0]);
+        const float2 hs_high = __bfloat1622float2(hs_half2[1]);
+
+        const float2 attn_low = __bfloat1622float2(attn_half2[0]);
+        const float2 attn_high = __bfloat1622float2(attn_half2[1]);
+
+        const float2 bias_low = __bfloat1622float2(bias_half2[0]);
+        const float2 bias_high = __bfloat1622float2(bias_half2[1]);
+
+        if (attn_bias) {
+            const float2 attn_bias_fl2 = attn_bias_fl2_ptr[offset % intermediate_size];
+            const __nv_bfloat162* attn_bias_half2 =
+                reinterpret_cast<const __nv_bfloat162*>(&attn_bias_fl2);
+            const float2 attn_bias_low = __bfloat1622float2(attn_bias_half2[0]);
+            const float2 attn_bias_high = __bfloat1622float2(attn_bias_half2[1]);
+            // residual += attention_bias
+            res_low.x += attn_bias_low.x;
+            res_low.y += attn_bias_low.y;
+            res_high.x += attn_bias_high.x;
+            res_high.y += attn_bias_high.y;
+        }
+        // residual = hidden_state + attention + (residual + bias) * mp_scale
+        res_low.x = attn_low.x + hs_low.x + (res_low.x + bias_low.x) * mp_scale;
+        res_low.y = attn_low.y + hs_low.y + (res_low.y + bias_low.y) * mp_scale;
+        res_high.x = attn_high.x + hs_high.x + (res_high.x + bias_high.x) * mp_scale;
+        res_high.y = attn_high.y + hs_high.y + (res_high.y + bias_high.y) * mp_scale;
+
+        res_half2[0] = __float22bfloat162_rn(res_low);
+        res_half2[1] = __float22bfloat162_rn(res_high);
+
+        res_fl2_ptr[offset] = res_fl2;
     }
 }
 
@@ -395,6 +550,17 @@ template void launch_gptj_residual_add<float>(float*,
                                               int,
                                               int,
                                               cudaStream_t);
+
+template void launch_gptj_residual_add<__nv_bfloat16>(__nv_bfloat16*,
+                                                      __nv_bfloat16*,
+                                                      __nv_bfloat16*,
+                                                      __nv_bfloat16*,
+                                                      __nv_bfloat16*,
+                                                      int,
+                                                      int,
+                                                      int,
+                                                      cudaStream_t);
+
 template void launch_gptj_residual_add<__half>(__half*,
                                                __half*,
                                                __half*,
@@ -454,6 +620,14 @@ template void launch_moe_res_matmul(float* residual,
                                     int seq_len,
                                     int hidden_dim,
                                     cudaStream_t stream);
+
+template void launch_moe_res_matmul(__nv_bfloat16* residual,
+                                    __nv_bfloat16* coef,
+                                    __nv_bfloat16* mlp_out,
+                                    int seq_len,
+                                    int hidden_dim,
+                                    cudaStream_t stream);
+
 template void launch_moe_res_matmul(__half* residual,
                                     __half* coef,
                                     __half* mlp_out,
@@ -482,6 +656,29 @@ __global__ void pad_data_kernel(__half* padded_output,
     else
         padded_output_cast[idx] = ZERO;
 }
+
+__global__ void pad_data_kernel(__nv_bfloat16* padded_output,
+                                __nv_bfloat16* output,
+                                int head_size,
+                                int padded_head_size)
+{
+    float4* padded_output_cast = reinterpret_cast<float4*>(padded_output);
+    float4* output_cast = reinterpret_cast<float4*>(output);
+    int bid = blockIdx.x * (blockDim.y) + threadIdx.y;
+    int idx = threadIdx.x;
+    padded_output_cast += (bid * padded_head_size);
+    output_cast += (bid * head_size);
+    float4 ZERO;
+    const __nv_bfloat162 zero_h = __float2bfloat162_rn(0.f);
+    __nv_bfloat162* ZERO_h = reinterpret_cast<__nv_bfloat162*>(&ZERO);
+#pragma unroll
+    for (int i = 0; i < 4; i++) ZERO_h[i] = zero_h;
+    if (idx < head_size)
+        padded_output_cast[idx] = output_cast[idx];
+    else
+        padded_output_cast[idx] = ZERO;
+}
+
 __global__ void pad_data_kernel(float* padded_output,
                                 float* output,
                                 int head_size,
@@ -507,6 +704,14 @@ template void pad_data(__half* padded_output,
                        int head_size,
                        int padded_head_size,
                        cudaStream_t stream);
+
+template void pad_data(__nv_bfloat16* padded_output,
+                       __nv_bfloat16* output,
+                       int bsz,
+                       int head_size,
+                       int padded_head_size,
+                       cudaStream_t stream);
+
 template void pad_data(float* padded_output,
                        float* output,
                        int bsz,
@@ -539,6 +744,32 @@ __global__ void pad_head_seq_kernel(__half* padded_output,
     else
         padded_output_cast[idx] = ZERO;
 }
+
+__global__ void pad_head_seq_kernel(__nv_bfloat16* padded_output,
+                                    __nv_bfloat16* output,
+                                    int seq_len,
+                                    int padded_seq_len,
+                                    int head_size,
+                                    int padded_head_size)
+{
+    float4* padded_output_cast = reinterpret_cast<float4*>(padded_output);
+    float4* output_cast = reinterpret_cast<float4*>(output);
+    int bsz = blockIdx.x;
+    int bid = blockIdx.y * (blockDim.y) + threadIdx.y;
+    int idx = threadIdx.x;
+    padded_output_cast += (bsz * padded_seq_len + bid) * padded_head_size;
+    output_cast += (bsz * seq_len + bid) * head_size;
+    float4 ZERO;
+    const __nv_bfloat162 zero_h = __float2bfloat162_rn(0.f);
+    __nv_bfloat162* ZERO_h = reinterpret_cast<__nv_bfloat162*>(&ZERO);
+#pragma unroll
+    for (int i = 0; i < 4; i++) ZERO_h[i] = zero_h;
+
+    if (idx < head_size && bid < seq_len)
+        padded_output_cast[idx] = output_cast[idx];
+    else
+        padded_output_cast[idx] = ZERO;
+}
 __global__ void pad_head_seq_kernel(float* padded_output,
                                     float* output,
                                     int seq_len,
@@ -562,6 +793,7 @@ void pad_head_seq(T* padded_output,
     pad_head_seq_kernel<<<grid_dim, block_dim, 0, stream>>>(
         padded_output, output, seq_len, padded_seq_len, head_size / 8, padded_head_size / 8);
 }
+
 template void pad_head_seq(__half* padded_output,
                            __half* output,
                            int bsz,
@@ -570,6 +802,16 @@ template void pad_head_seq(__half* padded_output,
                            int head_size,
                            int padded_head_size,
                            cudaStream_t stream);
+
+template void pad_head_seq(__nv_bfloat16* padded_output,
+                           __nv_bfloat16* output,
+                           int bsz,
+                           int seq_len,
+                           int padded_seq_len,
+                           int head_size,
+                           int padded_head_size,
+                           cudaStream_t stream);
+
 template void pad_head_seq(float* padded_output,
                            float* output,
                            int bsz,
@@ -677,6 +919,12 @@ void launch_fused_bias_geglu(T* output,
 template void launch_fused_bias_geglu(__half*,
                                       const __half*,
                                       const __half*,
+                                      int,
+                                      int,
+                                      cudaStream_t);
+template void launch_fused_bias_geglu(__nv_bfloat16*,
+                                      const __nv_bfloat16*,
+                                      const __nv_bfloat16*,
                                       int,
                                       int,
                                       cudaStream_t);
