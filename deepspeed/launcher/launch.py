@@ -171,6 +171,10 @@ def main():
     current_env["CROSS_SIZE"] = str(args.nnodes)
     current_env["LOCAL_SIZE"] = str(num_local_procs)
 
+    if "none" == current_env.get("CCL_PROCESS_LAUNCHER"):
+        current_env["CCL_LOCAL_SIZE"] = str(num_local_procs)
+
+
     if args.save_pid:
         print(f"launcher pid: {os.getpid()}")
 
@@ -224,6 +228,9 @@ def main():
             dist_rank = global_rank_mapping[local_node][local_rank]
             current_env["RANK"] = str(dist_rank)
             current_env["LOCAL_RANK"] = str(local_rank)
+
+            if "none" == current_env.get("CCL_PROCESS_LAUNCHER"):
+                current_env["CCL_LOCAL_RANK"] = str(local_rank)
 
             # spawn the processes
             cmd = []
