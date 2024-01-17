@@ -26,6 +26,10 @@ import torch.nn.functional as F
 from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
 
+# For debug print
+# import os
+# local_rank = int(os.getenv("LOCAL_RANK", "0"))
+
 if TYPE_CHECKING:
     Base = Module[Tensor]
 else:
@@ -158,7 +162,9 @@ def einsum(rule, a, b):
 # includes stateful caching logic which is incompatible with ONNX.
 
 
-@torch.jit.script
+# HPU Enable Begin
+# @torch.jit.script
+# HPU Enable End
 def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> Tensor:
     # gates has shape of SE
     num_tokens = gates.shape[0]
@@ -171,12 +177,16 @@ def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> T
     return capacity
 
 
-@torch.jit.script
+# HPU Enable Begin
+# @torch.jit.script
+# HPU Enable End
 def _top_idx(source, k):
     return torch.topk(source, k=k, dim=0)[1]
 
 
-@torch.jit.script
+# HPU Enable Begin
+# @torch.jit.script
+# HPU Enable End
 def _one_hot_to_float(x, num_classes):
     return F.one_hot(x, num_classes=num_classes).float()
 
@@ -199,7 +209,11 @@ def top1gating(logits: Tensor,
 
     # Create a mask for 1st's expert per token
     # noisy gating
-    indices1_s = torch.argmax(logits_w_noise if noisy_gate_policy == 'RSample' else gates, dim=1)
+    # HPU Enable Begin
+    # indices1_s = torch.argmax(logits_w_noise if noisy_gate_policy == 'RSample' else gates, dim=1)
+    indices1_s = torch.argmax(logits_w_noise if noisy_gate_policy == 'RSample' else gates, dim=1).to(dtype=logits.dtype)
+    # HPU Enable End
+
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
 
@@ -208,17 +222,26 @@ def top1gating(logits: Tensor,
         mask1 = einsum("s,se->se", used_token, mask1)
 
     # gating decisions
-    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    # HPU Enable Begin
+    # exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    # it's never used only if drop tokens is false
+    exp_counts = None
+
+    # torch.distributions.Distribution.set_default_validate_args(False)
+    # HPU Enable End
 
     # if we don't want to drop any tokens
     if not drop_tokens:
+        # HPU Enable Begin
+        exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+        # HPU Enable End
         new_capacity = torch.max(exp_counts).to(logits.device)
         dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=dist.get_world_group())
         capacity = new_capacity
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
-    ce = torch.mean(mask1.float(), dim=0)
+    ce = torch.mean(mask1.float(), dim=0, dtype=torch.float)
     l_aux = torch.sum(me * ce) * num_experts
 
     # Random Token Selection
@@ -378,7 +401,10 @@ class TopKGate(Module):
         # Only top-1 and top-2 are supported at the moment.
         if k != 1 and k != 2:
             raise ValueError('Only top-1 and top-2 gatings are supported.')
-        self.wg = torch.nn.Linear(model_dim, num_experts, bias=False).float()
+        # HPU Enable Begin
+        # self.wg = torch.nn.Linear(model_dim, num_experts, bias=False).float()
+        self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
+        # HPU Enable End
         self.k = k
         self.capacity_factor = capacity_factor
         self.eval_capacity_factor = eval_capacity_factor
@@ -398,22 +424,28 @@ class TopKGate(Module):
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).start()
 
-        if self.wg.weight.dtype != torch.float32:
-            self.wg = self.wg.float()
-        input_fp32 = input.float()
-        # input jittering
+        # HPU Enable Begin
+        #if self.wg.weight.dtype != torch.float32:
+        #    self.wg = self.wg.float()
+        #input_fp32 = input.float()
+        ## input jittering
+        #if self.noisy_gate_policy == 'Jitter' and self.training:
+        #    input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
         if self.noisy_gate_policy == 'Jitter' and self.training:
-            input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
-        logits = self.wg(input_fp32)
+            input = multiplicative_jitter(input, device=input.device)
+        #logits = self.wg(input_fp32)
+        logits = self.wg(input)
+        logits_fp32 = logits.float()
 
         if self.k == 1:
-            gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+            gate_output = top1gating(logits_fp32, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
                                      self.drop_tokens, self.use_rts, use_tutel)
 
         else:
-            gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+            gate_output = top2gating(logits_fp32, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity)
+        # HPU Enable End
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).stop()
@@ -511,7 +543,9 @@ class MOELayer(Base):
             # reducing the all-to-all communication volume.
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
+        #print(f"Rank{local_rank}, 1: {dispatched_input.shape}")
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        #print(f"Rank{local_rank}, 2: {dispatched_input.shape}")
 
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).stop()
@@ -519,13 +553,16 @@ class MOELayer(Base):
 
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
+        #print(f"Rank{local_rank}, 3: {dispatched_input.shape}")
 
         expert_output = self.experts(dispatched_input)
+        #print(f"Rank{local_rank}, 4: {expert_output.shape}")
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        #print(f"Rank{local_rank}, 5: {expert_output.shape}")
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
