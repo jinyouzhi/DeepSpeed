@@ -175,7 +175,7 @@ def _top_idx(source, k):
 
 @torch.jit.script
 def _one_hot_to_float(x, num_classes):
-    return F.one_hot(x, num_classes=num_classes).float()
+    return F.one_hot(x, num_classes=num_classes)#.float()
 
 
 def top1gating(logits: Tensor,
@@ -191,7 +191,7 @@ def top1gating(logits: Tensor,
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
     # everything is in fp32 in this function
-    gates = F.softmax(logits, dim=1)
+    gates = F.softmax(logits.float(), dim=1)
 
     capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
 
@@ -273,11 +273,12 @@ def top1gating(logits: Tensor,
     locations1_s = torch.sum(locations1 * mask1, dim=1)
 
     # Normalize gate probabilities
+    # due to 225C spec, matmul's dtype need adapt to bf16
     mask1_float = mask1.float()
     gates = gates * mask1_float
 
     locations1_sc = _one_hot_to_float(locations1_s, capacity)
-    combine_weights = einsum("se,sc->sec", gates, locations1_sc)
+    combine_weights = einsum("se,sc->sec", gates.bfloat16(), locations1_sc.bfloat16()).to(logits.dtype)
 
     dispatch_mask = combine_weights.bool()
 
@@ -292,7 +293,7 @@ def top2gating(logits: Tensor,
                top2_2nd_expert_sampling: bool = True) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top2Gating on logits."""
     # everything is in fp32 in this function
-    gates = F.softmax(logits, dim=1)
+    gates = F.softmax(logits.float(), dim=1)
 
     # Create a mask for 1st's expert per token
     indices1_s = torch.argmax(gates, dim=1)
@@ -302,7 +303,7 @@ def top2gating(logits: Tensor,
     if top2_2nd_expert_sampling:
         # Create a mask for 2nd's expert per token using Gumbel-max trick
         # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
-        logits += gumbel_rsample(logits.shape, device=logits.device)
+        logits = logits + gumbel_rsample(logits.shape, device=logits.device)
 
     # Replace top-expert with min value
     logits_except1 = logits.masked_fill(mask1.bool(), float("-inf"))
@@ -345,10 +346,11 @@ def top2gating(logits: Tensor,
     locations2_s = torch.sum(locations2 * mask2, dim=1)
 
     # Normalize gate probabilities
-    mask1_float = mask1.float()
-    mask2_float = mask2.float()
-    gates1_s = einsum("se,se->s", gates, mask1_float)
-    gates2_s = einsum("se,se->s", gates, mask2_float)
+    # due to 225C spec, matmul's dtype need adapt to bf16
+    mask1_float = mask1.bfloat16()
+    mask2_float = mask2.bfloat16()
+    gates1_s = einsum("se,se->s", gates.bfloat16(), mask1_float).to(logits.dtype)
+    gates2_s = einsum("se,se->s", gates.bfloat16(), mask2_float).to(logits.dtype)
     denom_s = gates1_s + gates2_s
     # Avoid divide-by-zero
     denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
@@ -356,8 +358,9 @@ def top2gating(logits: Tensor,
     gates2_s /= denom_s
 
     # Calculate combine_weights and dispatch_mask
-    gates1 = einsum("s,se->se", gates1_s, mask1_float)
-    gates2 = einsum("s,se->se", gates2_s, mask2_float)
+    # due to 225C spec, matmul's dtype need adapt to bf16
+    gates1 = einsum("s,se->se", gates1_s.bfloat16(), mask1_float)
+    gates2 = einsum("s,se->se", gates2_s.bfloat16(), mask2_float)
     locations1_sc = _one_hot_to_float(locations1_s, capacity)
     locations2_sc = _one_hot_to_float(locations2_s, capacity)
     combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
@@ -433,7 +436,10 @@ class TopKGate(Module):
         # input jittering
         if self.noisy_gate_policy == 'Jitter' and self.training:
             input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
-        logits = torch.nn.functional.linear(input_fp32, weight=self.wg.weight.float(), bias=None)
+
+        # due to 225C spec, linear's dtype need adapt to bf16
+        # logits = torch.nn.functional.linear(input_fp32, weight=self.wg.weight, bias=None)
+        logits = torch.nn.functional.linear(input_fp32.to(input.dtype), weight=self.wg.weight.to(input.dtype), bias=None)
 
         if self.k == 1:
             gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
