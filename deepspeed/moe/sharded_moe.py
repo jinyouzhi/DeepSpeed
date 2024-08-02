@@ -377,23 +377,40 @@ def topkgating(logits: Tensor,
                used_token: Tensor = None,
                noisy_gate_policy: Optional[str] = None,
                drop_tokens: bool = True,
-               ep_group: Union[torch.distributed.ProcessGroup, None] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+               ep_group: Union[torch.distributed.ProcessGroup, None] = None,
+               use_pre_softamx: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements TopKGating on logits."""
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
-    # everything is in fp32 in this function
-    gates = F.softmax(logits, dim=1)
+
+    # TODO: apply z-loss
+
+    if use_pre_softamx:
+        # TODO: support Pre softmax
+        raise ValueError("pre softmax not support.")
+    else:
+        # Post softmax
+        indices = torch.topk(logits_w_noise if noisy_gate_policy == 'RSample' else logits, k, dim=1)[1]
+        # everything is in fp32 in this function
+        gates = F.softmax(logits, dim=1)
     num_experts = int(gates.shape[1])
 
     # Create the mask for topk's expert per token
     # noisy gating
-    indices = torch.topk(logits_w_noise if noisy_gate_policy == 'RSample' else gates, k, dim=1)[1]
     mask = torch.zeros_like(gates, dtype=torch.int64).scatter_(1, indices, 1)
     locations = torch.cumsum(mask, dim=0) - 1
 
     # mask only used tokens
     if used_token is not None:
         mask = einsum("s,se->se", used_token, mask)
+
+    # gating decisions
+    exp_counts = torch.sum(mask, dim=0).detach()
+
+    # Compute l_aux
+    me = torch.mean(gates, dim=0)
+    ce = torch.mean(mask.float(), dim=0)
+    l_aux = torch.mean(me * ce) * num_experts * num_experts / k
 
     if drop_tokens:
         # Calculate configured capacity and remove locations outside capacity from mask
@@ -410,14 +427,6 @@ def topkgating(logits: Tensor,
             tp = 1 if groups.mpu is None else bwc_tensor_model_parallel_world_size(mpu=groups.mpu)
             new_capacity = torch.ceil(new_capacity / tp).mul(tp).to(new_capacity.dtype)
         capacity = new_capacity
-
-    # gating decisions
-    exp_counts = torch.sum(mask, dim=0).detach()
-
-    # Compute l_aux
-    me = torch.mean(gates, dim=0)
-    ce = torch.mean(mask.float(), dim=0)
-    l_aux = torch.mean(me * ce) * num_experts * num_experts
 
     # Normalize gate probabilities
     gates_s = gates * mask
