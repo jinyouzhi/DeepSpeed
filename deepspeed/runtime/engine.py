@@ -594,10 +594,16 @@ class DeepSpeedEngine(Module):
         and registering a pre-hook to ensure that the Dataloader inputs are consistent across ranks.
         """
         self._set_client_model(model)
-        # sanity check
-        # currently, the compatibility between 'autotp' and 'zero > 1' has not been validated
-        # assert self.zero_optimization_stage(
-        # ) <= 2, "Currently, the compatibility between 'autotp' and 'zero_stage = 3' has not been validated"
+        if self.zero_optimization_stage() == ZeroStageEnum.weights:
+            if isinstance(model, PipelineModule):
+                raise NotImplementedError("AutoTP with ZeRO Stage 3 does not support pipeline parallelism yet.")
+            offload_param_config = self.zero_offload_param()
+            if offload_param_config is not None and offload_param_config.device != OffloadDeviceEnum.none:
+                raise NotImplementedError("AutoTP with ZeRO Stage 3 does not support parameter offload yet.")
+            if self.mics_shard_size() > 0:
+                raise NotImplementedError("AutoTP with ZeRO Stage 3 does not support MiCS yet.")
+            if self.tensor_parallel_config().tp_overlap_comm:
+                raise NotImplementedError("AutoTP with ZeRO Stage 3 does not support tp_overlap_comm yet.")
 
         self.mpu = groups
         self.mpu._init_tp_mesh_device(tensor_model_parallel_size=self.autotp_size())
