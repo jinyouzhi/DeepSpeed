@@ -484,8 +484,12 @@ class TestAutoTPZero3Runtime(DistributedTest):
                              requires_grad=True,
                              device=get_accelerator().current_device())
         targets = torch.randint(output_classes, (1, ), device=get_accelerator().current_device())
-        dist.broadcast(inputs, groups.get_tensor_model_parallel_src_rank(), group=groups.get_tensor_model_parallel_group())
-        dist.broadcast(targets, groups.get_tensor_model_parallel_src_rank(), group=groups.get_tensor_model_parallel_group())
+        dist.broadcast(inputs,
+                       groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
+        dist.broadcast(targets,
+                       groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
 
         loss = engine(inputs, targets)
         engine.backward(loss)
@@ -504,7 +508,8 @@ class TestAutoTPZero3Runtime(DistributedTest):
 
     def test_column_to_row_parallel(self):
         partition_config = {
-            "use_default_specs": False,
+            "use_default_specs":
+            False,
             "layer_specs": [
                 {
                     "patterns": [".*linears\\.0\\.weight$"],
