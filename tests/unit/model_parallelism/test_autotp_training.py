@@ -682,7 +682,7 @@ class TestSave(DistributedTest):
         compare_lr_scheduler_states(trained_model, loaded_model)
 
 
-@pytest.mark.parametrize("zero_stage", [0, 1, 2])
+@pytest.mark.parametrize("zero_stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("tp_size", [2, 4])
 class TestTpGradNorm(DistributedTest):
 
