@@ -50,6 +50,12 @@ class TPTrainingConfig(DeepSpeedConfigModel):
     tp_overlap_comm: bool = False
     """ Whether to overlap communication with computation. Currently, only allreduce supports overlap. """
 
+    vocab_parallel_lm_head: bool = False
+    """Shard an untied LM head along the vocabulary/output dimension during training."""
+
+    use_liger_kernel: bool = False
+    """Use Liger Kernel's vocab-parallel Online Softmax loss for a sharded LM head."""
+
     tensor_parallel: TPConfig = Field({}, alias="tp")
     """
     Configuration for tensor parallelism used to split the model across several

@@ -21,7 +21,8 @@ from copy import deepcopy
 from typing import Union
 
 __all__ = [
-    "TensorParallel_Layer", "LinearAllreduce", "LinearLayer", "LmHeadLinearAllreduce", "Yuan_LinearAllreduce",
+    "TensorParallel_Layer", "LinearAllreduce", "LinearLayer", "VocabParallelLinear", "LmHeadLinearAllreduce",
+    "Yuan_LinearAllreduce",
     "Yuan_LinearLayer", "GateUpPack_LinearLayer", "Conv_LinearALlreduce", "fused_LinearLayer", "conv_LinearLayer",
     "SubParamLinearLayer", "SubParamLinearAllreduce"
 ]
@@ -778,6 +779,30 @@ class LinearLayer(TensorParallel_Layer):
             out_features = weight_shape[0]
             linear = nn.Linear(in_features, out_features, bias=(bias is not None))
         return cls(linear, skip_partition=True)
+
+
+class VocabParallelLinear(LinearLayer):
+    """Column-parallel linear layer for an untied vocabulary projection.
+
+    Unlike ``LmHeadLinearAllreduce``, this layer partitions the output/vocabulary
+    dimension and returns only the local vocabulary logits.  The loss function
+    is responsible for reducing softmax statistics across the tensor-parallel
+    group.
+    """
+
+    def __init__(self, module, mp_group=None, **kwargs):
+        vocab_size = module.weight.shape[0]
+        tp_world_size = dist.get_world_size(mp_group) if mp_group is not None else 1
+        if vocab_size % tp_world_size != 0:
+            raise ValueError("Vocab-parallel lm_head requires vocab_size to be divisible by the TP size: "
+                             f"vocab_size={vocab_size}, tp_size={tp_world_size}")
+
+        super().__init__(module, mp_group, **kwargs)
+        self.name = "lm_head"
+        self.is_vocab_parallel_lm_head = True
+        self.vocab_size = vocab_size
+        self.vocab_start_index = self.tp_index * self.weight.shape[0]
+        self.replaced = True
 
 
 class FusedModuleWrapper:

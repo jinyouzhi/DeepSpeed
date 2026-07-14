@@ -665,6 +665,18 @@ class DeepSpeedEngine(Module):
         if tp_config.tensor_parallel.tp_group is None:
             tp_config.tensor_parallel.tp_group = groups.get_tensor_model_parallel_group()
 
+        if tp_config.use_liger_kernel and not tp_config.vocab_parallel_lm_head:
+            raise ValueError("tensor_parallel.use_liger_kernel requires tensor_parallel.vocab_parallel_lm_head")
+
+        def configure_vocab_parallel_lm_head(autotp):
+            if not tp_config.vocab_parallel_lm_head:
+                return
+            autotp.replace_vocab_parallel_lm_head(model)
+            from deepspeed.sequence.cross_entropy import configure_vocab_parallel_loss
+            configure_vocab_parallel_loss(model,
+                                          tp_group=tp_config.tensor_parallel.tp_group,
+                                          use_liger=tp_config.use_liger_kernel)
+
         from deepspeed.module_inject.auto_tp import AutoTP
 
         # Tensor parallel priority: custom config > HF tp_plan > AutoTP
@@ -680,15 +692,28 @@ class DeepSpeedEngine(Module):
                             linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
                             orig_layer_impl=None,
                             keep_module_on_host=tp_config.keep_module_on_host,
-                            partition_config=partition_config)
+                            partition_config=partition_config,
+                            vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head)
             autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
             autotp.update_linear_policies()
             autotp._replace_module(model)
+            configure_vocab_parallel_lm_head(autotp)
             setattr(model, UNIVERSAL_CHECKPOINT_INFO, collect_autotp_universal_checkpoint_info(model))
             setattr(model, "ds_autotp_parsed", True)
             return
 
         if tp_size <= 1:
+            if tp_config.vocab_parallel_lm_head:
+                autotp = AutoTP(module=model,
+                                all_reduce_linears=(),
+                                prefix="",
+                                state_dict=None,
+                                linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
+                                orig_layer_impl=None,
+                                keep_module_on_host=tp_config.keep_module_on_host,
+                                vocab_parallel_lm_head=True)
+                autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
+                configure_vocab_parallel_lm_head(autotp)
             setattr(model, "ds_autotp_parsed", True)
             return
 
@@ -715,10 +740,12 @@ class DeepSpeedEngine(Module):
                     orig_layer_impl=None,
                     keep_module_on_host=tp_config.keep_module_on_host,
                     partition_config=tp_plan_config,
+                    vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head,
                 )
                 autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
                 autotp.update_linear_policies()
                 autotp._replace_module(model)
+                configure_vocab_parallel_lm_head(autotp)
                 setattr(model, "ds_autotp_parsed", True)
                 return
 
@@ -726,6 +753,18 @@ class DeepSpeedEngine(Module):
         for client_module, injection_policy in parser_dict:
             tp_config.injection_policy_tuple = injection_policy
             replace_transformer_layer(client_module, model, None, tp_config, model_config)
+
+        if tp_config.vocab_parallel_lm_head:
+            autotp = AutoTP(module=model,
+                            all_reduce_linears=(),
+                            prefix="",
+                            state_dict=None,
+                            linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
+                            orig_layer_impl=None,
+                            keep_module_on_host=tp_config.keep_module_on_host,
+                            vocab_parallel_lm_head=True)
+            autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
+            configure_vocab_parallel_lm_head(autotp)
 
         setattr(model, UNIVERSAL_CHECKPOINT_INFO, collect_autotp_universal_checkpoint_info(model))
         setattr(model, "ds_autotp_parsed", True)

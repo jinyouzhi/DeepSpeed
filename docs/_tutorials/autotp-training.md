@@ -69,6 +69,32 @@ Compatibility note: For backward compatibility, you can still call
 are not required when the DeepSpeed config provides the necessary
 `tensor_parallel` settings.
 
+### Untied vocabulary-parallel LM head
+
+AutoTP can optionally shard an **untied** `lm_head` along the vocabulary
+dimension. Each tensor-parallel rank then produces only its local vocabulary
+logits, and the loss reduces the online softmax statistics across the TP group
+without materializing a full-vocabulary logits tensor.
+
+```json
+{
+    "tensor_parallel": {
+        "autotp_size": 4,
+        "vocab_parallel_lm_head": true,
+        "use_liger_kernel": true
+    }
+}
+```
+
+`use_liger_kernel` is optional. When it is `false`, DeepSpeed uses its PyTorch
+Online Softmax implementation; when it is `true`, `liger-kernel` must be
+installed and its vocab-parallel cross-entropy kernel is used.
+
+This path currently requires an untied output projection, a vocabulary size
+divisible by `autotp_size`, and a model exposing the Hugging Face
+`loss_function` hook. Tied input embeddings and output heads are not modified
+by this feature yet.
+
 ### Preset-based Sharding
 
 If your model matches a built-in preset, set `tensor_parallel.preset_model` in the DeepSpeed config:

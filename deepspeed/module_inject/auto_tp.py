@@ -201,7 +201,8 @@ class AutoTP():
                  linear_layer_setting,
                  orig_layer_impl,
                  keep_module_on_host=False,
-                 partition_config: Optional[AutoTPConfig] = None):
+                 partition_config: Optional[AutoTPConfig] = None,
+                 vocab_parallel_lm_head=False):
         self.module = module
         self.all_reduce_linears = all_reduce_linears
         self.prefix = prefix
@@ -214,6 +215,7 @@ class AutoTP():
         self.linear_policies = None
         self.conv_linear_layer = False
         self.partition_config = partition_config
+        self.vocab_parallel_lm_head = vocab_parallel_lm_head
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
 
     def in_module_list(module, module_list):
@@ -358,6 +360,11 @@ class AutoTP():
         if getattr(child, "_is_autoep_layer", False):
             return child
 
+        if self.vocab_parallel_lm_head and is_autotp_training_mode() and self._is_lm_head_name(name):
+            self._validate_untied_lm_head(child)
+            setattr(child, "replaced", True)
+            return VocabParallelLinear(child, self.mp_group, name=name)
+
         weight_shape = child.weight.shape
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
@@ -417,6 +424,11 @@ class AutoTP():
         if getattr(child, "replaced", False) == True:
             return child
 
+        if self.vocab_parallel_lm_head and is_autotp_training_mode() and self._is_lm_head_name(name):
+            self._validate_untied_lm_head(child)
+            setattr(child, "replaced", True)
+            return VocabParallelLinear(child, self.mp_group, name=name)
+
         # Build the full parameter name for pattern matching
         param_name = name + ".weight" if not name.endswith(".weight") else name
 
@@ -463,6 +475,8 @@ class AutoTP():
         """Create column-parallel layer (AllReduce in backward)."""
         if self.conv_linear_layer:
             return conv_LinearLayer(module, self.mp_group, name=name)
+        if self.vocab_parallel_lm_head and is_autotp_training_mode() and self._is_lm_head_name(name):
+            return VocabParallelLinear(module, self.mp_group, name=name)
         # Only use fused-QKV heuristics when no partition_config is provided.
         elif self.partition_config is None and require_tp_fused_qkvw(name, self.mp_size):
             # Check and handle fused qkv for TP
@@ -476,6 +490,51 @@ class AutoTP():
                 name=name,
             )
         return LinearLayer(module, self.mp_group, name=name)
+
+    @staticmethod
+    def _is_lm_head_name(name):
+        return str(name).split('.')[-1] in ("lm_head", "embed_out")
+
+    @staticmethod
+    def _get_input_embedding(module):
+        get_input_embeddings = getattr(module, "get_input_embeddings", None)
+        if callable(get_input_embeddings):
+            embedding = get_input_embeddings()
+            if embedding is not None and hasattr(embedding, "weight"):
+                return embedding
+
+        for name, child in module.named_modules():
+            if name and ("embed_tokens" in name or "word_embeddings" in name or name.endswith(".wte")):
+                if isinstance(child, nn.Embedding):
+                    return child
+        return None
+
+    def _validate_untied_lm_head(self, lm_head):
+        embedding = self._get_input_embedding(self.module)
+        if embedding is not None and lm_head.weight is embedding.weight:
+            raise ValueError("vocab_parallel_lm_head currently supports untied lm_head weights only")
+
+    def replace_vocab_parallel_lm_head(self, r_module):
+        """Replace an untied top-level LM head with a vocab-parallel layer."""
+        embedding = self._get_input_embedding(r_module)
+        embedding_weight = getattr(embedding, "weight", None)
+
+        def replace(parent):
+            for name, child in parent.named_children():
+                if self._is_lm_head_name(name) and hasattr(child, "weight") and child.weight.dim() == 2:
+                    if embedding_weight is not None and child.weight is embedding_weight:
+                        raise ValueError("vocab_parallel_lm_head currently supports untied lm_head weights only")
+                    if getattr(child, "is_vocab_parallel_lm_head", False):
+                        return True
+                    setattr(parent, name, VocabParallelLinear(child, self.mp_group, name=name))
+                    return True
+                if replace(child):
+                    return True
+            return False
+
+        if not replace(r_module):
+            raise ValueError("vocab_parallel_lm_head is enabled, but no lm_head or embed_out Linear was found")
+        return r_module
 
     def _get_model_type(self) -> Optional[str]:
         """Extract model type from module config or class name."""

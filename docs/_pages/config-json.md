@@ -806,6 +806,18 @@ When a HuggingFace model provides a built-in `tp_plan` (via `model.config.base_m
 | -------------------------------------------------------------------------------------------------------- | ------- |
 | Overlap tensor-parallel allreduce communication with computation (training only).                       | `false` |
 
+***vocab_parallel_lm_head***: [boolean]
+
+| Description                                                                                                  | Default |
+| ------------------------------------------------------------------------------------------------------------ | ------- |
+| Shard an untied LM head along the vocabulary/output dimension and use vocab-parallel Online Softmax loss.    | `false` |
+
+***use_liger_kernel***: [boolean]
+
+| Description                                                                                                  | Default |
+| ------------------------------------------------------------------------------------------------------------ | ------- |
+| Use Liger Kernel's vocab-parallel Online Softmax implementation for a sharded LM head. Requires the Liger package. | `false` |
+
 ***partition_config***: [dictionary]
 
 | Description                                                                                                                     | Default |

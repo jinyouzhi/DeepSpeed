@@ -286,7 +286,8 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                          linear_layer_setting,
                          orig_layer_impl,
                          config.keep_module_on_host,
-                         partition_config=partition_config)
+                         partition_config=partition_config,
+                         vocab_parallel_lm_head=getattr(config, "vocab_parallel_lm_head", False))
 
         # 2. Set the tensor parallelism config
         _autotp.set_tensor_parallel_config(config.tensor_parallel.tp_size, config.tensor_parallel.tp_group)
@@ -347,8 +348,12 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
 
     def set_lm_head(module):
         if is_autotp_training_mode():
-            # we need to handle autoTP training mode separately.
-            return
+            # The inference LM-head path uses hidden-dimension sharding and an
+            # inference all-reduce.  Training uses an explicit vocab-parallel
+            # path when requested and otherwise leaves the model unchanged.
+            if not getattr(config, "vocab_parallel_lm_head", False):
+                return module
+            return replace_wo_policy(module, ("lm_head", "embed_out"), 0, "lm_head")
 
         embedding_weight = None
         for n, p in module.named_parameters():

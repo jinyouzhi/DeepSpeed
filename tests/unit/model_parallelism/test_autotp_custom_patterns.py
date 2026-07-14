@@ -13,9 +13,11 @@ from torch import nn
 from unit.common import DistributedTest, preferred_dtype
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import groups
-from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, SubParamLinearLayer, fused_LinearLayer)
+from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, SubParamLinearLayer, VocabParallelLinear,
+                                            fused_LinearLayer, set_autotp_mode)
 from deepspeed.module_inject.autotp_config import AutoTPConfig
 from deepspeed.module_inject.auto_tp import AutoTP
+from deepspeed.sequence.cross_entropy import vocab_parallel_cross_entropy
 
 
 def skip_on_device():
@@ -116,6 +118,27 @@ class DeepModel(torch.nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class UntiedCausalLM(torch.nn.Module):
+    """Small causal LM used to exercise the vocab-parallel LM-head path."""
+
+    def __init__(self, hidden_dim=8, vocab_size=16):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        self.vocab_size = vocab_size
+        self.config = type("Config", (), {"model_type": "untied_test"})()
+        self.loss_function = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, labels=None):
+        hidden_states = self.proj(self.embed_tokens(input_ids))
+        logits = self.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size)
+        return type("CausalLMOutput", (), {"loss": loss, "logits": logits})()
 
 
 def init_tp_engine(tp_size, partition_config=None):
@@ -470,6 +493,83 @@ class TestAutoTPCustomPatterns(DistributedTest):
                 f"layers.{i}.self_attn.q_proj was not replaced (path propagation bug?)"
             assert isinstance(model.layers[i].self_attn.o_proj, LinearAllreduce), \
                 f"layers.{i}.self_attn.o_proj was not replaced (path propagation bug?)"
+
+    def test_vocab_parallel_lm_head_tp1(self):
+        skip_on_device()
+        set_autotp_mode(training=True)
+        try:
+            torch.manual_seed(42)
+            linear = nn.Linear(8, 16, bias=False)
+            layer = VocabParallelLinear(linear, mp_group=None)
+            inputs = torch.randn(2, 3, 8)
+
+            torch.testing.assert_close(layer(inputs), linear(inputs))
+            assert layer.weight.shape == (16, 8)
+            assert layer.vocab_size == 16
+            assert layer.vocab_start_index == 0
+        finally:
+            set_autotp_mode(training=False)
+
+    def test_vocab_parallel_cross_entropy_tp1_matches_torch(self):
+        skip_on_device()
+        torch.manual_seed(42)
+        logits = torch.randn(2, 3, 16, requires_grad=True)
+        reference_logits = logits.detach().clone().requires_grad_(True)
+        target = torch.randint(0, 16, (2, 3))
+        target[0, 0] = -100
+
+        expected = torch.nn.functional.cross_entropy(reference_logits.view(-1, 16), target.view(-1))
+        actual = vocab_parallel_cross_entropy(logits, target, reduction="mean")
+
+        torch.testing.assert_close(actual, expected)
+        actual.backward()
+        expected.backward()
+        torch.testing.assert_close(logits.grad, reference_logits.grad)
+
+    def test_vocab_parallel_lm_head_training(self):
+        skip_on_device()
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-6
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": 2,
+                "vocab_parallel_lm_head": True,
+                "partition_config": {
+                    "use_default_specs": False,
+                    "layer_specs": [{
+                        "patterns": [".*\\.weight$"],
+                        "partition_type": "skip",
+                    }],
+                },
+            },
+            "zero_optimization": {
+                "stage": 0,
+            },
+        }
+        if preferred_dtype() is torch.float16:
+            config_dict["fp16"] = {"enabled": True}
+        elif preferred_dtype() is torch.bfloat16:
+            config_dict["bf16"] = {"enabled": True}
+
+        model = UntiedCausalLM()
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        assert isinstance(engine.module.lm_head, VocabParallelLinear)
+        assert engine.module.lm_head.weight.shape == (8, 8)
+
+        input_ids = torch.randint(0, 16, (1, 4), device=get_accelerator().current_device())
+        dist.broadcast(input_ids,
+                       src=groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
+        outputs = engine(input_ids, labels=input_ids)
+        assert outputs.logits.shape == (1, 4, 8)
+        assert torch.isfinite(outputs.loss)
+        engine.backward(outputs.loss)
 
 
 def test_invalid_custom_shape_rejected():
