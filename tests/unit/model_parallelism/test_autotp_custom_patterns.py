@@ -7,6 +7,7 @@ import pytest
 import torch
 import deepspeed.comm as dist
 import deepspeed
+import importlib.util
 from copy import deepcopy
 from torch import nn
 
@@ -17,7 +18,7 @@ from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, SubPar
                                             fused_LinearLayer, set_autotp_mode)
 from deepspeed.module_inject.autotp_config import AutoTPConfig
 from deepspeed.module_inject.auto_tp import AutoTP
-from deepspeed.sequence.cross_entropy import vocab_parallel_cross_entropy
+from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, vocab_parallel_cross_entropy
 
 
 def skip_on_device():
@@ -129,7 +130,10 @@ class UntiedCausalLM(torch.nn.Module):
         self.proj = nn.Linear(hidden_dim, hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
         self.vocab_size = vocab_size
-        self.config = type("Config", (), {"model_type": "untied_test"})()
+        self.config = type("Config", (), {
+            "model_type": "untied_test",
+            "tie_word_embeddings": False,
+        })()
         self.loss_function = nn.CrossEntropyLoss()
 
     def forward(self, input_ids, labels=None):
@@ -139,6 +143,14 @@ class UntiedCausalLM(torch.nn.Module):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size)
         return type("CausalLMOutput", (), {"loss": loss, "logits": logits})()
+
+
+class TiedCausalLM(UntiedCausalLM):
+
+    def __init__(self, hidden_dim=8, vocab_size=16):
+        super().__init__(hidden_dim=hidden_dim, vocab_size=vocab_size)
+        self.lm_head.weight = self.embed_tokens.weight
+        self.config.tie_word_embeddings = True
 
 
 def init_tp_engine(tp_size, partition_config=None):
@@ -510,6 +522,37 @@ class TestAutoTPCustomPatterns(DistributedTest):
         finally:
             set_autotp_mode(training=False)
 
+    def test_vocab_parallel_lm_head_rejects_tied_weights_tp2(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        autotp = AutoTP(module=TiedCausalLM(),
+                        all_reduce_linears=(),
+                        prefix="",
+                        state_dict=None,
+                        linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
+                        orig_layer_impl=None,
+                        keep_module_on_host=False,
+                        vocab_parallel_lm_head=True)
+        autotp.set_tensor_parallel_config(2, groups.get_tensor_model_parallel_group())
+        set_autotp_mode(training=True)
+        try:
+            with pytest.raises(ValueError, match="untied"):
+                autotp.replace_vocab_parallel_lm_head(autotp.module)
+        finally:
+            set_autotp_mode(training=False)
+
+    def test_vocab_parallel_lm_head_rejects_nondivisible_vocab_tp2(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        set_autotp_mode(training=True)
+        try:
+            device = get_accelerator().current_device()
+            linear = nn.Linear(8, 17, bias=False, device=device)
+            with pytest.raises(ValueError, match="divisible"):
+                VocabParallelLinear(linear, groups.get_tensor_model_parallel_group(), name="lm_head")
+        finally:
+            set_autotp_mode(training=False)
+
     def test_vocab_parallel_cross_entropy_tp1_matches_torch(self):
         skip_on_device()
         torch.manual_seed(42)
@@ -526,7 +569,239 @@ class TestAutoTPCustomPatterns(DistributedTest):
         expected.backward()
         torch.testing.assert_close(logits.grad, reference_logits.grad)
 
-    def test_vocab_parallel_lm_head_training(self):
+    def test_vocab_parallel_cross_entropy_tp2_matches_torch(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+
+        torch.manual_seed(42)
+        full_logits = torch.randn(2, 3, 16, device=get_accelerator().current_device())
+        reference_logits = full_logits.detach().clone().requires_grad_(True)
+        vocab_start_index = tp_rank * 8
+        local_logits = full_logits[..., vocab_start_index:vocab_start_index + 8].detach().clone().requires_grad_(True)
+        target = torch.tensor([[0, 8, -100], [15, 7, 9]],
+                              dtype=torch.long,
+                              device=get_accelerator().current_device())
+
+        expected_none = torch.nn.functional.cross_entropy(reference_logits.view(-1, 16),
+                                                          target.view(-1),
+                                                          reduction="none").view_as(target)
+        actual_none = vocab_parallel_cross_entropy(local_logits,
+                                                   target,
+                                                   tp_group=tp_group,
+                                                   vocab_start_index=vocab_start_index,
+                                                   reduction="none")
+        torch.testing.assert_close(actual_none, expected_none)
+
+        expected = expected_none.sum() / (target != -100).sum()
+        actual = vocab_parallel_cross_entropy(local_logits,
+                                              target,
+                                              tp_group=tp_group,
+                                              vocab_start_index=vocab_start_index,
+                                              reduction="mean")
+        torch.testing.assert_close(actual, expected)
+
+        actual.backward()
+        expected.backward()
+        expected_local_grad = reference_logits.grad[..., vocab_start_index:vocab_start_index + 8]
+        torch.testing.assert_close(local_logits.grad, expected_local_grad)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_vocab_parallel_cross_entropy_tp2_dtype(self, dtype):
+        skip_on_device()
+        if dtype == torch.bfloat16 and not get_accelerator().is_bf16_supported():
+            pytest.skip("BF16 is not supported by the active accelerator")
+
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        device = get_accelerator().current_device()
+
+        torch.manual_seed(314)
+        full_logits = torch.randn(2, 4, 16, dtype=dtype, device=device)
+        reference_logits = full_logits.detach().clone().requires_grad_(True)
+        vocab_start_index = tp_rank * 8
+        local_logits = full_logits[..., vocab_start_index:vocab_start_index + 8].detach().clone()
+        local_logits.requires_grad_(True)
+        assert local_logits.dtype == dtype
+        target = torch.tensor([[0, 8, -100, 15], [7, 9, 3, -100]], dtype=torch.long, device=device)
+
+        expected = torch.nn.functional.cross_entropy(reference_logits.float().view(-1, 16), target.view(-1))
+        actual = vocab_parallel_cross_entropy(local_logits,
+                                              target,
+                                              tp_group=tp_group,
+                                              vocab_start_index=vocab_start_index,
+                                              reduction="mean")
+        atol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+        rtol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+        actual.backward()
+        expected.backward()
+        expected_local_grad = reference_logits.grad[..., vocab_start_index:vocab_start_index + 8]
+        assert local_logits.grad.dtype == dtype
+        torch.testing.assert_close(local_logits.grad, expected_local_grad, atol=atol, rtol=rtol)
+
+    def test_vocab_parallel_lm_head_tp2_matches_full_linear(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        set_autotp_mode(training=True)
+
+        try:
+            torch.manual_seed(123)
+            hidden_dim = 8
+            vocab_size = 16
+            device = get_accelerator().current_device()
+            reference_linear = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.float32, device=device)
+            sharded_linear = VocabParallelLinear(deepcopy(reference_linear), tp_group, name="lm_head")
+
+            torch.manual_seed(456)
+            reference_inputs = torch.randn(2, 3, hidden_dim, dtype=torch.float32, device=device, requires_grad=True)
+            sharded_inputs = reference_inputs.detach().clone().requires_grad_(True)
+            full_logits = reference_linear(reference_inputs)
+            local_logits = sharded_linear(sharded_inputs)
+
+            gathered_logits = [torch.empty_like(local_logits) for _ in range(2)]
+            dist.all_gather(gathered_logits, local_logits.detach().contiguous(), group=tp_group)
+            torch.testing.assert_close(torch.cat(gathered_logits, dim=-1), full_logits.detach())
+
+            target = torch.tensor([[0, 8, -100], [15, 7, 9]], dtype=torch.long, device=device)
+            expected = torch.nn.functional.cross_entropy(full_logits.view(-1, vocab_size), target.view(-1))
+            actual = vocab_parallel_cross_entropy(local_logits,
+                                                  target,
+                                                  tp_group=tp_group,
+                                                  vocab_start_index=sharded_linear.vocab_start_index,
+                                                  reduction="mean")
+            torch.testing.assert_close(actual, expected)
+
+            actual.backward()
+            expected.backward()
+            local_weight_grad = reference_linear.weight.grad.narrow(0, tp_rank * 8, 8)
+            torch.testing.assert_close(sharded_linear.weight.grad, local_weight_grad)
+            torch.testing.assert_close(sharded_inputs.grad, reference_inputs.grad)
+        finally:
+            set_autotp_mode(training=False)
+
+    def test_vocab_parallel_lm_head_sgd_step_tp2_matches_full_linear(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        set_autotp_mode(training=True)
+
+        try:
+            torch.manual_seed(2718)
+            device = get_accelerator().current_device()
+            reference_linear = nn.Linear(8, 16, bias=False, dtype=torch.float32, device=device)
+            sharded_linear = VocabParallelLinear(deepcopy(reference_linear), tp_group, name="lm_head")
+            reference_inputs = torch.randn(2, 3, 8, dtype=torch.float32, device=device, requires_grad=True)
+            sharded_inputs = reference_inputs.detach().clone().requires_grad_(True)
+            target = torch.tensor([[0, 8, -100], [15, 7, 9]], dtype=torch.long, device=device)
+
+            expected = torch.nn.functional.cross_entropy(reference_linear(reference_inputs).view(-1, 16),
+                                                         target.view(-1))
+            actual = vocab_parallel_cross_entropy(sharded_linear(sharded_inputs),
+                                                  target,
+                                                  tp_group=tp_group,
+                                                  vocab_start_index=sharded_linear.vocab_start_index,
+                                                  reduction="mean")
+            actual.backward()
+            expected.backward()
+
+            expected_local_grad = reference_linear.weight.grad.narrow(0, tp_rank * 8, 8)
+            torch.testing.assert_close(sharded_linear.weight.grad, expected_local_grad)
+            torch.testing.assert_close(sharded_inputs.grad, reference_inputs.grad)
+
+            reference_optimizer = torch.optim.SGD(reference_linear.parameters(), lr=0.05)
+            sharded_optimizer = torch.optim.SGD(sharded_linear.parameters(), lr=0.05)
+            reference_optimizer.step()
+            sharded_optimizer.step()
+
+            expected_local_weight = reference_linear.weight.detach().narrow(0, tp_rank * 8, 8)
+            torch.testing.assert_close(sharded_linear.weight.detach(), expected_local_weight)
+        finally:
+            set_autotp_mode(training=False)
+
+    def test_vocab_parallel_causal_lm_loss_tp2_matches_torch(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+
+        torch.manual_seed(789)
+        full_logits = torch.randn(2, 5, 16, device=get_accelerator().current_device())
+        reference_logits = full_logits.detach().clone().requires_grad_(True)
+        vocab_start_index = tp_rank * 8
+        local_logits = full_logits[..., vocab_start_index:vocab_start_index + 8].detach().clone().requires_grad_(True)
+        labels = torch.tensor([[1, 8, -100, 15, 7], [0, 3, 9, -100, 12]],
+                              dtype=torch.long,
+                              device=get_accelerator().current_device())
+
+        expected = torch.nn.functional.cross_entropy(reference_logits[:, :-1, :].contiguous().view(-1, 16),
+                                                     labels[:, 1:].contiguous().view(-1))
+        loss_fn = VocabParallelCausalLMLoss(tp_group=tp_group)
+        actual = loss_fn(local_logits, labels=labels, vocab_size=16)
+        torch.testing.assert_close(actual, expected)
+
+        actual.backward()
+        expected.backward()
+        expected_local_grad = reference_logits.grad[..., vocab_start_index:vocab_start_index + 8]
+        torch.testing.assert_close(local_logits.grad, expected_local_grad)
+
+    def test_vocab_parallel_causal_lm_loss_ulysses_shift_labels_long_sequence(self):
+        skip_on_device()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        sp_group = dist.new_group(ranks=list(range(world_size)))
+        device = get_accelerator().current_device()
+        sequence_length = 1024
+        assert sequence_length % world_size == 0
+
+        torch.manual_seed(1618)
+        full_logits = torch.randn(1, sequence_length, 16, device=device)
+        shift_labels = torch.randint(0, 16, (1, sequence_length), dtype=torch.long, device=device)
+        shift_labels[:, ::31] = -100
+
+        local_sequence_length = sequence_length // world_size
+        sequence_start = rank * local_sequence_length
+        sequence_end = sequence_start + local_sequence_length
+        local_logits = full_logits[:, sequence_start:sequence_end, :].detach().clone().requires_grad_(True)
+        local_shift_labels = shift_labels[:, sequence_start:sequence_end]
+
+        # Ulysses supplies rank-local logits and explicit shifted labels. Each
+        # rank computes a mean over its valid tokens before weighted aggregation.
+        loss_fn = VocabParallelCausalLMLoss(tp_group=None)
+        local_loss = loss_fn(local_logits,
+                             labels=None,
+                             shift_labels=local_shift_labels,
+                             vocab_size=16)
+        local_count = (local_shift_labels != -100).sum().to(dtype=local_loss.dtype)
+        global_loss_sum = (local_loss * local_count).detach().clone()
+        global_token_count = local_count.detach().clone()
+        dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(global_token_count, op=dist.ReduceOp.SUM, group=sp_group)
+        actual = global_loss_sum / global_token_count.clamp_min(1)
+
+        expected = torch.nn.functional.cross_entropy(full_logits.view(-1, 16), shift_labels.view(-1))
+        torch.testing.assert_close(actual, expected)
+
+    def test_liger_unavailable_is_actionable(self):
+        skip_on_device()
+        if importlib.util.find_spec("liger_kernel") is not None:
+            pytest.skip("Liger Kernel is installed; optional backend path is covered separately")
+
+        logits = torch.randn(1, 2, 8, requires_grad=True)
+        target = torch.tensor([[0, 3]], dtype=torch.long)
+        fallback_loss = vocab_parallel_cross_entropy(logits, target, use_liger=False)
+        assert torch.isfinite(fallback_loss)
+        with pytest.raises(ImportError, match="Liger Kernel is required"):
+            vocab_parallel_cross_entropy(logits, target, use_liger=True)
+
+    @pytest.mark.parametrize("zero_stage", [0, 1, 2])
+    def test_vocab_parallel_lm_head_zero_optimizer_stages(self, zero_stage):
         skip_on_device()
         config_dict = {
             "train_micro_batch_size_per_gpu": 1,
@@ -548,21 +823,21 @@ class TestAutoTPCustomPatterns(DistributedTest):
                 },
             },
             "zero_optimization": {
-                "stage": 0,
+                "stage": zero_stage,
             },
         }
-        if preferred_dtype() is torch.float16:
-            config_dict["fp16"] = {"enabled": True}
-        elif preferred_dtype() is torch.bfloat16:
-            config_dict["bf16"] = {"enabled": True}
 
+        torch.manual_seed(2024)
         model = UntiedCausalLM()
         engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
 
         assert isinstance(engine.module.lm_head, VocabParallelLinear)
         assert engine.module.lm_head.weight.shape == (8, 8)
+        assert engine.module.config.tie_word_embeddings is False
+        assert engine.module.lm_head.weight is not engine.module.embed_tokens.weight
+        original_weight = engine.module.lm_head.weight.detach().clone()
 
-        input_ids = torch.randint(0, 16, (1, 4), device=get_accelerator().current_device())
+        input_ids = torch.randint(0, 16, (1, 4), device=engine.device)
         dist.broadcast(input_ids,
                        src=groups.get_tensor_model_parallel_src_rank(),
                        group=groups.get_tensor_model_parallel_group())
@@ -570,6 +845,11 @@ class TestAutoTPCustomPatterns(DistributedTest):
         assert outputs.logits.shape == (1, 4, 8)
         assert torch.isfinite(outputs.loss)
         engine.backward(outputs.loss)
+        engine.step()
+
+        updated_weight = engine.module.lm_head.weight.detach()
+        assert torch.isfinite(updated_weight).all()
+        assert not torch.equal(original_weight, updated_weight)
 
 
 def test_invalid_custom_shape_rejected():
