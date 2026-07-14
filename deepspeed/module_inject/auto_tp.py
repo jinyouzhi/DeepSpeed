@@ -205,7 +205,8 @@ class AutoTP():
                  linear_layer_setting,
                  orig_layer_impl,
                  keep_module_on_host=False,
-                 partition_config: Optional[AutoTPConfig] = None):
+                 partition_config: Optional[AutoTPConfig] = None,
+                 vocab_parallel_lm_head=False):
         self.module = module
         self.all_reduce_linears = all_reduce_linears
         self.prefix = prefix
@@ -218,6 +219,7 @@ class AutoTP():
         self.linear_policies = None
         self.conv_linear_layer = False
         self.partition_config = partition_config
+        self.vocab_parallel_lm_head = vocab_parallel_lm_head
         self._gathered_column_tie_fallbacks_configured = False
         self._tied_gathered_column_module_names = set()
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
@@ -364,6 +366,11 @@ class AutoTP():
         if getattr(child, "_is_autoep_layer", False):
             return child
 
+        if self.vocab_parallel_lm_head and self._is_lm_head_name(name):
+            self._validate_untied_vocab_head(child)
+            setattr(child, "replaced", True)
+            return VocabParallelLinear(child, self.mp_group, name=name)
+
         weight_shape = child.weight.shape
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
@@ -423,6 +430,11 @@ class AutoTP():
         if getattr(child, "replaced", False) == True:
             return child
 
+        if self.vocab_parallel_lm_head and self._is_lm_head_name(name):
+            self._validate_untied_vocab_head(child)
+            setattr(child, "replaced", True)
+            return VocabParallelLinear(child, self.mp_group, name=name)
+
         # Build the full parameter name for pattern matching
         param_name = name + ".weight" if not name.endswith(".weight") else name
 
@@ -469,6 +481,9 @@ class AutoTP():
         """Create column-parallel layer (AllReduce in backward)."""
         if self.conv_linear_layer:
             return conv_LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output)
+        if self._is_lm_head_name(name) and not spec.gather_output:
+            self._validate_untied_vocab_head(module)
+            return VocabParallelLinear(module, self.mp_group, name=name)
         # Only use fused-QKV heuristics when no partition_config is provided.
         elif self.partition_config is None and require_tp_fused_qkvw(name, self.mp_size):
             # Check and handle fused qkv for TP
@@ -484,6 +499,15 @@ class AutoTP():
                 name=name,
             )
         return LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output)
+
+    @staticmethod
+    def _is_lm_head_name(name):
+        return any(part in ("lm_head", "embed_out") for part in str(name).split('.'))
+
+    def _validate_untied_vocab_head(self, lm_head):
+        for _, module in self.module.named_modules():
+            if isinstance(module, nn.Embedding) and getattr(module, "weight", None) is lm_head.weight:
+                raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
 
     def _configure_gathered_column_tie_fallbacks(self):
         """Configure a replicated fallback for gathered output layers tied to embeddings."""
@@ -687,7 +711,7 @@ class AutoTP():
                 self._replace_module(child, full_name, "")
 
     def _replace_module(self, r_module, prev_name='', prev_class_name=''):
-        if prev_name == '' and prev_class_name == '':
+        if prev_name == '' and prev_class_name == '' and not self.vocab_parallel_lm_head:
             self._configure_gathered_column_tie_fallbacks()
 
         for name, child in r_module.named_children():

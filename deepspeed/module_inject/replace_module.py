@@ -286,7 +286,8 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                          linear_layer_setting,
                          orig_layer_impl,
                          config.keep_module_on_host,
-                         partition_config=partition_config)
+                         partition_config=partition_config,
+                         vocab_parallel_lm_head=getattr(config, "vocab_parallel_lm_head", False))
 
         # 2. Set the tensor parallelism config
         _autotp.set_tensor_parallel_config(config.tensor_parallel.tp_size, config.tensor_parallel.tp_group)
