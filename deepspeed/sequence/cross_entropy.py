@@ -96,7 +96,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         if tp_world_size > 1:
             dist.all_reduce(target_logits, op=dist.ReduceOp.SUM, group=tp_group)
 
-        loss = torch.log(global_sum_exp) - target_logits
+        loss = torch.log(global_sum_exp) + global_max - target_logits
         loss = torch.where(valid_target, loss, torch.zeros_like(loss))
 
         ctx.save_for_backward(exp_logits, global_sum_exp, local_target, target_in_partition, valid_target)
