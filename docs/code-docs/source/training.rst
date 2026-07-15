@@ -391,8 +391,8 @@ See :ref:`autotp-training-init-details` for more details.
         mpu=mpu,  # optional: TP/DP process groups
     )
 
-.. note::
-   AutoTP training supports ZeRO stages 0, 1, and 2. ZeRO Stage 3 is not supported.
+.. .. note::
+..    AutoTP training supports ZeRO stages 0, 1, and 2. ZeRO Stage 3 is not supported.
 
 .. _autotp-training-init-details:
 

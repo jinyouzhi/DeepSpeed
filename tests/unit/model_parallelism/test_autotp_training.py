@@ -433,6 +433,98 @@ class TestTpLayerFwdBwd(DistributedTest):
 
 
 # @pytest.mark.sequential
+class TestAutoTPZero3Runtime(DistributedTest):
+    world_size = 4
+    reuse_dist_env = False
+
+    def _run_runtime_step(self, partition_config, nlayers, output_classes):
+        skip_on_device()
+        tp_size = 2
+        hidden_dim = 64
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-6
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": tp_size,
+                "tp_overlap_comm": False,
+                "partition_config": partition_config,
+            },
+            "zero_optimization": {
+                "stage": 3,
+            }
+        }
+        if preferred_dtype() is torch.float16:
+            config_dict["fp16"] = {"enabled": True}
+        elif preferred_dtype() is torch.bfloat16:
+            config_dict["bf16"] = {"enabled": True}
+
+        torch.manual_seed(42)
+        model = SequentialLinearModel(hidden_dim=hidden_dim, nlayers=nlayers)
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        assert groups.get_tensor_model_parallel_world_size() == tp_size
+        assert groups.get_data_parallel_world_size() == dist.get_world_size() // tp_size
+
+        trainable_params = [param for param in engine.module.parameters() if param.requires_grad]
+        assert any(is_model_parallel_parameter(param) for param in trainable_params)
+        for param in trainable_params:
+            assert hasattr(param, "ds_id")
+            assert hasattr(param, "ds_process_group")
+            assert dist.get_world_size(group=param.ds_process_group) == dist.get_world_size() // tp_size
+
+        inputs = torch.randn(1,
+                             hidden_dim,
+                             dtype=preferred_dtype(),
+                             requires_grad=True,
+                             device=get_accelerator().current_device())
+        targets = torch.randint(output_classes, (1, ), device=get_accelerator().current_device())
+        dist.broadcast(inputs,
+                       groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
+        dist.broadcast(targets,
+                       groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
+
+        loss = engine(inputs, targets)
+        engine.backward(loss)
+        engine.step()
+        engine.destroy()
+
+    def test_column_parallel(self):
+        partition_config = {
+            "use_default_specs": False,
+            "layer_specs": [{
+                "patterns": [".*linears\\.0\\.weight$"],
+                "partition_type": "column",
+            }],
+        }
+        self._run_runtime_step(partition_config, nlayers=1, output_classes=32)
+
+    def test_column_to_row_parallel(self):
+        partition_config = {
+            "use_default_specs":
+            False,
+            "layer_specs": [
+                {
+                    "patterns": [".*linears\\.0\\.weight$"],
+                    "partition_type": "column",
+                },
+                {
+                    "patterns": [".*linears\\.1\\.weight$"],
+                    "partition_type": "row",
+                },
+            ],
+        }
+        self._run_runtime_step(partition_config, nlayers=2, output_classes=64)
+
+
+# @pytest.mark.sequential
 class TestParamsGather(DistributedTest):
     world_size = 4
     reuse_dist_env = False
@@ -682,7 +774,7 @@ class TestSave(DistributedTest):
         compare_lr_scheduler_states(trained_model, loaded_model)
 
 
-@pytest.mark.parametrize("zero_stage", [0, 1, 2])
+@pytest.mark.parametrize("zero_stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("tp_size", [2, 4])
 class TestTpGradNorm(DistributedTest):
 
