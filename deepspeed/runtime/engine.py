@@ -794,6 +794,7 @@ class DeepSpeedEngine(Module):
                 autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
                 autotp.update_linear_policies()
                 autotp._replace_module(model)
+                setattr(model, UNIVERSAL_CHECKPOINT_INFO, collect_autotp_universal_checkpoint_info(model))
                 setattr(model, "ds_autotp_parsed", True)
                 return
             print_dist(
