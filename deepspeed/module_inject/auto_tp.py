@@ -622,7 +622,7 @@ class AutoTP():
                 f"parameters, e.g. {registered[0]!r}",
                 ranks=[0])
 
-    def update_mp_params(self, child):
+    def update_mp_params(self, child, name=None):
         if getattr(child, "replaced", False) == True:
             return
         tp_index = dist.get_rank(group=self.mp_group) if self.mp_group is not None else 0
@@ -643,7 +643,9 @@ class AutoTP():
                 param_list.remove('embed_dim')
             if hasattr(child, param):
                 param_val = getattr(child, param)
-                setattr(child, param, get_shard_size(param_val, self.mp_size, rank=tp_index))
+                # get_shard_size selects its partitioning strategy from the module name, so the
+                # attributes must be sharded under the same name as the weights they describe.
+                setattr(child, param, get_shard_size(param_val, self.mp_size, name, rank=tp_index))
         setattr(child, "replaced", True)
 
     def update_linear_policies(self):
@@ -681,7 +683,7 @@ class AutoTP():
                 key = next(lp for lp in self.linear_policies if isinstance(child, lp))
                 setattr(autoep_layer, child_name, self.linear_policies[key](child, full_name, self.conv_linear_layer))
             else:
-                self.update_mp_params(child)
+                self.update_mp_params(child, full_name)
                 self._replace_module(child, full_name, "")
 
     def _replace_module(self, r_module, prev_name='', prev_class_name=''):
@@ -730,7 +732,7 @@ class AutoTP():
                     if new_child is not None:
                         setattr(r_module, name, new_child)
                 else:
-                    self.update_mp_params(child)
+                    self.update_mp_params(child, full_name)
                     self._replace_module(child, name, class_name)
             # Traditional path: use linear_policies for type-based routing
             elif child.__class__ in self.linear_policies:
@@ -748,11 +750,12 @@ class AutoTP():
                 setattr(r_module, name, self.linear_policies[key](child, prev_name + '.' + name,
                                                                   self.conv_linear_layer))
             else:
-                self.update_mp_params(child)
+                self.update_mp_params(child, name)
                 self._replace_module(child, name, class_name)
         return r_module
 
-    def get_model_num_kv_heads(self, config):
+    @staticmethod
+    def get_model_num_kv_heads(config):
         num_kv_heads = None
         # multi_query_group_num is for chatglm2 & chatglm3
         kv_head_names = [
