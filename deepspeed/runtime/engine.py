@@ -149,8 +149,9 @@ from deepspeed.compile.util import (is_deepcompile_supported, get_deepcompile_ha
                                     deepcompile_backward_epilogue)
 from deepspeed.compile.backend import register_compile_pass, opt_passes
 from deepspeed.compile.passes.contract import validate_schedule
-from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states
-from deepspeed.compile.init_z1 import init_z1
+from deepspeed.compile.passes import (zero_1_and_2_compile, zero3_compile, prefetch, selective_gather,
+                                      offload_parameters, offload_adam_states, offload_activation)
+from deepspeed.compile.init_z1_and_2 import init_z1_and_2
 from deepspeed.compile.init_z3 import init_z3
 from deepspeed.compile.z3_eager_fallback import deepcompile_z3_forward_context
 from deepspeed.compile.init_sp import init_autosp
@@ -476,12 +477,27 @@ class DeepSpeedEngine(Module):
         self._is_compiled = False
         if is_deepcompile_supported():
             # Predefined compile passes
+            self.register_compile_pass(zero_1_and_2_compile.NAME_Z1, zero_1_and_2_compile.add_z1_reduce,
+                                       zero_1_and_2_compile.CONTRACT_Z1)
+            self.register_compile_pass(zero_1_and_2_compile.NAME_Z2, zero_1_and_2_compile.add_z2_reduce,
+                                       zero_1_and_2_compile.CONTRACT_Z2)
             self.register_compile_pass(zero3_compile.NAME, zero3_compile.add_z3_gather_release, zero3_compile.CONTRACT)
             self.register_compile_pass(prefetch.NAME, prefetch.schedule_prefetch, prefetch.CONTRACT)
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather,
                                        selective_gather.CONTRACT)
+            self.register_compile_pass(offload_parameters.NAME, offload_parameters.offload_parameter_fwd,
+                                       offload_parameters.CONTRACT)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states,
                                        offload_adam_states.CONTRACT)
+            self.register_compile_pass(offload_activation.FLOOR_NAME, offload_activation.offload_activation_floor,
+                                       offload_activation.CONTRACT)
+            self.register_compile_pass(offload_activation.NAME, offload_activation.offload_activation,
+                                       offload_activation.CONTRACT)
+            self.register_compile_pass(offload_adam_states.NAME_SYNC, offload_adam_states.move_opt_states_sync,
+                                       offload_adam_states.CONTRACT_SYNC)
+            self.register_compile_pass(offload_adam_states.NAME_FOR_INIT,
+                                       offload_adam_states.offload_adam_states_for_init,
+                                       offload_adam_states.CONTRACT_FOR_INIT)
 
         # We now support PyTorch style backward, but it relies on the counter in ZeRO optimizers.
         # However, we need some internal APIs to count the number of only used parameters.
@@ -959,15 +975,20 @@ class DeepSpeedEngine(Module):
         """
         Pass through attributes defined in the model if they are not overridden by ds-engine.
         """
-
-        _module = {}
-        if "module" in self.__dict__:
-            _module = self.__dict__['module']
-        if name in dir(self):
-            return getattr(self, name)
-        elif name in dir(_module):
-            return getattr(_module, name)
-        else:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            _module = self.__dict__.get("module")
+            if _module is None:
+                try:
+                    _module = super().__getattr__("module")
+                except AttributeError:
+                    _module = None
+            if _module is not None:
+                try:
+                    return getattr(_module, name)
+                except AttributeError:
+                    pass
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def checkpoint_serialization_enabled(self):
@@ -5652,9 +5673,9 @@ class DeepSpeedEngine(Module):
                 and self._config.zero_config.offload_optimizer.device == "cpu"):
             compile_config.offload_parameters = True
         if self.zero_optimization_stage() == ZeroStageEnum.optimizer_states:
-            return init_z1(self, backend, compile_config, compile_kwargs, schedule)
+            return init_z1_and_2(self, backend, compile_config, compile_kwargs, schedule)
         elif self.zero_optimization_stage() == ZeroStageEnum.gradients:
-            return init_z1(self, backend, compile_config, compile_kwargs, schedule, use_z2=True)
+            return init_z1_and_2(self, backend, compile_config, compile_kwargs, schedule, use_z2=True)
         elif self.zero_optimization_stage() == ZeroStageEnum.weights:
             return init_z3(self, backend, compile_config, compile_kwargs, schedule)
         return None
