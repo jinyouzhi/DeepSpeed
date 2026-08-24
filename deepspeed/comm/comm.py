@@ -104,18 +104,20 @@ def configure(
 
 # Logging wrapper for timing ops
 def timed_op(func):
+    default_log_name = get_default_args(func).get('log_name', func.__name__)
 
     def log_wrapper(*args, **kwargs):
+        selected_log_name = kwargs.get('log_name', default_log_name)
+        should_profile = (('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all
+                          or selected_log_name in comms_logger.prof_ops)
         # Add enabled flag so that overhead to each comm op is two if conditions at most
         if comms_logger.enabled:
-            if ('prof' in kwargs
-                    and kwargs['prof']) or comms_logger.prof_all or ('log_name' in kwargs
-                                                                     and kwargs['log_name'] in comms_logger.prof_ops):
+            if should_profile:
                 # Need func args for their defaults
                 func_args = get_default_args(func)
                 func_args.update(kwargs)
                 # Ops that do not declare a log_name are logged under their own name
-                func_args.setdefault('log_name', func.__name__)
+                func_args['log_name'] = selected_log_name
                 msg_size = get_msg_size_from_args(func, *args, **kwargs)
                 log_name = get_debug_log_name(func_args, comms_logger.debug)
                 timers(log_name).start()
@@ -129,8 +131,7 @@ def timed_op(func):
                 # If we're using MPI, we can't simply sync the stream
                 if cdb.using_mpi:
                     cdb.barrier()
-                if ('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all or (
-                        'log_name' in kwargs and kwargs['log_name'] in comms_logger.prof_ops):
+                if should_profile:
                     log_name = get_debug_log_name(func_args, comms_logger.debug)
                     raw_name = func.__name__
                     timers(log_name).stop()

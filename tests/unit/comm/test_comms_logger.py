@@ -74,3 +74,23 @@ def test_timed_op_falls_back_to_the_op_name_when_log_name_is_missing(monkeypatch
 
     assert barrier() == 'done'
     assert 'barrier' in comm.comms_logger.comms_dict
+
+
+def test_timed_op_profiles_default_log_name_with_prof_ops(monkeypatch):
+    from deepspeed.comm import comm
+
+    monkeypatch.setattr(comm, 'comms_logger', CommsLogger())
+    monkeypatch.setattr(
+        comm, 'cdb', SimpleNamespace(using_mpi=False, is_initialized=lambda: True,
+                                     get_world_size=lambda group=None: 1))
+    monkeypatch.setattr(comm, 'get_accelerator', lambda: SimpleNamespace(synchronize=lambda: None))
+
+    @comm.timed_op
+    def barrier(log_name='barrier'):
+        return 'done'
+
+    comm.comms_logger.enabled = True
+    comm.comms_logger.prof_ops = ['barrier']
+
+    assert barrier() == 'done'
+    assert 'barrier' in comm.comms_logger.comms_dict
