@@ -313,15 +313,39 @@ APIs:
 callers can either allocate a shaped copy of ``tensor`` or obtain a flat locked
 buffer for later filling.
 
+Pin on/off vs backend
+=====================
+
+Whether to pin and how to pin are orthogonal:
+
+* **On/off:** ``zero_optimization.offload_*.pin_memory`` (ZeRO CPU offload),
+  ``use_pin_memory`` on eager activation checkpoint offload
+  (``CheckpointHiddenStatesOffload``), and
+  ``compile.offload_activation_pin_memory`` (DeepCompile activation offload).
+  All default to pinning so async copies can use full DMA bandwidth; set
+  false only under tight memlock limits (``ulimit -l``).
+* **How:** ``DS_PIN_MEMORY_BACKEND=torch|native`` (environment only; not a
+  ``ds_config`` field). Every call site that pins through
+  ``get_accelerator().pin_memory()`` honors this env var, including ZeRO
+  CPU-offload buffers and eager activation checkpoint offload. Keep the default
+  ``torch`` backend for activation offload: ``native`` is ``mlock`` without
+  ``cudaHostRegister``, so its host buffers are not registered for accelerator
+  DMA and the offload's async copies can still block. DeepCompile activation
+  offload pins with ATen ``pinned_memory`` and does **not** use
+  ``DS_PIN_MEMORY_BACKEND``.
+
 Backend Selection
 =================
 
 The pinning implementation is selected with the ``DS_PIN_MEMORY_BACKEND``
 environment variable (default ``torch``).
 
-Both backends page-lock host memory for DMA, are visible to AIO/GDS I/O
-handles (so DeepNVMe can skip bounce buffers), and are counted by
-``track_pinned_memory`` when pages are actually locked. Differences:
+The ``torch`` backend page-locks host memory for **accelerator DMA**
+(``cudaHostRegister`` / device-specific pin). The ``native`` backend
+page-locks via ``posix_memalign`` + ``mlock`` for AIO/GDS (DeepNVMe can
+skip bounce buffers) and does **not** register the allocation with CUDA/XPU,
+so async GPU copies to native-pinned tensors can still block. Both are
+counted by ``track_pinned_memory`` when pages are actually locked. Differences:
 
 .. list-table:: Differences between ``torch`` and ``native`` pin backends
    :header-rows: 1
@@ -332,7 +356,8 @@ handles (so DeepNVMe can skip bounce buffers), and are counted by
      - ``native``
    * - Allocator
      - ``torch.Tensor.pin_memory()`` (device-specific accelerator hook)
-     - DeepNVMe page-locked allocator (``posix_memalign`` + ``mlock``) via pin_memory
+     - DeepNVMe page-locked allocator (``posix_memalign`` + ``mlock``) via pin_memory;
+       registered with the CUDA runtime by default for asynchronous DMA
    * - Selection
      - ``DS_PIN_MEMORY_BACKEND`` unset or ``torch``
      - ``DS_PIN_MEMORY_BACKEND=native``
@@ -361,6 +386,25 @@ Example:
 
     export DS_PIN_MEMORY_BACKEND=native
     deepspeed train.py ...
+
+Native device registration
+==========================
+
+Native allocations are device-independent ``mlock`` buffers. On CUDA systems,
+DeepSpeed additionally calls ``cudaHostRegister`` so PyTorch can use them for
+asynchronous H2D/D2H DMA. Device registration is enabled by default and can be
+disabled for comparison or debugging:
+
+.. code-block:: bash
+
+    export DS_PIN_MEMORY_BACKEND=native
+    export DS_PIN_MEMORY_REGISTER_DEVICE=0  # mlock only; default is 1
+
+``DS_PIN_MEMORY_REGISTER_DEVICE`` accepts ``1``/``0``, ``true``/``false``,
+``yes``/``no``, and ``on``/``off``. Accelerators without a registration hook
+continue to use the device-independent ``mlock`` buffer. If registration fails,
+DeepSpeed logs a warning and retains the valid ``mlock`` allocation for CPU and
+AIO use.
 
 Requirements for native
 =======================
