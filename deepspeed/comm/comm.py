@@ -107,11 +107,12 @@ def timed_op(func):
     default_log_name = get_default_args(func).get('log_name', func.__name__)
 
     def log_wrapper(*args, **kwargs):
-        selected_log_name = kwargs.get('log_name', default_log_name)
-        should_profile = (('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all
-                          or selected_log_name in comms_logger.prof_ops)
+        should_profile = False
         # Add enabled flag so that overhead to each comm op is two if conditions at most
         if comms_logger.enabled:
+            selected_log_name = kwargs.get('log_name', default_log_name)
+            should_profile = (('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all
+                              or selected_log_name in comms_logger.prof_ops)
             if should_profile:
                 # Need func args for their defaults
                 func_args = get_default_args(func)
