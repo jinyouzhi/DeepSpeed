@@ -180,13 +180,13 @@ class TestGramNewtonSchulz(DistributedTest):
             engine.step()
 
 
-class TestMuonRejectsReduceScatter(DistributedTest):
-    """Optimizer offload does not yet support Muon with reduce-scatter."""
+class TestMuonOptimizerOffload(DistributedTest):
+    """Muon remains correct when optimizer state is kept on the CPU."""
 
     world_size = 1
 
-    @pytest.mark.parametrize('zero_stage', [1, 2])
-    def test_muon_reduce_scatter_with_optimizer_offload_raises(self, zero_stage):
+    @pytest.mark.parametrize('zero_stage', [1, 2, 3])
+    def test_muon_with_optimizer_offload(self, zero_stage):
         config_dict = {
             "train_batch_size": 4,
             "optimizer": {
@@ -200,7 +200,7 @@ class TestMuonRejectsReduceScatter(DistributedTest):
             },
             "zero_optimization": {
                 "stage": zero_stage,
-                "reduce_scatter": True,
+                "reduce_scatter": False,
                 "offload_optimizer": {
                     "device": "cpu",
                     "pin_memory": True,
@@ -208,11 +208,18 @@ class TestMuonRejectsReduceScatter(DistributedTest):
             },
         }
         model = SimpleModel(hidden_dim=32, nlayers=2)
-        with pytest.raises(ValueError, match="Muon with reduce scatter does not support optimizer offload"):
-            deepspeed.initialize(config=config_dict,
-                                 model=model,
-                                 model_parameters=model.parameters(),
-                                 dist_init_required=False)
+        initial_params = [p.detach().clone().cpu() for p in model.parameters()]
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               model_parameters=model.parameters(),
+                                               dist_init_required=False)
+        x = torch.randn(4, 32, device=engine.device, dtype=torch.half)
+        y = torch.randint(0, 32, (4, ), device=engine.device)
+        engine.backward(engine(x, y))
+        engine.step()
+        assert any(not torch.equal(initial,
+                                   current.detach().cpu())
+                   for initial, current in zip(initial_params, model.parameters()))
 
 
 class TestMuonZero12NumericalCorrectness(DistributedTest):
@@ -228,21 +235,23 @@ class TestMuonZero12NumericalCorrectness(DistributedTest):
 
     @pytest.mark.parametrize(
         "zero_stage,ns_method,reduce_scatter,gas,overlap_comm,use_multi_rank_bucket_allreduce,"
-        "contiguous_gradients,reduce_bucket_size", [
-            pytest.param(1, "gram", False, 1, False, True, True, 500000000, id="z1-gram-allreduce"),
-            pytest.param(1, "standard", False, 1, False, True, True, 500000000, id="z1-standard-allreduce"),
-            pytest.param(2, "gram", False, 1, False, True, True, 500000000, id="z2-gram-allreduce"),
-            pytest.param(2, "standard", False, 1, False, True, True, 500000000, id="z2-standard-allreduce"),
-            pytest.param(1, "gram", True, 1, False, True, True, 500000000, id="z1-reduce-scatter"),
-            pytest.param(2, "gram", True, 1, False, True, True, 500000000, id="z2-reduce-scatter"),
-            pytest.param(2, "gram", True, 2, True, True, True, 500000000, id="z2-rs-gas2-overlap"),
-            pytest.param(2, "gram", True, 2, False, False, True, 500000000, id="z2-rs-gas2-no-multi-rank"),
-            pytest.param(2, "gram", True, 1, False, True, True, 32768, id="z2-rs-extra-large-param"),
-            pytest.param(2, "gram", True, 1, False, True, False, 500000000, id="z2-rs-noncontiguous"),
+        "contiguous_gradients,reduce_bucket_size,offload_optimizer", [
+            pytest.param(1, "gram", False, 1, False, True, True, 500000000, False, id="z1-gram-allreduce"),
+            pytest.param(1, "standard", False, 1, False, True, True, 500000000, False, id="z1-standard-allreduce"),
+            pytest.param(2, "gram", False, 1, False, True, True, 500000000, False, id="z2-gram-allreduce"),
+            pytest.param(2, "standard", False, 1, False, True, True, 500000000, False, id="z2-standard-allreduce"),
+            pytest.param(1, "gram", True, 1, False, True, True, 500000000, False, id="z1-reduce-scatter"),
+            pytest.param(2, "gram", True, 1, False, True, True, 500000000, False, id="z2-reduce-scatter"),
+            pytest.param(2, "gram", True, 2, True, True, True, 500000000, False, id="z2-rs-gas2-overlap"),
+            pytest.param(2, "gram", True, 2, False, False, True, 500000000, False, id="z2-rs-gas2-no-multi-rank"),
+            pytest.param(2, "gram", True, 1, False, True, True, 32768, False, id="z2-rs-extra-large-param"),
+            pytest.param(2, "gram", True, 1, False, True, False, 500000000, False, id="z2-rs-noncontiguous"),
+            pytest.param(1, "gram", False, 2, False, True, True, 500000000, True, id="z1-offload-gas2"),
+            pytest.param(2, "gram", True, 2, False, True, True, 500000000, True, id="z2-offload-rs-gas2"),
         ])
     def test_update_matches_full_gradient_reference(self, zero_stage, ns_method, reduce_scatter, gas, overlap_comm,
                                                     use_multi_rank_bucket_allreduce, contiguous_gradients,
-                                                    reduce_bucket_size):
+                                                    reduce_bucket_size, offload_optimizer):
         import copy
         from deepspeed.utils import safe_get_full_fp32_param
         from deepspeed.runtime.zero.muon.original_muon import muon_update
@@ -286,6 +295,11 @@ class TestMuonZero12NumericalCorrectness(DistributedTest):
                 "reduce_bucket_size": reduce_bucket_size,
             },
         }
+        if offload_optimizer:
+            config_dict["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": True,
+            }
         engine, _, _, _ = deepspeed.initialize(config=config_dict,
                                                model=model,
                                                model_parameters=model.parameters(),
