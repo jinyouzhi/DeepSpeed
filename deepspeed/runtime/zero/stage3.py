@@ -1198,7 +1198,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if self.offload_optimizer:
             cur_device = self.subgroup_to_device[sub_group_id]
-            if cur_device == 'cpu':
+            if cur_device == 'cpu' or (self.use_muon and self.sub_groups_using_muon[sub_group_id]):
                 self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
                 step_with_gradscaler(self.optimizer)
                 self.optimizer.param_groups[param_group_id]['params'] = []
@@ -2387,6 +2387,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     @instrument_w_nvtx
     def _get_norm_groups(self):
+        if self.offload_optimizer:
+            self._apply_muon_updates_cpu_offload()
         norm_groups = []
         for i, group in enumerate(self.fp16_groups):
             if self.offload_optimizer:
@@ -2394,6 +2396,67 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             else:
                 norm_groups.append(self.get_grad_norm_direct(self.averaged_gradients[i], self.fp16_groups[i]))
         return norm_groups
+
+    @instrument_w_nvtx
+    @torch.no_grad()
+    def _apply_muon_updates_cpu_offload(self):
+        """Orthogonalize full logical gradients before clipping CPU-offloaded updates."""
+        if not self.use_muon:
+            return
+
+        accelerator_device = get_accelerator().current_device_name()
+        for sub_group_id, params in enumerate(self.fp16_groups):
+            muon_params = [param for param in params if getattr(param, "use_muon", False)]
+            if not muon_params:
+                continue
+
+            if self._swappable_optimizer_subgroup(sub_group_id):
+                self._optimizer_states_and_gradient_swap_in(sub_group_id)
+
+            fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+            state = self.optimizer.state.setdefault(fp32_param, {})
+            momentum = state.get("momentum_buffer")
+            if momentum is None or momentum.numel() != fp32_param.numel():
+                self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
+                momentum = state["momentum_buffer"]
+
+            local_grad_parts = []
+            local_momentum_parts = []
+            for param in muon_params:
+                _, dest_offset, _ = self.grad_position[self.get_param_id(param)]
+                numel = param.partition_numel()
+                local_grad_parts.append(fp32_param.grad.narrow(0, dest_offset, numel).to(accelerator_device))
+                local_momentum_parts.append(momentum.narrow(0, dest_offset, numel).to(accelerator_device))
+
+            full_grads = self._partitioned_buffers_all_gather(muon_params, local_grad_parts,
+                                                              self.gradient_accumulation_dtype)
+            full_momentums = self._partitioned_buffers_all_gather(muon_params, local_momentum_parts,
+                                                                  self.gradient_accumulation_dtype)
+            optimizer_group = self.optimizer.param_groups[self.sub_group_to_group_id[sub_group_id]]
+
+            for param, full_grad, full_momentum in zip(muon_params, full_grads, full_momentums):
+                update = muon_update(full_grad,
+                                     full_momentum,
+                                     beta=optimizer_group["momentum"],
+                                     ns_method=optimizer_group.get("ns_method", "gram"),
+                                     is_expert_group=getattr(param, "is_expert_group", False))
+                partition_numel = param.partition_numel()
+                partition_rank = self._get_param_partition_rank(param)
+                start = partition_rank * partition_numel
+                real_numel = min(partition_numel, max(0, param.ds_numel - start))
+                local_update = torch.zeros(partition_numel, dtype=update.dtype, device=accelerator_device)
+                if real_numel > 0:
+                    local_update[:real_numel].copy_(update.view(-1).narrow(0, start, real_numel))
+                _, dest_offset, _ = self.grad_position[self.get_param_id(param)]
+                fp32_param.grad.narrow(0, dest_offset, partition_numel).copy_(local_update.to(fp32_param.grad.dtype))
+                local_momentum = torch.zeros(partition_numel, dtype=full_momentum.dtype, device=accelerator_device)
+                if real_numel > 0:
+                    local_momentum[:real_numel].copy_(full_momentum.view(-1).narrow(0, start, real_numel))
+                momentum.narrow(0, dest_offset, partition_numel).copy_(local_momentum.to(momentum.dtype))
+                self.norm_for_param_grads[self.get_param_id(param)] = local_update.to(get_norm_dtype()).norm(2)
+
+            if self._swappable_optimizer_subgroup(sub_group_id):
+                self._optimizer_states_and_gradient_swap_out(sub_group_id)
 
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):

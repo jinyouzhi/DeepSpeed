@@ -228,10 +228,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.reduce_scatter = reduce_scatter
 
-        if isinstance(self.optimizer, MuonWithAuxAdam) and self.reduce_scatter and self.cpu_offload:
-            raise ValueError("Muon with reduce scatter does not support optimizer offload because offload retains "
-                             "only partition slices; disable reduce scatter or optimizer offload")
-
         self.overlap_comm = overlap_comm
 
         self.deepspeed_adam_offload = self.cpu_offload
@@ -1647,6 +1643,77 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return torch.tensor(total_norm, device=self.device, dtype=torch.float)
 
+    @torch.no_grad()
+    def _apply_muon_updates_cpu_offload(self):
+        """Orthogonalize full Muon gradients before clipping CPU-offloaded updates."""
+        if not isinstance(self.optimizer, MuonWithAuxAdam):
+            return
+
+        accelerator_device = get_accelerator().current_device_name()
+        for group_idx, group in enumerate(self.round_robin_bit16_groups):
+            muon_params = [param for param in group if getattr(param, "use_muon", False)]
+            if not muon_params:
+                continue
+
+            process_group = self.real_dp_process_group[group_idx]
+            world_size = dist.get_world_size(group=process_group)
+            rank = dist.get_rank(group=process_group)
+            partition_size = int(self.partition_size[group_idx])
+            local_grad = self.single_partition_of_fp32_groups[group_idx].grad.to(accelerator_device)
+            full_grad = torch.empty(partition_size * world_size, dtype=local_grad.dtype, device=accelerator_device)
+            dist.all_gather_into_tensor(full_grad, local_grad, group=process_group)
+
+            flat_param = self.single_partition_of_fp32_groups[group_idx]
+            state = self.optimizer.state.setdefault(flat_param, {})
+            momentum = state.get("momentum_buffer")
+            if momentum is None or momentum.numel() != partition_size:
+                momentum = torch.zeros_like(flat_param)
+                state["momentum_buffer"] = momentum
+            local_momentum = momentum.to(accelerator_device)
+            full_momentum = torch.empty(partition_size * world_size,
+                                        dtype=local_momentum.dtype,
+                                        device=accelerator_device)
+            dist.all_gather_into_tensor(full_momentum, local_momentum, group=process_group)
+
+            def reconstruct_param(buffer, param):
+                # A parameter can straddle partitions, so use the recorded slice map rather than
+                # deriving offsets from rank and partition size.
+                param_id = self.get_param_id(param)
+                full_param = torch.zeros(param.numel(), dtype=buffer.dtype, device=accelerator_device)
+                for partition_id in self.param_to_partition_ids[group_idx][param_id]:
+                    source_offset = int(self.grad_partition_insertion_offset[group_idx][partition_id][param_id])
+                    param_offset = int(self.grad_start_offset[group_idx][partition_id][param_id])
+                    num_elements = int(min(param.numel() - param_offset, partition_size - source_offset))
+                    if num_elements > 0:
+                        source = buffer.narrow(0, partition_id * partition_size + source_offset, num_elements)
+                        full_param.narrow(0, param_offset, num_elements).copy_(source)
+                return full_param.view_as(param)
+
+            optimizer_group = self.optimizer.param_groups[group_idx]
+            for param in muon_params:
+                param_id = self.get_param_id(param)
+                grad = reconstruct_param(full_grad, param)
+                param_momentum = reconstruct_param(full_momentum, param)
+                update = muon_update(grad,
+                                     param_momentum,
+                                     optimizer_group["momentum"],
+                                     ns_method=optimizer_group.get("ns_method", "gram"),
+                                     is_expert_group=getattr(param, "is_expert_group", False))
+
+                if rank not in self.param_to_partition_ids[group_idx][param_id]:
+                    continue
+                source_offset = int(self.grad_start_offset[group_idx][rank][param_id])
+                dest_offset = int(self.grad_partition_insertion_offset[group_idx][rank][param_id])
+                num_elements = int(min(param.numel() - source_offset, partition_size - dest_offset))
+                if num_elements > 0:
+                    local_update = update.view(-1).narrow(0, source_offset, num_elements)
+                    self.single_partition_of_fp32_groups[group_idx].grad.view(-1).narrow(
+                        0, dest_offset, num_elements).copy_(
+                            local_update.to(self.single_partition_of_fp32_groups[group_idx].grad.dtype))
+                    self.norm_for_param_grads[param_id] = local_update.to(get_norm_dtype()).norm(2)
+                    momentum_update = param_momentum.view(-1).narrow(0, source_offset, num_elements)
+                    momentum.narrow(0, dest_offset, num_elements).copy_(momentum_update.to(momentum.dtype))
+
     ############################################################################################
     def copy_grads_in_partition(self, param):
         if self.cpu_offload:
@@ -2313,6 +2380,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # Step 1:- Calculate gradient norm using bit-16 grads
         see_memory_usage('Before norm calculation')
+        if self.cpu_offload:
+            self._apply_muon_updates_cpu_offload()
         scaled_global_grad_norm = self.scaled_global_norm()
         self._global_grad_norm = scaled_global_grad_norm / prev_scale
         see_memory_usage('After norm before optimizer')
