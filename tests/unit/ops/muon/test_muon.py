@@ -11,6 +11,8 @@ import pytest
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 if torch.half not in get_accelerator().supported_dtypes():
     pytest.skip(f"fp16 not supported, valid dtype: {get_accelerator().supported_dtypes()}", allow_module_level=True)
 
@@ -220,6 +222,20 @@ class TestMuonOptimizerOffload(DistributedTest):
         assert any(not torch.equal(initial,
                                    current.detach().cpu())
                    for initial, current in zip(initial_params, model.parameters()))
+
+
+class TestMuonAllGatherBufferLifecycle:
+
+    @pytest.mark.parametrize("optimizer_class", [DeepSpeedZeroOptimizer, DeepSpeedZeroOptimizer_Stage3])
+    def test_clear_muon_allgather_buffers(self, optimizer_class):
+        optimizer = optimizer_class.__new__(optimizer_class)
+        optimizer._muon_allgather_buffers = {"test": object()}
+        optimizer._muon_allgather_buffer_bytes = 128
+
+        optimizer._clear_muon_allgather_buffers()
+
+        assert not optimizer._muon_allgather_buffers
+        assert optimizer._muon_allgather_buffer_bytes == 0
 
 
 class TestMuonZero12NumericalCorrectness(DistributedTest):
