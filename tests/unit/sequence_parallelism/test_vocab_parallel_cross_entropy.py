@@ -5,12 +5,15 @@
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import deepspeed.comm as dist
+import deepspeed.sequence.cross_entropy as cross_entropy
 from deepspeed.accelerator import get_accelerator
+from deepspeed.module_inject.layers import VocabParallelLinear
 from deepspeed.module_inject.tp_shard import get_shard_size_list
-from deepspeed.sequence.cross_entropy import vocab_parallel_cross_entropy
+from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, vocab_parallel_cross_entropy
 from unit.common import DistributedTest
 
 
@@ -58,6 +61,76 @@ def test_vocab_parallel_cross_entropy_validates_inputs():
     target[0, 0] = 11
     with pytest.raises(ValueError, match="out of range"):
         vocab_parallel_cross_entropy(logits, target)
+
+
+def test_causal_lm_loss_shifts_labels_and_matches_reference():
+    torch.manual_seed(7)
+    vocab_size = 13
+    logits = torch.randn(2, 5, vocab_size)
+    labels = torch.tensor([[0, 3, 12, -100, 7], [1, 2, 3, 4, -100]])
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+
+    from_labels = loss_fn(logits=logits, labels=labels)
+    from_shift_labels = loss_fn(logits=logits[..., :-1, :], shift_labels=labels[..., 1:])
+    expected = F.cross_entropy(logits[..., :-1, :].reshape(-1, vocab_size),
+                               labels[..., 1:].reshape(-1),
+                               ignore_index=-100)
+
+    torch.testing.assert_close(from_labels, expected)
+    torch.testing.assert_close(from_shift_labels, expected)
+
+
+def test_causal_lm_loss_divides_sum_by_num_items_in_batch():
+    torch.manual_seed(8)
+    vocab_size = 9
+    logits = torch.randn(2, 4, vocab_size)
+    shift_labels = torch.tensor([[0, 1, -100], [2, 3, 4]])
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+
+    loss = loss_fn(logits=logits, shift_labels=shift_labels, num_items_in_batch=5)
+
+    token_losses = F.cross_entropy(logits.reshape(-1, vocab_size),
+                                   shift_labels.reshape(-1),
+                                   reduction="none",
+                                   ignore_index=-100)
+    torch.testing.assert_close(loss, token_losses.sum() / 5)
+
+
+def test_causal_lm_loss_vocab_size_mismatch_warns_instead_of_raising():
+    torch.manual_seed(9)
+    vocab_size = 7
+    logits = torch.randn(2, 3, vocab_size)
+    labels = torch.tensor([[0, 1, 2], [3, 4, 6]])
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+
+    # A resized embedding leaves the caller's vocab_size stale; the head's weights win.
+    loss = loss_fn(logits=logits, labels=labels, vocab_size=vocab_size + 1)
+
+    expected = F.cross_entropy(logits[..., :-1, :].reshape(-1, vocab_size),
+                               labels[..., 1:].reshape(-1),
+                               ignore_index=-100)
+    torch.testing.assert_close(loss, expected)
+
+
+def test_vocab_metadata_validation_runs_once(monkeypatch):
+    torch.manual_seed(10)
+    # A vocab size unique to this test keeps the process-wide metadata cache from being
+    # warmed by the other tests, whatever order pytest runs them in.
+    vocab_size = 23
+    logits = torch.randn(2, 3, vocab_size)
+    target = torch.zeros(2, 3, dtype=torch.long)
+    calls = []
+    original_validate = cross_entropy._validate_vocab_shard_bounds
+
+    def counting_validate(*args, **kwargs):
+        calls.append(1)
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(cross_entropy, "_validate_vocab_shard_bounds", counting_validate)
+    vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
+    vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
+
+    assert len(calls) == 1
 
 
 class TestVocabParallelCrossEntropyTP(DistributedTest):
@@ -207,3 +280,13 @@ class TestVocabParallelCrossEntropyTPAndSP(DistributedTest):
         expected.backward()
         expected_grad = reference_logits.grad[sequence_start:sequence_end, ..., vocab_start_index:vocab_end_index]
         torch.testing.assert_close(local_logits.grad, expected_grad)
+
+
+class TestVocabParallelLinearRejectsEmptyShard(DistributedTest):
+    world_size = 2
+
+    def test_vocabulary_smaller_than_tp_size_raises_on_all_ranks(self):
+        # Both ranks derive the same shard-size list, so the failure must be raised
+        # everywhere at construction time instead of hanging in a later collective.
+        with pytest.raises(ValueError, match="at least tp_size"):
+            VocabParallelLinear(nn.Linear(4, 1, bias=False), mp_group=dist.get_world_group(), name="lm_head")

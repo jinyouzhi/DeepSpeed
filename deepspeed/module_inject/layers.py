@@ -944,6 +944,11 @@ class VocabParallelLinear(LinearLayer):
 
     def __init__(self, module, mp_group=None, **kwargs):
         super().__init__(module, mp_group, gather_output=False, **kwargs)
+        if min(self._partition_sizes) == 0:
+            # The shard-size list is identical on every TP rank, so all ranks raise here
+            # together instead of one rank failing into a collective hang at the loss.
+            raise ValueError(f"vocab_parallel_lm_head requires a vocabulary of at least tp_size="
+                             f"{self.tp_world_size} rows, but '{self.name}' has {self._orig_weight_shape[0]}")
         self.is_vocab_parallel_lm_head = True
         self.vocab_size = self._orig_weight_shape[0]
         self.vocab_start_index = sum(self._partition_sizes[:self.tp_index])

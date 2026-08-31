@@ -169,7 +169,11 @@ vocabulary shards are supported.
 This option requires an untied output head and a model with a writable
 `loss_function` hook. Models that share the output weight with the input
 embedding must continue using gathered output until coupled vocabulary-parallel
-embedding support is available.
+embedding support is available. The head's vocabulary must also be at least as
+large as `autotp_size`; smaller vocabularies fail at startup instead of leaving
+TP ranks with empty shards. The flag itself is the only trigger: a `colwise`
+`lm_head` specification with local output keeps the previous behavior of
+returning rank-local logits without installing the distributed loss.
 
 The lower-level `vocab_parallel_cross_entropy` API also accepts an explicit
 sequence-parallel group. With `reduction="none"`, callers may return local token
@@ -177,6 +181,12 @@ losses or gather them along sequence dimension 0. `sum` and `mean` reduce over
 the supplied SP group. TP and SP may be combined with explicit orthogonal
 process groups, but AutoTP does not currently construct a combined TP x SP mesh
 automatically.
+
+Under DeepSpeed's Ulysses sequence-parallel engine, the installed loss must keep
+its default sequence-parallel settings (no `sp_group`): the engine aggregates
+each shard's mean itself, weighted by the shard's valid-token count, so an
+additional SP reduction would double-count tokens. Pass an `sp_group` only when
+this loss is the sole aggregation over a manually constructed TP x SP mesh.
 
 
 ## Custom Patterns
@@ -266,7 +276,7 @@ For Grouped Query Attention with different Q/K/V sizes:
 
 1. **Ranks beyond the key/value head count stay idle**: Attention heads are distributed whole, and the distribution may be uneven -- 6 key/value heads over 4 ranks becomes 2/2/1/1, and a fused QKV weight is cut on the same head boundaries rather than inside a head. With more ranks than key/value heads, for example an 8-head model at `autotp_size=16`, the surplus ranks receive no attention weights at all. The result is still correct, because those ranks contribute zeros to the row-parallel all-reduce, but they do no attention work; AutoTP logs a warning instead of replicating heads to fill them. Hidden and vocabulary dimensions do not need to be divisible by the tensor parallel size: uneven shards are carried through save, conversion and restore via per-TP-rank shapes and widths.
 
-2. **Vocabulary-parallel tied weights**: `vocab_parallel_lm_head` requires an untied output projection and a writable model `loss_function` hook. Coupled sharding of a tied input embedding and output projection is not yet implemented.
+2. **Vocabulary-parallel tied weights**: `vocab_parallel_lm_head` requires an untied output projection and a writable model `loss_function` hook, and a vocabulary at least as large as the tensor-parallel size. Coupled sharding of a tied input embedding and output projection is not yet implemented.
 
 3. **Combined TP and SP orchestration**: The vocab-parallel loss supports explicit orthogonal TP and SP groups, but AutoTP does not currently construct a combined TP x SP process mesh automatically.
 

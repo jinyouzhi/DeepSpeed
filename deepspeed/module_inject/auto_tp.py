@@ -366,10 +366,8 @@ class AutoTP():
         if getattr(child, "_is_autoep_layer", False):
             return child
 
-        if self.vocab_parallel_lm_head and self._is_lm_head_name(name):
-            self._validate_untied_vocab_head(child)
-            setattr(child, "replaced", True)
-            return VocabParallelLinear(child, self.mp_group, name=name)
+        if self._is_vocab_parallel_lm_head(child, name):
+            return self._create_vocab_parallel_layer(child, name)
 
         weight_shape = child.weight.shape
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
@@ -430,10 +428,8 @@ class AutoTP():
         if getattr(child, "replaced", False) == True:
             return child
 
-        if self.vocab_parallel_lm_head and self._is_lm_head_name(name):
-            self._validate_untied_vocab_head(child)
-            setattr(child, "replaced", True)
-            return VocabParallelLinear(child, self.mp_group, name=name)
+        if self._is_vocab_parallel_lm_head(child, name):
+            return self._create_vocab_parallel_layer(child, name)
 
         # Build the full parameter name for pattern matching
         param_name = name + ".weight" if not name.endswith(".weight") else name
@@ -481,11 +477,8 @@ class AutoTP():
         """Create column-parallel layer (AllReduce in backward)."""
         if self.conv_linear_layer:
             return conv_LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output)
-        if self._is_lm_head_name(name) and not spec.gather_output:
-            self._validate_untied_vocab_head(module)
-            return VocabParallelLinear(module, self.mp_group, name=name)
         # Only use fused-QKV heuristics when no partition_config is provided.
-        elif self.partition_config is None and require_tp_fused_qkvw(name, self.mp_size):
+        if self.partition_config is None and require_tp_fused_qkvw(name, self.mp_size):
             # Check and handle fused qkv for TP
             return fused_LinearLayer(module, self.mp_group, fused_module=self.module)
         if spec.shape is not None:
@@ -502,7 +495,23 @@ class AutoTP():
 
     @staticmethod
     def _is_lm_head_name(name):
-        return any(part in ("lm_head", "embed_out") for part in str(name).split('.'))
+        # Only the final path segment may match, so auxiliary projections whose names
+        # merely contain "lm_head" (e.g. "lm_head_proj") are never captured.
+        return str(name).split('.')[-1] in ("lm_head", "embed_out")
+
+    def _is_vocab_parallel_lm_head(self, child, name):
+        # VocabParallelLinear assumes an [vocab, hidden] nn.Linear weight; a Conv1D head
+        # stores [hidden, vocab] and would be cut on the wrong dimension.
+        return self.vocab_parallel_lm_head and isinstance(child, nn.Linear) and self._is_lm_head_name(name)
+
+    def _create_vocab_parallel_layer(self, child, name):
+        self._validate_untied_vocab_head(child)
+        setattr(child, "replaced", True)
+        log_dist(
+            f"AutoTP: vocab_parallel_lm_head keeps '{name}' vocabulary-sharded and installs the "
+            f"distributed causal-LM loss",
+            ranks=[0])
+        return VocabParallelLinear(child, self.mp_group, name=name)
 
     def _validate_untied_vocab_head(self, lm_head):
         for _, module in self.module.named_modules():

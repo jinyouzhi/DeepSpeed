@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 import deepspeed.comm as dist
+from deepspeed.utils.logging import logger
 
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
@@ -102,11 +103,51 @@ def _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_
     for rank, (shard_start, shard_end, shard_size) in enumerate(gathered_metadata.view(tp_world_size, 3).tolist()):
         if shard_end - shard_start != shard_size:
             raise ValueError(f"Vocabulary shard bounds for TP rank {rank} do not match its local vocabulary size")
+        if shard_size <= 0:
+            raise ValueError(f"TP rank {rank} received an empty vocabulary shard; the vocabulary must be at least "
+                             f"as large as the tensor-parallel size")
         if shard_start != expected_start:
             raise ValueError("Vocabulary shard bounds must form a contiguous, non-overlapping partition starting at 0")
         expected_start = shard_end
 
     return expected_start
+
+
+_vocab_metadata_cache = {}
+
+
+def _resolve_vocab_metadata(local_vocab_size, vocab_start_index, vocab_end_index, tp_group, device):
+    """Collectively validate the vocabulary shard layout once and cache the result.
+
+    The shard geometry is fixed for the lifetime of the layers, so the repeated calls a
+    training loop makes every micro-batch must not re-run the validation collectives or
+    their host synchronizations. Decisions are made from identical all-gathered data, so
+    every TP rank raises together instead of diverging into a collective hang.
+    """
+    key = (tp_group, local_vocab_size, vocab_start_index, vocab_end_index)
+    cached = _vocab_metadata_cache.get(key)
+    if cached is not None:
+        return cached
+
+    if vocab_start_index is None:
+        tp_world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        if tp_world_size > 1:
+            local_size = torch.tensor(local_vocab_size, device=device, dtype=torch.long)
+            min_local_size = local_size.clone()
+            max_local_size = local_size.clone()
+            dist.all_reduce(min_local_size, op=dist.ReduceOp.MIN, group=tp_group)
+            dist.all_reduce(max_local_size, op=dist.ReduceOp.MAX, group=tp_group)
+            if min_local_size.item() != max_local_size.item():
+                raise ValueError("Explicit vocabulary shard bounds are required for uneven tensor-parallel shards")
+        vocab_start_index = tp_rank * local_vocab_size
+        vocab_end_index = vocab_start_index + local_vocab_size
+    global_vocab_size = _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_index, tp_group,
+                                                     device)
+
+    metadata = (vocab_start_index, vocab_end_index, global_vocab_size)
+    _vocab_metadata_cache[key] = metadata
+    return metadata
 
 
 def vocab_parallel_cross_entropy(vocab_parallel_logits,
@@ -125,7 +166,9 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
     """
     if vocab_parallel_logits.shape[:-1] != target.shape:
         raise ValueError("vocab_parallel_logits and target must have matching non-vocabulary dimensions")
-    if vocab_parallel_logits.shape[-1] == 0:
+    # With tensor parallelism an empty shard is rejected from the all-gathered shard
+    # metadata so every rank fails together; only the single-process case can raise here.
+    if vocab_parallel_logits.shape[-1] == 0 and (tp_group is None or dist.get_world_size(tp_group) == 1):
         raise ValueError("vocab_parallel_logits must contain at least one local vocabulary entry")
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Unsupported reduction: {reduction}")
@@ -136,20 +179,10 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
     if (vocab_start_index is None) != (vocab_end_index is None):
         raise ValueError("vocab_start_index and vocab_end_index must be provided together")
 
-    tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-    if vocab_start_index is None:
-        if tp_group is not None and dist.get_world_size(tp_group) > 1:
-            local_size = torch.tensor(local_vocab_size, device=vocab_parallel_logits.device, dtype=torch.long)
-            min_local_size = local_size.clone()
-            max_local_size = local_size.clone()
-            dist.all_reduce(min_local_size, op=dist.ReduceOp.MIN, group=tp_group)
-            dist.all_reduce(max_local_size, op=dist.ReduceOp.MAX, group=tp_group)
-            if min_local_size.item() != max_local_size.item():
-                raise ValueError("Explicit vocabulary shard bounds are required for uneven tensor-parallel shards")
-        vocab_start_index = tp_rank * local_vocab_size
-        vocab_end_index = vocab_start_index + local_vocab_size
-    global_vocab_size = _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_index, tp_group,
-                                                     vocab_parallel_logits.device)
+    vocab_start_index, vocab_end_index, global_vocab_size = _resolve_vocab_metadata(
+        local_vocab_size, vocab_start_index, vocab_end_index, tp_group, vocab_parallel_logits.device)
+    # Data-dependent, so it cannot be hoisted out of the training loop: an out-of-range
+    # target belongs to no shard and would otherwise silently contribute a wrong, finite loss.
     invalid_target = (target != ignore_index) & ((target < 0) | (target >= global_vocab_size))
     if invalid_target.any().item():
         raise ValueError(f"Target is out of range for vocabulary size {global_vocab_size}")
@@ -182,6 +215,13 @@ def vocab_sequence_parallel_cross_entropy(vocab_parallel_logits,
                                           ignore_index=-100,
                                           reduction="none",
                                           gather_sequence_loss=True):
+    """Sequence-parallel wrapper over :func:`vocab_parallel_cross_entropy`.
+
+    Backward reduce-scatters the gradient over ``sp_group``, so each rank receives the
+    gradient of its own sequence shard with the other ranks' contributions already
+    summed in. Downstream code must therefore treat the returned loss as replicated
+    across the SP group and must not average SP gradients a second time.
+    """
     return vocab_parallel_cross_entropy(vocab_parallel_logits,
                                         target,
                                         tp_group=tp_group,
@@ -225,6 +265,14 @@ class VocabParallelCrossEntropyLoss(nn.Module):
 
 
 class VocabParallelCausalLMLoss(nn.Module):
+    """Distributed causal-LM loss for a vocabulary-sharded (no-gather) LM head.
+
+    ``sp_group`` must stay ``None`` under DeepSpeed's Ulysses sequence-parallel engine:
+    that engine aggregates the per-shard means itself, weighted by each shard's
+    valid-token count, so an additional SP reduction here would double-count tokens.
+    Pass ``sp_group`` only when this loss is the sole aggregation over a manually
+    constructed TP x SP process-group mesh.
+    """
 
     def __init__(self, tp_group=None, sp_group=None, vocab_start_index=None, vocab_end_index=None, ignore_index=-100):
         super().__init__()
@@ -243,15 +291,15 @@ class VocabParallelCausalLMLoss(nn.Module):
         else:
             shift_labels = shift_labels.contiguous()
 
-        if vocab_size is not None and self.vocab_end_index is not None:
-            global_vocab_size = self.vocab_end_index
-            if self.tp_group is not None and dist.get_world_size(self.tp_group) > 1:
-                global_vocab_size = torch.tensor(global_vocab_size, device=logits.device, dtype=torch.long)
-                dist.all_reduce(global_vocab_size, op=dist.ReduceOp.MAX, group=self.tp_group)
-                global_vocab_size = global_vocab_size.item()
-            if global_vocab_size != vocab_size:
-                raise ValueError(f"Vocab-parallel shard metadata describes vocab_size={global_vocab_size}, "
-                                 f"but vocab_size={vocab_size}")
+        if vocab_size is not None and self.vocab_start_index is not None and self.vocab_end_index is not None:
+            # The LM head's shard metadata is the source of truth; a mismatch usually means
+            # the embedding was resized, which gathered loss implementations tolerated.
+            _, _, global_vocab_size = _resolve_vocab_metadata(self.vocab_end_index - self.vocab_start_index,
+                                                              self.vocab_start_index, self.vocab_end_index,
+                                                              self.tp_group, logits.device)
+            if vocab_size != global_vocab_size:
+                logger.warning_once(f"Vocab-parallel LM head holds vocab_size={global_vocab_size}, but the caller "
+                                    f"described vocab_size={vocab_size}; the LM head's weights win")
 
         reduction = "sum" if num_items_in_batch is not None else "mean"
         loss = vocab_parallel_cross_entropy(logits,
@@ -269,7 +317,12 @@ class VocabParallelCausalLMLoss(nn.Module):
 
 
 def configure_vocab_parallel_loss(model, vocab_parallel_head, sp_group=None, ignore_index=-100):
-    """Install the causal-LM loss required by a no-gather vocabulary projection."""
+    """Install the causal-LM loss required by a no-gather vocabulary projection.
+
+    Leave ``sp_group`` as ``None`` when running under DeepSpeed's Ulysses
+    sequence-parallel engine: the engine performs the token-count-weighted aggregation
+    across SP ranks itself and expects this loss to return the local shard's mean.
+    """
     if not hasattr(model, "loss_function"):
         raise ValueError("A no-gather vocab-parallel LM head requires a writable loss_function hook; "
                          "use gather_output=True for models without one")
@@ -279,10 +332,13 @@ def configure_vocab_parallel_loss(model, vocab_parallel_head, sp_group=None, ign
                                         vocab_start_index=vocab_parallel_head.vocab_start_index,
                                         vocab_end_index=vocab_parallel_head.vocab_end_index,
                                         ignore_index=ignore_index)
+    # Keep the stock loss reachable so callers can restore it when tearing the head down.
     if not hasattr(model, "_deepspeed_original_loss_function"):
         model._deepspeed_original_loss_function = model.loss_function
 
-    model._loss_function = loss_fn
+    # Some model classes expose loss_function as a read-only property, in which case the
+    # assignment raises; the identity check below turns that into an actionable error
+    # instead of leaving the model silently computing loss on rank-local logits.
     try:
         model.loss_function = loss_fn
     except AttributeError:

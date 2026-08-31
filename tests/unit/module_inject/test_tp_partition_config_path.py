@@ -159,7 +159,7 @@ def _build_gathered_lm_head_autotp(model, mp_size=1):
     return autotp
 
 
-def _build_local_lm_head_autotp(model):
+def _build_local_lm_head_autotp(model, vocab_parallel_lm_head=True):
     config = AutoTPConfig(layer_specs=[
         TPLayerSpec(patterns=[r".*lm_head\.weight$"], partition_type=PartitionType.COLUMN),
     ])
@@ -171,6 +171,7 @@ def _build_local_lm_head_autotp(model):
         linear_layer_setting=None,
         orig_layer_impl=None,
         partition_config=config,
+        vocab_parallel_lm_head=vocab_parallel_lm_head,
     )
     autotp.set_tensor_parallel_config(1, None)
     autotp.update_linear_policies()
@@ -240,9 +241,31 @@ def test_vocab_parallel_linear_exposes_vocab_metadata():
 def test_plain_colwise_lm_head_uses_vocab_parallel_layer():
     model = OutputModel(tied=False)
 
-    _build_local_lm_head_autotp(model)._replace_module(model)
+    _build_local_lm_head_autotp(model, vocab_parallel_lm_head=True)._replace_module(model)
 
     assert isinstance(model.lm_head, VocabParallelLinear)
+
+
+def test_plain_colwise_lm_head_without_flag_keeps_local_logits():
+    model = OutputModel(tied=False)
+
+    _build_local_lm_head_autotp(model, vocab_parallel_lm_head=False)._replace_module(model)
+
+    assert isinstance(model.lm_head, LinearLayer)
+    assert not isinstance(model.lm_head, VocabParallelLinear)
+    assert not model.lm_head.gather_output
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("lm_head", True),
+    ("embed_out", True),
+    ("model.lm_head", True),
+    ("lm_head_proj", False),
+    ("model.lm_head_proj.weight", False),
+    ("inner_lm_head.block", False),
+])
+def test_lm_head_name_matching_ignores_projections(name, expected):
+    assert AutoTP._is_lm_head_name(name) is expected
 
 
 def test_plain_colwise_lm_head_rejects_tied_weights():
