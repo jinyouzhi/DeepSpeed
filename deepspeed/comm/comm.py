@@ -23,6 +23,7 @@
 
 import torch
 from torch.distributed import GradBucket  # noqa: F401
+import inspect
 import os
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -110,8 +111,12 @@ def timed_op(func):
         should_profile = False
         # Add enabled flag so that overhead to each comm op is two if conditions at most
         if comms_logger.enabled:
-            selected_log_name = kwargs.get('log_name', default_log_name)
-            should_profile = (('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all
+            # prof/log_name may be passed positionally, so bind args/kwargs to
+            # func's signature rather than only looking at kwargs
+            bound_args = inspect.signature(func).bind_partial(*args, **kwargs)
+            bound_args.apply_defaults()
+            selected_log_name = bound_args.arguments.get('log_name', default_log_name)
+            should_profile = (bound_args.arguments.get('prof', False) or comms_logger.prof_all
                               or selected_log_name in comms_logger.prof_ops)
             if should_profile:
                 # Need func args for their defaults
@@ -238,7 +243,6 @@ def broadcast_object_list(object_list,
                           src,
                           group=None,
                           device=None,
-                          *,
                           prof=False,
                           log_name='broadcast_object_list',
                           debug=get_caller_func()):
@@ -379,7 +383,6 @@ def all_to_all(output_tensor_list,
                input_tensor_list,
                group=None,
                async_op=False,
-               *,
                prof=False,
                log_name='all_to_all',
                debug=get_caller_func()):
