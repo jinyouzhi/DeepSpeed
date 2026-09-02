@@ -106,6 +106,9 @@ def configure(
 # Logging wrapper for timing ops
 def timed_op(func):
     default_log_name = get_default_args(func).get('log_name', func.__name__)
+    # func is fixed at decoration time, so resolve its signature once here rather
+    # than on every call
+    func_signature = inspect.signature(func)
 
     def log_wrapper(*args, **kwargs):
         should_profile = False
@@ -113,7 +116,7 @@ def timed_op(func):
         if comms_logger.enabled:
             # prof/log_name may be passed positionally, so bind args/kwargs to
             # func's signature rather than only looking at kwargs
-            bound_args = inspect.signature(func).bind_partial(*args, **kwargs)
+            bound_args = func_signature.bind_partial(*args, **kwargs)
             bound_args.apply_defaults()
             selected_log_name = bound_args.arguments.get('log_name', default_log_name)
             should_profile = (bound_args.arguments.get('prof', False) or comms_logger.prof_all
