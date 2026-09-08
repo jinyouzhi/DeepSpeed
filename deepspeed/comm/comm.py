@@ -23,6 +23,7 @@
 
 import torch
 from torch.distributed import GradBucket  # noqa: F401
+import inspect
 import os
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -105,18 +106,20 @@ def configure(
 # Logging wrapper for timing ops
 def timed_op(func):
     default_log_name = get_default_args(func).get('log_name', func.__name__)
+    # Cache the signature to avoid inspecting it on every communication call.
+    func_signature = inspect.signature(func)
 
     def log_wrapper(*args, **kwargs):
         should_profile = False
         # Add enabled flag so that overhead to each comm op is two if conditions at most
         if comms_logger.enabled:
-            selected_log_name = kwargs.get('log_name', default_log_name)
-            should_profile = (('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all
+            bound_args = func_signature.bind_partial(*args, **kwargs)
+            bound_args.apply_defaults()
+            func_args = bound_args.arguments
+            selected_log_name = func_args.get('log_name', default_log_name)
+            should_profile = (func_args.get('prof', False) or comms_logger.prof_all
                               or selected_log_name in comms_logger.prof_ops)
             if should_profile:
-                # Need func args for their defaults
-                func_args = get_default_args(func)
-                func_args.update(kwargs)
                 # Ops that do not declare a log_name are logged under their own name
                 func_args['log_name'] = selected_log_name
                 msg_size = get_msg_size_from_args(func, *args, **kwargs)
