@@ -172,7 +172,8 @@ def find_node_by_name(gm: GraphModule, name: str) -> Optional[Node]:
 
 
 def get_node_shape_meta(node: Node) -> Optional[torch.Tensor]:
-    return node.meta.get("val") or node.meta.get("example_value")
+    value = node.meta.get("val")
+    return value if value is not None else node.meta.get("example_value")
 
 
 def find_node_by_tag(gm: GraphModule, tag: str) -> Optional[Node]:

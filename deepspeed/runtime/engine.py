@@ -945,7 +945,7 @@ class DeepSpeedEngine(Module):
         optimizer = getattr(self, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, 'destroy'):
             optimizer.destroy()
-        if self.is_deepcompile_active():
+        if self.is_deepcompile_active() and not self.uses_parallelization_pass_only():
             get_deepcompile_handle().cleanup()
         debug_clear_module_and_param_names()
 
@@ -3027,7 +3027,7 @@ class DeepSpeedEngine(Module):
         assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
         assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
 
-        if self.is_deepcompile_active() and not self.compile_autotp():
+        if self.is_deepcompile_active() and not self.uses_parallelization_pass_only():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
 
         if isinstance(self.optimizer, ZeROOptimizer):
@@ -3062,7 +3062,7 @@ class DeepSpeedEngine(Module):
                 self.optimizer.backward_epilogue()
             self.optimizer.exit_backward()
 
-        if self.is_deepcompile_active() and not self.compile_autotp():
+        if self.is_deepcompile_active() and not self.uses_parallelization_pass_only():
             deepcompile_backward_epilogue()
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())

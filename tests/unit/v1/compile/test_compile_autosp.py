@@ -378,6 +378,15 @@ class TestShardTensorCompile:
 
 class TestAutoSPValidation:
 
+    def test_reads_tensor_shape_metadata_without_boolean_conversion(self):
+        from deepspeed.compile.fx import get_node_shape_meta
+
+        node = Graph().placeholder("input")
+        value = torch.empty(2)
+        node.meta["val"] = value
+
+        assert get_node_shape_meta(node) is value
+
     def test_prepare_inputs_preserves_non_default_sequence_dimension(self):
         from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
 
