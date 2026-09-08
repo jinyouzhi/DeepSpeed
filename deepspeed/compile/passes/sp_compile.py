@@ -160,7 +160,7 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
         shard_tensor_node(gm, label_ids_node, seq_dim)
         return
 
-    sharded_candidates = {}
+    causal_losses = []
     for loss_node in label_loss_nodes:
         weight = loss_node.kwargs.get("weight", loss_node.args[2] if len(loss_node.args) > 2 else None)
         if weight is not None:
@@ -188,10 +188,13 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
             worklist.extend(current.all_input_nodes)
 
         if shifted_label_node is None:
-            raise RuntimeError("AutoSP causal language-model loss requires labels to be shifted to the original "
-                               "sequence length before flattening. Pass pre-shifted labels or use a Transformers "
-                               "causal loss that pads labels before shifting.")
+            shard_tensor_node(gm, label_ids_node, seq_dim)
+            return
 
+        causal_losses.append((loss_node, shifted_label_node, ignore_index))
+
+    sharded_candidates = {}
+    for loss_node, shifted_label_node, ignore_index in causal_losses:
         if shifted_label_node not in sharded_candidates:
             sharded_candidates[shifted_label_node] = shard_tensor_node(gm,
                                                                        shifted_label_node,

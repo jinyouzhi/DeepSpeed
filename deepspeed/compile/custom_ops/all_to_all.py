@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+from typing import Tuple
+
 import torch
 import deepspeed.comm as dist
 from torch.utils._sympy.functions import FloorDiv
@@ -114,7 +116,7 @@ def all_gather_sequence_fake(input: torch.Tensor, dim: int):
 
 
 @torch.library.custom_op("autosp::aggregate_loss", mutates_args=())
-def aggregate_loss(loss: torch.Tensor, valid_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def aggregate_loss(loss: torch.Tensor, valid_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return the valid-token-weighted mean loss on every SP rank."""
     assert is_setup(), 'Incorrect initialization of SP/DP mesh.'
     gid = dist.get_rank() // sp_size()

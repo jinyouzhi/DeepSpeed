@@ -46,14 +46,14 @@ def _create_sdpa_graph(seq_len, num_heads=2, mask_rank=None):
     return GraphModule({}, graph)
 
 
-def _create_causal_loss_graph(seq_len=16, ignore_index=-100):
+def _create_causal_loss_graph(seq_len=16, ignore_index=-100, shift_labels=True):
 
     class CausalLoss(torch.nn.Module):
 
         def forward(self, input_ids, labels):
             logits = F.one_hot(input_ids, num_classes=32).float()
-            shifted_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
-            return F.cross_entropy(logits.view(-1, 32), shifted_labels.view(-1), ignore_index=ignore_index)
+            targets = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous() if shift_labels else labels
+            return F.cross_entropy(logits.view(-1, 32), targets.view(-1), ignore_index=ignore_index)
 
     torch._dynamo.reset()
     input_ids = torch.randint(0, 32, (2, seq_len))
@@ -513,6 +513,26 @@ class TestAutoSPValidation:
         ]
         assert not raw_label_slices
         assert any(node.target == torch.ops.autosp.aggregate_loss.default for node in gm.graph.nodes)
+        gm.graph.lint()
+
+    @pytest.mark.sequential
+    def test_shards_direct_cross_entropy_labels(self):
+        import deepspeed.comm as _dist
+        from deepspeed.compile.custom_ops import sp_dp_registry
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+        from deepspeed.compile.util import get_label_id_node
+
+        gm = _create_causal_loss_graph(seq_len=64, shift_labels=False)
+        label_node = get_label_id_node(gm)
+        with patch.object(sp_dp_registry, "sp_size", return_value=_SP_SIZE), \
+             patch.object(_dist, "get_rank", return_value=0):
+            pass_shard_label_ids(gm, ())
+
+        raw_label_slices = [
+            node for node in gm.graph.nodes if node.target == operator.getitem and node.args[0] is label_node
+        ]
+        assert len(raw_label_slices) == 1
+        assert not any(node.target == torch.ops.autosp.aggregate_loss.default for node in gm.graph.nodes)
         gm.graph.lint()
 
     @pytest.mark.sequential
