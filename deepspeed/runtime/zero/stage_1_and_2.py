@@ -1806,7 +1806,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     self.single_partition_of_fp32_groups[group_idx].grad.view(-1).narrow(
                         0, dest_offset, num_elements).copy_(
                             scaled_local_update.to(self.single_partition_of_fp32_groups[group_idx].grad.dtype))
-                    self.norm_for_param_grads[param_id] = local_update.to(get_norm_dtype()).norm(2)
+                    self.norm_for_param_grads[param_id] = scaled_local_update.to(get_norm_dtype()).norm(2)
                     momentum_update = param_momentum.view(-1).narrow(0, source_offset, num_elements)
                     momentum.narrow(0, dest_offset, num_elements).copy_(momentum_update.to(momentum.dtype))
 

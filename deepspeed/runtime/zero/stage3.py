@@ -1028,13 +1028,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                                         device=self.device,
                                                         dtype=self.communication_data_type)
             unpinned_fp32_buffer_momentum.requires_grad = False
+            if self.save_muon_momentum_buffer_in_memory:
+                unpinned_fp32_buffer_momentum.swappable = False
+                unpinned_fp32_buffer_momentum.is_resident = True
+                self.muon_momentum_buffer_partitioned_groups_flat[i] = unpinned_fp32_buffer_momentum
+                self.muon_momentum_buffer_partitioned_groups_flat[i].ds_id = ds_id
             if self.fp32_partitioned_groups_flat[i] not in self.optimizer.state:
                 self.optimizer.state[self.fp32_partitioned_groups_flat[i]] = {}
             self.optimizer.state[
                 self.fp32_partitioned_groups_flat[i]]["momentum_buffer"] = unpinned_fp32_buffer_momentum
-            if self.save_muon_momentum_buffer_in_memory:
-                self.muon_momentum_buffer_partitioned_groups_flat[i] = unpinned_fp32_buffer_momentum
-                self.muon_momentum_buffer_partitioned_groups_flat[i].ds_id = ds_id
 
     def _create_fp32_partitions(self):
         cpu_memory_usage = 0
@@ -2471,23 +2473,24 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if not muon_params:
                 continue
 
-            if self._swappable_optimizer_subgroup(sub_group_id) and not self.save_muon_momentum_buffer_in_memory:
+            if self._swappable_optimizer_subgroup(sub_group_id):
                 self._optimizer_states_and_gradient_swap_in(sub_group_id)
 
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+            subgroup_numel = int(self.fp16_partitioned_groups_flat_numel[sub_group_id])
             if self.save_muon_momentum_buffer_in_memory:
                 momentum = self.muon_momentum_buffer_partitioned_groups_flat.get(sub_group_id)
-                momentum_was_created = momentum is None or momentum.numel() != fp32_param.numel()
+                momentum_was_created = momentum is None or momentum.numel() != subgroup_numel
                 if momentum_was_created:
-                    self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
+                    self._create_momentum_buffer(subgroup_numel, sub_group_id, fp32_param.ds_id)
                     momentum = self.muon_momentum_buffer_partitioned_groups_flat[sub_group_id]
             else:
                 state = self.optimizer.state.setdefault(fp32_param, {})
                 momentum = state.get("momentum_buffer")
-                momentum_was_created = momentum is None or momentum.numel() != fp32_param.numel()
+                momentum_was_created = momentum is None or momentum.numel() != subgroup_numel
                 if momentum_was_created:
                     # A newly allocated state is zero on every rank, so it needs no all-gather.
-                    self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
+                    self._create_momentum_buffer(subgroup_numel, sub_group_id, fp32_param.ds_id)
                     momentum = state["momentum_buffer"]
 
             local_grad_parts = []
@@ -2541,13 +2544,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 if real_numel > 0:
                     local_momentum[:real_numel].copy_(full_momentum.view(-1).narrow(0, start, real_numel))
                 momentum.narrow(0, dest_offset, partition_numel).copy_(local_momentum.to(momentum.dtype))
-                self.norm_for_param_grads[self.get_param_id(param)] = local_update.to(get_norm_dtype()).norm(2)
+                self.norm_for_param_grads[self.get_param_id(param)] = scaled_local_update.to(get_norm_dtype()).norm(2)
 
             if self.save_muon_momentum_buffer_in_memory and fp32_param in self.optimizer.state:
                 self.optimizer.state[fp32_param]["momentum_buffer"] = momentum
 
-            if self._swappable_optimizer_subgroup(sub_group_id) and not self.save_muon_momentum_buffer_in_memory:
-                self._optimizer_states_and_gradient_swap_out(sub_group_id)
+            if self._swappable_optimizer_subgroup(sub_group_id):
+                self._writeback_swap_state(sub_group_id,
+                                           write_opt_state=not self.save_muon_momentum_buffer_in_memory,
+                                           write_gradients=True)
 
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
