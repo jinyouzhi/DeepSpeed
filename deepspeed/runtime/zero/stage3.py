@@ -2509,6 +2509,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     local_grad_parts,
                     self.gradient_accumulation_dtype,
                     additional_buffers_to_allgather=local_momentum_parts)
+
+            # Unscale gathered gradients prior to Newton-Schulz and momentum tracking,
+            # since Newton-Schulz normalizes spectral norm and loses gradient scale.
+            loss_scale = float(self.loss_scale)
+            if loss_scale != 1.0:
+                for grad in full_grads:
+                    grad.div_(loss_scale)
+
             optimizer_group = self.optimizer.param_groups[self.sub_group_to_group_id[sub_group_id]]
 
             for param, full_grad, full_momentum in zip(muon_params, full_grads, full_momentums):
@@ -2525,7 +2533,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 if real_numel > 0:
                     local_update[:real_numel].copy_(update.view(-1).narrow(0, start, real_numel))
                 _, dest_offset, _ = self.grad_position[self.get_param_id(param)]
-                fp32_param.grad.narrow(0, dest_offset, partition_numel).copy_(local_update.to(fp32_param.grad.dtype))
+                # Rescale by loss_scale so downstream unscale_and_clip_grads cancels it cleanly
+                scaled_local_update = local_update * loss_scale if loss_scale != 1.0 else local_update
+                fp32_param.grad.narrow(0, dest_offset,
+                                       partition_numel).copy_(scaled_local_update.to(fp32_param.grad.dtype))
                 local_momentum = torch.zeros(partition_numel, dtype=full_momentum.dtype, device=accelerator_device)
                 if real_numel > 0:
                     local_momentum[:real_numel].copy_(full_momentum.view(-1).narrow(0, start, real_numel))

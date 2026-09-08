@@ -1778,6 +1778,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                                             [local_grad, momentum], process_group,
                                                                             accelerator_device)
 
+            # Unscale gathered gradients prior to Newton-Schulz and momentum tracking,
+            # since Newton-Schulz normalizes spectral norm and loses gradient scale.
+            loss_scale = float(self.loss_scale)
+            if loss_scale != 1.0:
+                for grad in full_grad:
+                    grad.div_(loss_scale)
+
             optimizer_group = self.optimizer.param_groups[group_idx]
             for param, grad, param_momentum in zip(muon_params, full_grad, full_momentum):
                 param_id = self.get_param_id(param)
@@ -1794,9 +1801,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 num_elements = int(min(param.numel() - source_offset, partition_size - dest_offset))
                 if num_elements > 0:
                     local_update = update.view(-1).narrow(0, source_offset, num_elements)
+                    # Rescale by loss_scale so downstream unscale_and_clip_grads cancels it cleanly
+                    scaled_local_update = local_update * loss_scale if loss_scale != 1.0 else local_update
                     self.single_partition_of_fp32_groups[group_idx].grad.view(-1).narrow(
                         0, dest_offset, num_elements).copy_(
-                            local_update.to(self.single_partition_of_fp32_groups[group_idx].grad.dtype))
+                            scaled_local_update.to(self.single_partition_of_fp32_groups[group_idx].grad.dtype))
                     self.norm_for_param_grads[param_id] = local_update.to(get_norm_dtype()).norm(2)
                     momentum_update = param_momentum.view(-1).narrow(0, source_offset, num_elements)
                     momentum.narrow(0, dest_offset, num_elements).copy_(momentum_update.to(momentum.dtype))

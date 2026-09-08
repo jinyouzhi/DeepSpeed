@@ -390,3 +390,65 @@ class TestMuonZero12NumericalCorrectness(DistributedTest):
                 f"full-gradient reference -- orthogonalization likely ran on a partition slice rather than "
                 f"the full averaged gradient (#7807)")
         assert changed, "optimizer step did not update any Muon weight (skipped step?)"
+
+
+class TestMuonOffloadLossScaling(DistributedTest):
+    """Verify Muon updates under CPU offload are invariant to loss_scale."""
+
+    world_size = 2
+
+    @pytest.mark.parametrize("zero_stage", [1, 2])
+    @pytest.mark.parametrize("loss_scale", [1.0, 1024.0])
+    def test_offload_loss_scale_invariance(self, zero_stage, loss_scale):
+        from deepspeed.utils import safe_get_full_fp32_param
+
+        hidden_dim, nlayers = 128, 2
+        lr = 0.02
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayers)
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 4,
+            "gradient_clipping": 0.0,
+            "optimizer": {
+                "type": "muon",
+                "params": {
+                    "lr": lr,
+                    "momentum": 0.0
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": loss_scale
+            },
+            "zero_optimization": {
+                "stage": zero_stage,
+                "offload_optimizer": {
+                    "device": "cpu",
+                    "pin_memory": True
+                }
+            }
+        }
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               model_parameters=model.parameters(),
+                                               dist_init_required=False)
+        device = engine.device
+        muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
+        pre = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+
+        torch.manual_seed(999)
+        x = torch.randn(4, hidden_dim, device=device).half()
+        y = torch.randint(0, hidden_dim, (4, ), device=device)
+        loss = engine(x, y)
+        engine.backward(loss)
+        engine.step()
+
+        post = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+        for n in pre:
+            applied_update_norm = ((pre[n] - post[n]) / lr).float().norm().item()
+            # Under double division bug, norm dropped to ~0.000024 for scale 1024.
+            # With fix, norm remains > 10.0 (Frobenius norm of ~128x128 orthogonal matrix is ~sqrt(128)~11.3).
+            assert applied_update_norm > 1.0, (
+                f"Muon update vanished under loss_scale={loss_scale} (norm={applied_update_norm})! "
+                f"Double loss-scale division bug present.")
