@@ -2471,17 +2471,24 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if not muon_params:
                 continue
 
-            if self._swappable_optimizer_subgroup(sub_group_id):
+            if self._swappable_optimizer_subgroup(sub_group_id) and not self.save_muon_momentum_buffer_in_memory:
                 self._optimizer_states_and_gradient_swap_in(sub_group_id)
 
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
-            state = self.optimizer.state.setdefault(fp32_param, {})
-            momentum = state.get("momentum_buffer")
-            momentum_was_created = momentum is None or momentum.numel() != fp32_param.numel()
-            if momentum_was_created:
-                # A newly allocated state is zero on every rank, so it needs no all-gather.
-                self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
-                momentum = state["momentum_buffer"]
+            if self.save_muon_momentum_buffer_in_memory:
+                momentum = self.muon_momentum_buffer_partitioned_groups_flat.get(sub_group_id)
+                momentum_was_created = momentum is None or momentum.numel() != fp32_param.numel()
+                if momentum_was_created:
+                    self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
+                    momentum = self.muon_momentum_buffer_partitioned_groups_flat[sub_group_id]
+            else:
+                state = self.optimizer.state.setdefault(fp32_param, {})
+                momentum = state.get("momentum_buffer")
+                momentum_was_created = momentum is None or momentum.numel() != fp32_param.numel()
+                if momentum_was_created:
+                    # A newly allocated state is zero on every rank, so it needs no all-gather.
+                    self._create_momentum_buffer(fp32_param.numel(), sub_group_id, fp32_param.ds_id)
+                    momentum = state["momentum_buffer"]
 
             local_grad_parts = []
             local_momentum_parts = []
@@ -2525,7 +2532,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 momentum.narrow(0, dest_offset, partition_numel).copy_(local_momentum.to(momentum.dtype))
                 self.norm_for_param_grads[self.get_param_id(param)] = local_update.to(get_norm_dtype()).norm(2)
 
-            if self._swappable_optimizer_subgroup(sub_group_id):
+            if self.save_muon_momentum_buffer_in_memory and fp32_param in self.optimizer.state:
+                self.optimizer.state[fp32_param]["momentum_buffer"] = momentum
+
+            if self._swappable_optimizer_subgroup(sub_group_id) and not self.save_muon_momentum_buffer_in_memory:
                 self._optimizer_states_and_gradient_swap_out(sub_group_id)
 
     @instrument_w_nvtx
