@@ -375,7 +375,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         else:
             self.use_grad_accum_attribute = False
 
-        self._muon_allgather_buffers = {}
+        self._muon_allgather_buffers = OrderedDict()
         self._muon_allgather_buffer_bytes = 0
         self._muon_allgather_max_cached_bytes = 256 * 1024 * 1024
 
@@ -729,6 +729,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.print_rank_0("Removed grad acc hooks")
         if get_accelerator().is_available():
             get_accelerator().synchronize()
+        # Clear after the synchronize above so any in-flight all-gather into these
+        # scratch buffers has completed before their references are dropped.
+        self._clear_muon_allgather_buffers()
         self._unpin_offload_buffers()
 
     def _unpin_offload_buffers(self):
@@ -1819,7 +1822,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                                non_blocking=True)
 
         dist.all_gather_into_tensor(gathered_buffer, local_buffer, group=process_group)
-        return [reconstruct(gathered_buffer, index) for index in range(len(flat_buffers))]
+        outputs = [reconstruct(gathered_buffer, index) for index in range(len(flat_buffers))]
+        return outputs[0] if len(outputs) == 1 else outputs
 
     def _clear_muon_allgather_buffers(self):
         self._muon_allgather_buffers.clear()
