@@ -1630,7 +1630,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         Returns:
             None
         """
-        if not self.use_muon:
+        if not self.use_muon or self.offload_optimizer:
             return
 
         params_by_group = {}
