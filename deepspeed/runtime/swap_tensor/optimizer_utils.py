@@ -211,6 +211,8 @@ class OptimizerSwapper(object):
     def is_swappable_tensor(self, tensor=None, numel=None):
         assert tensor is not None or numel is not None, "Either tensor or numel must be provided"
         if tensor is not None:
+            if not getattr(tensor, "swappable", True) or getattr(tensor, "is_resident", False):
+                return False
             return self.min_aio_bytes <= (tensor.numel() * self.swap_element_size)
         return self.min_aio_bytes <= (numel * self.swap_element_size)
 

@@ -393,62 +393,160 @@ class TestMuonZero12NumericalCorrectness(DistributedTest):
 
 
 class TestMuonOffloadLossScaling(DistributedTest):
-    """Verify Muon updates under CPU offload are invariant to loss_scale."""
+    """Verify Muon updates under CPU offload are invariant to loss_scale with clipping."""
 
     world_size = 2
 
-    @pytest.mark.parametrize("zero_stage", [1, 2])
-    @pytest.mark.parametrize("loss_scale", [1.0, 1024.0])
-    def test_offload_loss_scale_invariance(self, zero_stage, loss_scale):
+    @pytest.mark.parametrize("zero_stage", [1, 2, 3])
+    def test_offload_loss_scale_equivalence(self, zero_stage):
         from deepspeed.utils import safe_get_full_fp32_param
 
         hidden_dim, nlayers = 128, 2
         lr = 0.02
-        torch.manual_seed(42)
-        model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayers)
+        clip_grad = 1.0
 
+        def _run_with_scale(loss_scale):
+            torch.manual_seed(42)
+            model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayers)
+            config_dict = {
+                "train_micro_batch_size_per_gpu": 4,
+                "gradient_clipping": clip_grad,
+                "optimizer": {
+                    "type": "muon",
+                    "params": {
+                        "lr": lr,
+                        "momentum": 0.0
+                    }
+                },
+                "fp16": {
+                    "enabled": True,
+                    "loss_scale": loss_scale
+                },
+                "zero_optimization": {
+                    "stage": zero_stage,
+                    "reduce_scatter": False,
+                    "offload_optimizer": {
+                        "device": "cpu",
+                        "pin_memory": True
+                    }
+                }
+            }
+            engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                                   model=model,
+                                                   model_parameters=model.parameters(),
+                                                   dist_init_required=False)
+            device = engine.device
+            muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
+            pre = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+
+            torch.manual_seed(999)
+            x = torch.randn(4, hidden_dim, device=device).half()
+            y = torch.randint(0, hidden_dim, (4, ), device=device)
+            loss = engine(x, y)
+            engine.backward(loss)
+            engine.step()
+
+            post = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+            updates = {n: (pre[n] - post[n]).float() for n in pre}
+            return updates
+
+        updates_scale_1 = _run_with_scale(1.0)
+        updates_scale_1024 = _run_with_scale(1024.0)
+
+        for n in updates_scale_1:
+            norm_1 = updates_scale_1[n].norm().item()
+            norm_1024 = updates_scale_1024[n].norm().item()
+            assert norm_1 > 0.01, f"Update vanished for {n} under scale 1.0"
+            assert norm_1024 > 0.01, f"Update vanished for {n} under scale 1024.0"
+            max_diff = (updates_scale_1[n] - updates_scale_1024[n]).abs().max().item()
+            assert max_diff < 1e-3, (
+                f"Update mismatch between scale 1.0 and 1024.0 under stage {zero_stage} "
+                f"with gradient clipping: max_diff={max_diff}, norm_1={norm_1}, norm_1024={norm_1024}")
+
+
+class TestMuonZero3NVMeMomentumResidency(DistributedTest):
+    """Verify ZeRO-3 resident Muon momentum buffers persist across NVMe swapping steps."""
+
+    world_size = 1
+
+    def test_zero3_nvme_momentum_residency(self, tmpdir):
+        from deepspeed.ops.aio import AsyncIOBuilder
+        if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
+            pytest.skip("Skip tests since async-io is not compatible")
+
+        hidden_dim, nlayers = 1024, 2
+        lr = 0.01
+        momentum = 0.95
         config_dict = {
-            "train_micro_batch_size_per_gpu": 4,
-            "gradient_clipping": 0.0,
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1,
             "optimizer": {
                 "type": "muon",
                 "params": {
                     "lr": lr,
-                    "momentum": 0.0
+                    "momentum": momentum
                 }
             },
             "fp16": {
                 "enabled": True,
-                "loss_scale": loss_scale
+                "loss_scale": 1.0
             },
             "zero_optimization": {
-                "stage": zero_stage,
+                "stage": 3,
+                "reduce_scatter": False,
+                "save_muon_momentum_buffer_in_memory": True,
                 "offload_optimizer": {
-                    "device": "cpu",
-                    "pin_memory": True
-                }
+                    "device": "nvme",
+                    "nvme_path": str(tmpdir)
+                },
+                "sub_group_size": 100
+            },
+            "aio": {
+                "block_size": 1048576
             }
         }
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=nlayers)
         engine, _, _, _ = deepspeed.initialize(config=config_dict,
                                                model=model,
                                                model_parameters=model.parameters(),
                                                dist_init_required=False)
-        device = engine.device
-        muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
-        pre = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
 
-        torch.manual_seed(999)
-        x = torch.randn(4, hidden_dim, device=device).half()
-        y = torch.randint(0, hidden_dim, (4, ), device=device)
-        loss = engine(x, y)
-        engine.backward(loss)
+        device = engine.device
+        x = torch.randn(1, hidden_dim, device=device).half()
+        y = torch.randint(0, hidden_dim, (1, ), device=device)
+
+        opt = engine.optimizer
+        assert opt.swap_optimizer, "NVMe swap_optimizer must be enabled"
+        assert opt.save_muon_momentum_buffer_in_memory
+
+        # Step 1
+        engine.backward(engine(x, y))
         engine.step()
 
-        post = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
-        for n in pre:
-            applied_update_norm = ((pre[n] - post[n]) / lr).float().norm().item()
-            # Under double division bug, norm dropped to ~0.000024 for scale 1024.
-            # With fix, norm remains > 10.0 (Frobenius norm of ~128x128 orthogonal matrix is ~sqrt(128)~11.3).
-            assert applied_update_norm > 1.0, (
-                f"Muon update vanished under loss_scale={loss_scale} (norm={applied_update_norm})! "
-                f"Double loss-scale division bug present.")
+        assert len(opt.muon_momentum_buffer_partitioned_groups_flat) > 0
+        step1_momentums = {}
+        for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
+            expected_numel = int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
+            assert buf.numel() == expected_numel, (
+                f"Resident momentum for subgroup {sub_group_id} had numel={buf.numel()} "
+                f"instead of {expected_numel}; storage was evicted by NVMe swapper!")
+            assert not getattr(buf, "swappable", True)
+            assert getattr(buf, "is_resident", False)
+            step1_momentums[sub_group_id] = buf.clone()
+
+        # Step 2: verify multi-step execution does not crash and momentum accumulates
+        engine.backward(engine(x, y))
+        engine.step()
+
+        for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
+            expected_numel = int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
+            assert buf.numel() == expected_numel
+            diff = (buf - step1_momentums[sub_group_id]).abs().max().item()
+            assert diff > 0.0, f"Momentum buffer did not accumulate changes at step 2 for subgroup {sub_group_id}"
+
+        # Step 3
+        engine.backward(engine(x, y))
+        engine.step()
+        for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
+            assert buf.numel() == int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
