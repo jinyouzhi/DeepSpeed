@@ -1756,7 +1756,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 continue
 
             process_group = self.real_dp_process_group[group_idx]
-            world_size = dist.get_world_size(group=process_group)
             rank = dist.get_rank(group=process_group)
             partition_size = int(self.partition_size[group_idx])
             local_grad = self.single_partition_of_fp32_groups[group_idx].grad

@@ -209,9 +209,22 @@ class OptimizerSwapper(object):
             swap_info.has_state_tensors = False
             swap_info.release_unswapped_gradients()
 
+    def _writeback_gradients(self, swap_info, parameter, aio_handle):
+        """Persist a parameter's gradient partitions, whichever way they are stored."""
+        if swap_info.swapped_gradients:
+            param_gradients = swap_info.swapped_gradients.values()
+            swap_buffers = [parameter.grad.narrow(0, grad.offset, grad.length) for grad in param_gradients]
+            swap_paths = [grad.path for grad in param_gradients]
+            swap_out_tensors(aio_handle, swap_buffers, swap_paths)
+            assert len(swap_buffers) == aio_handle.wait()
+        if swap_info.unswapped_gradients:
+            swap_info.write_unswapped_gradients(src_buffer=parameter.grad)
+
     def is_swappable_tensor(self, tensor=None, numel=None):
         assert tensor is not None or numel is not None, "Either tensor or numel must be provided"
         if tensor is not None:
+            # Callers can pin an optimizer state in memory (e.g. the Muon momentum buffer under
+            # save_muon_momentum_buffer_in_memory) by tagging the tensor, which excludes it from swapping.
             if not getattr(tensor, "swappable", True) or getattr(tensor, "is_resident", False):
                 return False
             return self.min_aio_bytes <= (tensor.numel() * self.swap_element_size)

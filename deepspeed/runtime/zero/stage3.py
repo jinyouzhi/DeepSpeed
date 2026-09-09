@@ -1024,9 +1024,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _create_momentum_buffer(self, num_elements, i, ds_id):
         if self.use_muon and self.sub_groups_using_muon[i]:
+            # Momentum is an optimizer state that persists across steps, so it must keep the
+            # master (fp32) precision. Storing it in the reduced communication dtype would
+            # round the accumulator on every step and drift away from ZeRO-1/2 behavior.
             unpinned_fp32_buffer_momentum = torch.zeros(num_elements,
                                                         device=self.device,
-                                                        dtype=self.communication_data_type)
+                                                        dtype=self.master_weights_and_grads_dtype)
             unpinned_fp32_buffer_momentum.requires_grad = False
             if self.save_muon_momentum_buffer_in_memory:
                 unpinned_fp32_buffer_momentum.swappable = False
@@ -1658,31 +1661,28 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if not params:
                 continue
 
-            momentum_buffer = []
-            if self._swappable_optimizer_subgroup(i) and not self.save_muon_momentum_buffer_in_memory:
+            fp32_param = self.fp32_partitioned_groups_flat[i]
+            swapped_momentum = self._swappable_optimizer_subgroup(i) and not self.save_muon_momentum_buffer_in_memory
+            if swapped_momentum:
                 # swap-in once, keep resident through update + writeback
-                self.optimizer_swapper.swap_in_optimizer_state(parameter=self.fp32_partitioned_groups_flat[i])
-                if "momentum_buffer" not in self.optimizer.state.get(self.fp32_partitioned_groups_flat[i], {}):
-                    self._create_momentum_buffer(self.fp16_partitioned_groups_flat_numel[i], i,
-                                                 self.fp32_partitioned_groups_flat[i].ds_id)
-                state_buffer = self.optimizer.state[self.fp32_partitioned_groups_flat[i]]["momentum_buffer"]
-                for param, dest_offset, _ in group_items:
-                    momentum_buffer.append(state_buffer.narrow(0, dest_offset, param.partition_numel()).clone())
-            elif self.save_muon_momentum_buffer_in_memory:
-                state_buffer = self.muon_momentum_buffer_partitioned_groups_flat[i]
-                for param, dest_offset, _ in group_items:
-                    momentum_buffer.append(state_buffer.narrow(0, dest_offset, param.partition_numel()).clone())
-            else:
-                # Non-swappable optimizer (GPU/CPU): momentum buffer lives in optimizer state
-                if "momentum_buffer" not in self.optimizer.state.get(self.fp32_partitioned_groups_flat[i], {}):
-                    self._create_momentum_buffer(self.fp16_partitioned_groups_flat_numel[i], i,
-                                                 self.fp32_partitioned_groups_flat[i].ds_id)
-                state_buffer = self.optimizer.state[self.fp32_partitioned_groups_flat[i]]["momentum_buffer"]
-                for param, dest_offset, _ in group_items:
-                    momentum_buffer.append(state_buffer.narrow(0, dest_offset, param.partition_numel()).clone())
+                self.optimizer_swapper.swap_in_optimizer_state(parameter=fp32_param)
 
-            gathered_params_momentums = self._partitioned_buffers_all_gather(params, momentum_buffer,
-                                                                             communication_data_type)
+            if self.save_muon_momentum_buffer_in_memory:
+                state_buffer = self.muon_momentum_buffer_partitioned_groups_flat[i]
+            else:
+                if "momentum_buffer" not in self.optimizer.state.get(fp32_param, {}):
+                    self._create_momentum_buffer(self.fp16_partitioned_groups_flat_numel[i], i, fp32_param.ds_id)
+                state_buffer = self.optimizer.state[fp32_param]["momentum_buffer"]
+
+            momentum_buffer = [
+                state_buffer.narrow(0, dest_offset, param.partition_numel()).clone()
+                for param, dest_offset, _ in group_items
+            ]
+
+            # Momentum is a persistent optimizer state, so gather and update it in the
+            # master (fp32) dtype instead of the reduced communication dtype.
+            muon_dtype = self.master_weights_and_grads_dtype
+            gathered_params_momentums = self._partitioned_buffers_all_gather(params, momentum_buffer, muon_dtype)
 
             process_group = self._get_sub_group_process_group(i)
             world_sz = dist.get_world_size(process_group)
@@ -1698,7 +1698,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     param = params[base_i + rank]
                     g = param.grad
                     m = gathered_momentums_pad[base_i + rank]
-                    update = muon_update(g, m, beta=self.muon_beta, ns_method=getattr(self, 'muon_ns_method', 'gram'))
+                    # Promote the gradient so momentum tracking and Newton-Schulz run in fp32.
+                    fp32_grad = g.to(muon_dtype)
+                    update = muon_update(fp32_grad,
+                                         m,
+                                         beta=self.muon_beta,
+                                         ns_method=getattr(self, 'muon_ns_method', 'gram'))
                     g.data.copy_(update, non_blocking=False)
                 grad_handle = dist.all_gather(grads_pad[base_i:base_i + world_sz],
                                               grads_pad[base_i + rank],
@@ -1719,28 +1724,18 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 start_offset = rank * chunk_sz
                 end_offset = start_offset + chunk_sz
                 if end_offset > param.grad.numel():
-                    buffer_to_update = torch.zeros(chunk_sz,
-                                                   device=param.grad.device,
-                                                   dtype=self.gradient_accumulation_dtype)
+                    buffer_to_update = torch.zeros(chunk_sz, device=param.grad.device, dtype=gathered_momentum.dtype)
                     buffer_to_update[:param.grad.numel() -
                                      start_offset] = gathered_momentum.view(-1).data[start_offset:param.grad.numel()]
                 else:
                     buffer_to_update = gathered_momentum.view(-1).data[start_offset:end_offset]
-                if self._swappable_optimizer_subgroup(i) and not self.save_muon_momentum_buffer_in_memory:
-                    self.optimizer.state[self.fp32_partitioned_groups_flat[i]]["momentum_buffer"].narrow(
-                        0, dest_offset, param.partition_numel()).data.copy_(buffer_to_update, non_blocking=False)
-                elif self.save_muon_momentum_buffer_in_memory:
-                    self.muon_momentum_buffer_partitioned_groups_flat[i].narrow(
-                        0, dest_offset, param.partition_numel()).data.copy_(buffer_to_update, non_blocking=False)
-                    # update the momentum buffer in the optimizer state
-                    self.optimizer.state[self.fp32_partitioned_groups_flat[i]][
-                        "momentum_buffer"] = self.muon_momentum_buffer_partitioned_groups_flat[i]
-                else:
-                    # Non-swappable optimizer (GPU/CPU): write directly to optimizer state
-                    self.optimizer.state[self.fp32_partitioned_groups_flat[i]]["momentum_buffer"].narrow(
-                        0, dest_offset, param.partition_numel()).data.copy_(buffer_to_update, non_blocking=False)
-            if self._swappable_optimizer_subgroup(i) and not self.save_muon_momentum_buffer_in_memory:
-                self.optimizer_swapper.swap_out_optimizer_state(parameter=self.fp32_partitioned_groups_flat[i])
+                state_buffer.narrow(0, dest_offset, param.partition_numel()).data.copy_(buffer_to_update,
+                                                                                        non_blocking=False)
+            if self.save_muon_momentum_buffer_in_memory:
+                # The resident buffer is not owned by the swapper, so re-publish it as the state
+                self.optimizer.state[fp32_param]["momentum_buffer"] = state_buffer
+            if swapped_momentum:
+                self.optimizer_swapper.swap_out_optimizer_state(parameter=fp32_param)
             for handle in grad_handles:
                 handle.wait()
             for param, _, params_size_offset in group_items:
@@ -2502,16 +2497,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 if not momentum_was_created:
                     local_momentum_parts.append(momentum.narrow(0, dest_offset, numel).to(accelerator_device))
 
+            # Gather and run Muon in the master (fp32) dtype so momentum tracking and
+            # Newton-Schulz never see a half-precision round trip.
+            muon_dtype = self.master_weights_and_grads_dtype
             if momentum_was_created:
-                full_grads = self._partitioned_buffers_all_gather(muon_params, local_grad_parts,
-                                                                  self.gradient_accumulation_dtype)
+                full_grads = self._partitioned_buffers_all_gather(muon_params, local_grad_parts, muon_dtype)
                 full_momentums = [torch.zeros_like(full_grad) for full_grad in full_grads]
             else:
                 full_grads, full_momentums = self._partitioned_buffers_all_gather(
-                    muon_params,
-                    local_grad_parts,
-                    self.gradient_accumulation_dtype,
-                    additional_buffers_to_allgather=local_momentum_parts)
+                    muon_params, local_grad_parts, muon_dtype, additional_buffers_to_allgather=local_momentum_parts)
 
             # Unscale gathered gradients prior to Newton-Schulz and momentum tracking,
             # since Newton-Schulz normalizes spectral norm and loses gradient scale.
