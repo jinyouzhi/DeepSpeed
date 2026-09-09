@@ -1041,6 +1041,67 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.optimizer.state[
                 self.fp32_partitioned_groups_flat[i]]["momentum_buffer"] = unpinned_fp32_buffer_momentum
 
+    def _adopt_restored_muon_momentum(self, sub_group_id, restored_momentum):
+        """Copy a checkpointed momentum into the resident buffer and re-bind the optimizer state.
+
+        The resident buffer is deliberately excluded from swapping and is cached outside of
+        ``optimizer.state``, so both references must keep pointing at the same tensor.
+        """
+        resident_momentum = self.muon_momentum_buffer_partitioned_groups_flat[sub_group_id]
+        if restored_momentum is resident_momentum:
+            return
+        if restored_momentum.numel() != resident_momentum.numel():
+            raise RuntimeError("Muon momentum checkpoint size mismatch for subgroup "
+                               f"{sub_group_id}: got {restored_momentum.numel()} elements, "
+                               f"expected {resident_momentum.numel()}.")
+        resident_momentum.data.copy_(restored_momentum.data)
+        fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+        self.optimizer.state.setdefault(fp32_param, {})["momentum_buffer"] = resident_momentum
+
+    def _restore_muon_momentum_residency(self):
+        """Re-bind the in-memory Muon momentum cache to the freshly loaded optimizer state.
+
+        ``Optimizer.load_state_dict()`` replaces the state tensors with new objects, so the
+        resident cache would otherwise keep serving the pre-load (usually zero) momentum and
+        overwrite the restored values on the very next step.
+        """
+        if not (self.use_muon and self.save_muon_momentum_buffer_in_memory):
+            return
+
+        for sub_group_id in self.muon_momentum_buffer_partitioned_groups_flat:
+            state = self.optimizer.state.get(self.fp32_partitioned_groups_flat[sub_group_id])
+            restored_momentum = None if state is None else state.get("momentum_buffer")
+            if restored_momentum is not None:
+                self._adopt_restored_muon_momentum(sub_group_id, restored_momentum)
+
+    def restore_resident_optimizer_states(self, state_dict):
+        """Restore optimizer state that is pinned in memory rather than swapped to NVMe.
+
+        NVMe optimizer offload rebuilds its state by copying the swap files back, bypassing
+        ``Optimizer.load_state_dict()`` entirely. A resident Muon momentum buffer never reaches
+        those files, so it has to be pulled out of the saved optimizer state dict by hand.
+        """
+        if not (self.use_muon and self.save_muon_momentum_buffer_in_memory):
+            return
+
+        saved_state = state_dict[OPTIMIZER_STATE_DICT]["state"]
+        # Mirror how torch numbers parameters when packing an optimizer state dict.
+        self._set_fp32_optimizer_param_groups()
+        try:
+            saved_index_of_param = {}
+            for group in self.optimizer.param_groups:
+                for param in group["params"]:
+                    saved_index_of_param[id(param)] = len(saved_index_of_param)
+        finally:
+            self._clear_fp32_optimizer_param_groups()
+
+        for sub_group_id in self.muon_momentum_buffer_partitioned_groups_flat:
+            fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+            saved_index = saved_index_of_param[id(fp32_param)]
+            restored_momentum = saved_state.get(saved_index, {}).get("momentum_buffer")
+            if restored_momentum is not None:
+                self._adopt_restored_muon_momentum(sub_group_id, restored_momentum)
+
     def _create_fp32_partitions(self):
         cpu_memory_usage = 0
         cpu_memory_sub_groups = 0
@@ -3423,6 +3484,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self._set_fp32_optimizer_param_groups()
             self.optimizer.load_state_dict(state_dict[OPTIMIZER_STATE_DICT])
             self._clear_fp32_optimizer_param_groups()
+            self._restore_muon_momentum_residency()
 
         if self.swap_optimizer:
             # Purge the swapped optimizer state, it was initialized to the freshly created model and not the checkpoint
