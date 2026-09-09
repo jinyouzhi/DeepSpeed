@@ -630,3 +630,106 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             engine.step()
 
         assert any(not torch.equal(init, p.detach().cpu()) for init, p in zip(initial_params, model.parameters()))
+
+    @pytest.mark.parametrize("pipeline", [False, True])
+    def test_zero3_nvme_mixed_fragments_numerical_equivalence(self, tmpdir, pipeline):
+        from deepspeed.ops.aio import AsyncIOBuilder
+        from deepspeed.utils import safe_get_full_fp32_param
+        from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
+        from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+
+        if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
+            pytest.skip("Skip tests since async-io is not compatible")
+
+        class MixedMatrixModel(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                # 512 x 512 = 262,144 elements (>= 1 MiB in FP32) -> SWAPPED
+                self.large = torch.nn.Linear(512, 512, bias=False)
+                # 512 x 128 = 65,536 elements (< 1 MiB in FP32) -> UNSWAPPED
+                self.proj = torch.nn.Linear(512, 128, bias=False)
+                # 128 x 128 = 16,384 elements (< 1 MiB in FP32) -> UNSWAPPED
+                self.small = torch.nn.Linear(128, 128, bias=False)
+
+            def forward(self, x):
+                return self.small(self.proj(self.large(x))).sum()
+
+        lr = 0.01
+        num_steps = 2
+
+        def _run_experiment(offload_cfg):
+            torch.manual_seed(42)
+            model = MixedMatrixModel()
+            config_dict = {
+                "train_micro_batch_size_per_gpu": 1,
+                "steps_per_print": 1,
+                "optimizer": {
+                    "type": "muon",
+                    "params": {
+                        "lr": lr,
+                        "momentum": 0.95
+                    }
+                },
+                "fp16": {
+                    "enabled": True,
+                    "loss_scale": 1.0
+                },
+                "zero_optimization": {
+                    "stage": 3,
+                    "reduce_scatter": False,
+                    "save_muon_momentum_buffer_in_memory": True,
+                    "offload_optimizer": offload_cfg,
+                    "sub_group_size": 1000000
+                },
+                "aio": {
+                    "block_size": 1048576
+                }
+            }
+            engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                                   model=model,
+                                                   model_parameters=model.parameters(),
+                                                   dist_init_required=False)
+            device = engine.device
+            muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
+            init_params = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+
+            torch.manual_seed(1234)
+            for _ in range(num_steps):
+                x = torch.randn(2, 512, device=device).half()
+                loss = engine(x)
+                engine.backward(loss)
+                engine.step()
+
+            final_params = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+            return init_params, final_params, engine.optimizer
+
+        # 1. Non-NVMe reference run (CPU offload in RAM, no swapping)
+        ref_cfg = {"device": "cpu", "pin_memory": True}
+        init_params, ref_final, _ = _run_experiment(ref_cfg)
+
+        # 2. NVMe run (with mixed swapped/unswapped fragments in the same subgroup)
+        nvme_cfg = {
+            "device": "nvme",
+            "nvme_path": str(tmpdir),
+        }
+        if pipeline:
+            nvme_cfg["pipeline_read"] = True
+            nvme_cfg["pipeline_write"] = True
+
+        _, nvme_final, opt = _run_experiment(nvme_cfg)
+
+        assert opt.swap_optimizer
+        if pipeline:
+            assert isinstance(opt.optimizer_swapper, PipelinedOptimizerSwapper)
+        else:
+            assert isinstance(opt.optimizer_swapper, PartitionedOptimizerSwapper)
+
+        # Verify numerical equivalence with non-NVMe reference and non-zero update
+        for n in ref_final:
+            update_norm = (init_params[n] - nvme_final[n]).norm().item()
+            assert update_norm > 0.01, f"Parameter {n} did not update"
+            max_diff = (ref_final[n] - nvme_final[n]).abs().max().item()
+            assert max_diff < 1e-4, (
+                f"Numerical divergence for {n} under pipeline={pipeline}: "
+                f"max_diff={max_diff}, ref_norm={ref_final[n].norm().item()}, nvme_norm={nvme_final[n].norm().item()}")
