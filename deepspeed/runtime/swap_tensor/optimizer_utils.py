@@ -207,6 +207,7 @@ class OptimizerSwapper(object):
         for swap_info in self.swap_params_info.values():
             swap_info.tensors = [swap_info.tensors[0]]
             swap_info.has_state_tensors = False
+            swap_info.release_unswapped_gradients()
 
     def is_swappable_tensor(self, tensor=None, numel=None):
         assert tensor is not None or numel is not None, "Either tensor or numel must be provided"
@@ -468,9 +469,6 @@ class OptimizerSwapper(object):
         num_elem_count = swap_info.read_unswapped_gradients(dest_buffer)
         self._stop_timer(UNSWAPPED_READ_GRADIENTS)
         self._log_timers([UNSWAPPED_READ_GRADIENTS])
-
-        # It should be safe to discard unswapped gradient partitions
-        swap_info.release_unswapped_gradients()
 
         if SWAPPER_DEBUG_MODE:
             logger.info(

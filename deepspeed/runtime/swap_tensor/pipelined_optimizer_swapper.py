@@ -137,6 +137,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         assert self.swap_ops[SYNC_SWAP_IN] is not None
         assert not self.swap_ops[SYNC_SWAP_IN].wait_required
+        self.swap_ops[SYNC_SWAP_IN].param_info.release_unswapped_gradients()
         swap_op = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
                                                  parameter=parameter,
                                                  swap_in_op=self.swap_ops[SYNC_SWAP_IN])
@@ -156,6 +157,50 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                  gradient_offsets=gradient_offsets,
                                  gradient_tensors=gradient_tensors,
                                  gradient_swapper=self.gradient_swapper)
+
+    def writeback_optimizer_state_and_gradients(self, parameter, write_opt_state, write_gradients):
+        swap_in_op = self.swap_ops[SYNC_SWAP_IN]
+        assert swap_in_op is not None and swap_in_op.is_parameter(parameter)
+        param_info = swap_in_op.param_info
+
+        if self.swap_ops[ASYNC_SWAP_OUT]:
+            self._start_timer(ASYNC_SWAP_OUT_STATE_TIMER)
+            self._complete_swap_out(ASYNC_SWAP_OUT)
+            self._stop_timer(ASYNC_SWAP_OUT_STATE_TIMER)
+            self.timer_names.add(ASYNC_SWAP_OUT_STATE_TIMER)
+
+        if write_opt_state:
+            self._start_timer(SWAP_OUT_STATE_TIMER)
+            swap_op = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
+                                                     parameter=parameter,
+                                                     swap_in_op=swap_in_op)
+            self.swap_ops[SYNC_SWAP_OUT] = swap_op
+            self._complete_swap_out(SYNC_SWAP_OUT)
+            self._stop_timer(SWAP_OUT_STATE_TIMER)
+            self.timer_names.add(SWAP_OUT_STATE_TIMER)
+        else:
+            self.swap_buffer_manager.free(swap_in_op.allocated_buffers)
+
+        if write_gradients and param_info.has_gradients():
+            if param_info.swapped_gradients:
+                param_gradients = param_info.swapped_gradients.values()
+                swap_buffers = [parameter.grad.narrow(0, grad.offset, grad.length) for grad in param_gradients]
+                swap_paths = [grad.path for grad in param_gradients]
+                swap_out_tensors(self.write_aio_handle, swap_buffers, swap_paths)
+                assert len(swap_buffers) == self.write_aio_handle.wait()
+            if param_info.unswapped_gradients:
+                param_info.write_unswapped_gradients(src_buffer=parameter.grad)
+
+        param_info.release_memory()
+        self.swap_ops[SYNC_SWAP_IN] = None
+
+    def release_swap_buffers(self, parameter):
+        swap_in_op = self.swap_ops[SYNC_SWAP_IN]
+        if swap_in_op is not None and swap_in_op.is_parameter(parameter):
+            param_info = swap_in_op.param_info
+            param_info.release_memory()
+            self.swap_buffer_manager.free(swap_in_op.allocated_buffers)
+            self.swap_ops[SYNC_SWAP_IN] = None
 
     def _complete_swap_out(self, swap_out_type):
         self.swap_ops[swap_out_type].wait()

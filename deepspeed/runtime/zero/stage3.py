@@ -2598,7 +2598,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.optimizer_swapper.swap_in_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_parameter=self.next_swappable_fp32_partitioned_groups[sub_group_id])
+            async_parameter=self.next_swappable_fp32_partitioned_groups[sub_group_id]
+            if timer_names is not None else None)
 
         if timer_names is not None:
             self.timers(OPTIMIZER_SWAP_IN_STATE_TIMER).stop()
