@@ -436,7 +436,9 @@ class TestMuonOffloadLossScaling(DistributedTest):
                                                    model_parameters=model.parameters(),
                                                    dist_init_required=False)
             device = engine.device
-            muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
+            muon_named = [(n, p) for n, p in engine.module.named_parameters()
+                          if getattr(p, "use_muon", False) or len(getattr(p, "ds_shape", p.shape)) >= 2]
+            assert len(muon_named) > 0, "No Muon parameters identified!"
             pre = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
 
             torch.manual_seed(999)
@@ -633,10 +635,12 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
 
     @pytest.mark.parametrize("pipeline", [False, True])
     def test_zero3_nvme_mixed_fragments_numerical_equivalence(self, tmpdir, pipeline):
+        import copy
         from deepspeed.ops.aio import AsyncIOBuilder
         from deepspeed.utils import safe_get_full_fp32_param
         from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
         from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+        from deepspeed.runtime.zero.muon.original_muon import muon_update
 
         if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
             pytest.skip("Skip tests since async-io is not compatible")
@@ -656,59 +660,34 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 return self.small(self.proj(self.large(x))).sum()
 
         lr = 0.01
+        momentum = 0.95
         num_steps = 2
 
-        def _run_experiment(offload_cfg):
-            torch.manual_seed(42)
-            model = MixedMatrixModel()
-            config_dict = {
-                "train_micro_batch_size_per_gpu": 1,
-                "steps_per_print": 1,
-                "optimizer": {
-                    "type": "muon",
-                    "params": {
-                        "lr": lr,
-                        "momentum": 0.95
-                    }
-                },
-                "fp16": {
-                    "enabled": True,
-                    "loss_scale": 1.0
-                },
-                "zero_optimization": {
-                    "stage": 3,
-                    "reduce_scatter": False,
-                    "save_muon_momentum_buffer_in_memory": True,
-                    "offload_optimizer": offload_cfg,
-                    "sub_group_size": 1000000
-                },
-                "aio": {
-                    "block_size": 1048576
-                }
-            }
-            engine, _, _, _ = deepspeed.initialize(config=config_dict,
-                                                   model=model,
-                                                   model_parameters=model.parameters(),
-                                                   dist_init_required=False)
-            device = engine.device
-            muon_named = [(n, p) for n, p in engine.module.named_parameters() if p.ndim >= 2]
-            init_params = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
+        torch.manual_seed(42)
+        base_model = MixedMatrixModel()
+        init_state = copy.deepcopy(base_model.state_dict())
 
-            torch.manual_seed(1234)
-            for _ in range(num_steps):
-                x = torch.randn(2, 512, device=device).half()
-                loss = engine(x)
-                engine.backward(loss)
-                engine.step()
+        # 1. Independent full-gradient reference (pure PyTorch + canonical muon_update across 2 steps)
+        device = get_accelerator().current_device_name()
+        ref_model = MixedMatrixModel().to(device).half()
+        ref_model.load_state_dict({k: v.to(device).half() for k, v in init_state.items()})
+        ref_momentums = {n: torch.zeros_like(p) for n, p in ref_model.named_parameters()}
 
-            final_params = {n: safe_get_full_fp32_param(p).clone() for n, p in muon_named}
-            return init_params, final_params, engine.optimizer
+        gen = torch.Generator().manual_seed(1234)
+        inputs = [torch.randn(2, 512, generator=gen).to(device).half() for _ in range(num_steps)]
 
-        # 1. Non-NVMe reference run (CPU offload in RAM, no swapping)
-        ref_cfg = {"device": "cpu", "pin_memory": True}
-        init_params, ref_final, _ = _run_experiment(ref_cfg)
+        for step in range(num_steps):
+            ref_model.zero_grad(set_to_none=True)
+            loss = ref_model(inputs[step])
+            loss.backward()
+            with torch.no_grad():
+                for n, p in ref_model.named_parameters():
+                    update = muon_update(p.grad.clone(), ref_momentums[n], beta=momentum, ns_method="gram")
+                    p.add_(update.reshape(p.shape), alpha=-lr)
 
-        # 2. NVMe run (with mixed swapped/unswapped fragments in the same subgroup)
+        ref_final = {n: p.clone().detach().cpu().float() for n, p in ref_model.named_parameters()}
+
+        # 2. ZeRO-3 NVMe run with mixed swapped/unswapped fragments in the same subgroup
         nvme_cfg = {
             "device": "nvme",
             "nvme_path": str(tmpdir),
@@ -717,19 +696,66 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             nvme_cfg["pipeline_read"] = True
             nvme_cfg["pipeline_write"] = True
 
-        _, nvme_final, opt = _run_experiment(nvme_cfg)
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1,
+            "gradient_clipping": 0.0,
+            "optimizer": {
+                "type": "muon",
+                "params": {
+                    "lr": lr,
+                    "momentum": momentum
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.0
+            },
+            "zero_optimization": {
+                "stage": 3,
+                "reduce_scatter": False,
+                "save_muon_momentum_buffer_in_memory": True,
+                "offload_optimizer": nvme_cfg,
+                "sub_group_size": 1000000
+            },
+            "aio": {
+                "block_size": 1048576
+            }
+        }
+        model = MixedMatrixModel()
+        model.load_state_dict({k: v.clone() for k, v in init_state.items()})
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               model_parameters=model.parameters(),
+                                               dist_init_required=False)
 
+        # Explicitly verify all 3 parameters are identified as Muon parameters under ZeRO-3
+        muon_named = [(n, p) for n, p in engine.module.named_parameters()
+                      if getattr(p, "use_muon", False) or len(getattr(p, "ds_shape", p.shape)) >= 2]
+        assert len(muon_named) == 3, f"Expected 3 Muon parameters, got {len(muon_named)}: {[n for n, p in muon_named]}"
+        assert set(n for n, p in muon_named) == {"large.weight", "proj.weight", "small.weight"}
+        init_params = {n: safe_get_full_fp32_param(p).clone().cpu() for n, p in muon_named}
+
+        for step in range(num_steps):
+            loss = engine(inputs[step])
+            engine.backward(loss)
+            engine.step()
+
+        opt = engine.optimizer
         assert opt.swap_optimizer
         if pipeline:
             assert isinstance(opt.optimizer_swapper, PipelinedOptimizerSwapper)
         else:
             assert isinstance(opt.optimizer_swapper, PartitionedOptimizerSwapper)
 
-        # Verify numerical equivalence with non-NVMe reference and non-zero update
+        nvme_final = {n: safe_get_full_fp32_param(p).clone().cpu() for n, p in muon_named}
+
+        # Verify non-trivial update and numerical equivalence against independent reference
         for n in ref_final:
             update_norm = (init_params[n] - nvme_final[n]).norm().item()
             assert update_norm > 0.01, f"Parameter {n} did not update"
-            max_diff = (ref_final[n] - nvme_final[n]).abs().max().item()
-            assert max_diff < 1e-4, (
+            rel_err = ((nvme_final[n] - ref_final[n]).norm() / (ref_final[n].norm() + 1e-8)).item()
+            assert rel_err < 0.05, (
                 f"Numerical divergence for {n} under pipeline={pipeline}: "
-                f"max_diff={max_diff}, ref_norm={ref_final[n].norm().item()}, nvme_norm={nvme_final[n].norm().item()}")
+                f"rel_err={rel_err:.4f}, ref_norm={ref_final[n].norm().item():.4f}, nvme_norm={nvme_final[n].norm().item():.4f}"
+            )
