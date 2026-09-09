@@ -566,6 +566,158 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
             assert buf.numel() == int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
 
+    @pytest.mark.parametrize("offload", ["none", "nvme", "nvme_pipelined"])
+    def test_zero3_momentum_survives_checkpoint(self, tmpdir, offload):
+        """An interrupted run must land on the same weights as an uninterrupted one.
+
+        The resident momentum cache is a second reference to the tensor held in
+        ``optimizer.state``. ``Optimizer.load_state_dict()`` rebinds that entry to a fresh tensor,
+        and NVMe offload skips it entirely in favour of swap files that never hold the in-memory
+        buffer. Either way the resumed run would silently continue from a zero momentum.
+        """
+        from deepspeed.runtime.zero.partition_parameters import Init
+        from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
+        from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+
+        uses_nvme = offload.startswith("nvme")
+        if uses_nvme:
+            from deepspeed.ops.aio import AsyncIOBuilder
+            if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
+                pytest.skip("Skip tests since async-io is not compatible")
+
+        hidden_dim, nlayers = 1024, 2
+        total_steps = 4
+        interrupt_at = 2
+        # A wide batch keeps the gradients full rank. Rank-deficient gradients make the
+        # Newton-Schulz iteration amplify fp16 noise in the near-null singular directions, which
+        # would swamp the effect this test is looking for.
+        micro_batch = 256
+        offload_optimizer_cfg = None
+        if uses_nvme:
+            offload_optimizer_cfg = {"device": "nvme", "nvme_path": str(tmpdir.mkdir("nvme"))}
+            if offload == "nvme_pipelined":
+                offload_optimizer_cfg["pipeline_read"] = True
+                offload_optimizer_cfg["pipeline_write"] = True
+        config_dict = {
+            "train_micro_batch_size_per_gpu": micro_batch,
+            "steps_per_print": 1,
+            "optimizer": {
+                "type": "muon",
+                "params": {
+                    "lr": 0.01,
+                    "momentum": 0.95
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.0
+            },
+            "zero_optimization": {
+                "stage": 3,
+                "reduce_scatter": False,
+                "save_muon_momentum_buffer_in_memory": True,
+                "sub_group_size": 100
+            },
+            "aio": {
+                "block_size": 1048576
+            }
+        }
+        if offload_optimizer_cfg is not None:
+            config_dict["zero_optimization"]["offload_optimizer"] = offload_optimizer_cfg
+
+        # Bias-free matrices so that every parameter takes the Muon path and the resident momentum
+        # buffer is the only optimizer state that has to survive the checkpoint.
+        class MatrixOnlyModel(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [torch.nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(nlayers)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                # Scaled up to keep the fp16 gradients out of the subnormal range.
+                return x.pow(2).mean() * 1024.0
+
+        def build_engine():
+            # NVMe swap files are named after parameter ids, so every engine must number its
+            # parameters the same way for the copied checkpoint files to be picked up.
+            Init.param_id = 0
+            torch.manual_seed(42)
+            model = MatrixOnlyModel()
+            engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                                   model=model,
+                                                   model_parameters=model.parameters(),
+                                                   dist_init_required=False)
+            if uses_nvme:
+                expected_swapper = (PipelinedOptimizerSwapper
+                                    if offload == "nvme_pipelined" else PartitionedOptimizerSwapper)
+                assert isinstance(engine.optimizer.optimizer_swapper, expected_swapper)
+            else:
+                assert not engine.optimizer.swap_optimizer
+            return engine
+
+        def resident_momentums(engine):
+            buffers = engine.optimizer.muon_momentum_buffer_partitioned_groups_flat
+            assert len(buffers) > 0
+            return {sub_group_id: buf.clone().float().cpu() for sub_group_id, buf in buffers.items()}
+
+        def flat_weights(engine):
+            params = list(engine.module.parameters())
+            with deepspeed.zero.GatheredParameters(params, modifier_rank=None):
+                return torch.cat([p.detach().float().cpu().reshape(-1) for p in params])
+
+        torch.manual_seed(7)
+        inputs = torch.randn(total_steps, micro_batch, hidden_dim).half()
+
+        def run(engine, steps):
+            for step in steps:
+                engine.backward(engine(inputs[step].to(engine.device)))
+                engine.step()
+
+        reference_engine = build_engine()
+        run(reference_engine, range(total_steps))
+        reference_weights = flat_weights(reference_engine)
+        reference_engine.destroy()
+
+        interrupted_engine = build_engine()
+        run(interrupted_engine, range(interrupt_at))
+        checkpoint_weights = flat_weights(interrupted_engine)
+        saved_momentums = resident_momentums(interrupted_engine)
+        assert any(buf.abs().max().item() > 0.0 for buf in saved_momentums.values())
+        ckpt_dir = str(tmpdir.mkdir("ckpt"))
+        interrupted_engine.save_checkpoint(ckpt_dir)
+        interrupted_engine.destroy()
+
+        resumed_engine = build_engine()
+        resumed_engine.load_checkpoint(ckpt_dir)
+        assert torch.equal(flat_weights(resumed_engine), checkpoint_weights), \
+            "Model weights were not restored from the checkpoint"
+
+        restored_momentums = resident_momentums(resumed_engine)
+        assert restored_momentums.keys() == saved_momentums.keys()
+        for sub_group_id, saved in saved_momentums.items():
+            restored = restored_momentums[sub_group_id]
+            assert torch.equal(
+                restored,
+                saved), (f"Resident Muon momentum for subgroup {sub_group_id} was not restored from the checkpoint; "
+                         f"max diff {(restored - saved).abs().max().item()}")
+            fp32_param = resumed_engine.optimizer.fp32_partitioned_groups_flat[sub_group_id]
+            assert resumed_engine.optimizer.optimizer.state[fp32_param]["momentum_buffer"] is \
+                resumed_engine.optimizer.muon_momentum_buffer_partitioned_groups_flat[sub_group_id], \
+                ("Optimizer state and the resident cache must reference the same momentum tensor, "
+                 "otherwise the next step silently discards the restored values")
+
+        run(resumed_engine, range(interrupt_at, total_steps))
+        # Newton-Schulz runs in reduced precision and is not bitwise reproducible, so compare the
+        # weight update accumulated after the checkpoint instead of requiring exact equality.
+        reference_update = reference_weights - checkpoint_weights
+        resumed_update = flat_weights(resumed_engine) - checkpoint_weights
+        relative_error = ((resumed_update - reference_update).norm() / reference_update.norm()).item()
+        assert relative_error < 0.05, ("Resuming from a checkpoint diverged from the uninterrupted run; "
+                                       f"relative update error {relative_error}")
+
     def test_zero3_nvme_aggregate_unswapped_fragments(self, tmpdir):
         from deepspeed.ops.aio import AsyncIOBuilder
         if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
