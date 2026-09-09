@@ -469,14 +469,26 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
 
     world_size = 1
 
-    def test_zero3_nvme_momentum_residency(self, tmpdir):
+    @pytest.mark.parametrize("pipeline", [False, True])
+    def test_zero3_nvme_momentum_residency(self, tmpdir, pipeline):
         from deepspeed.ops.aio import AsyncIOBuilder
+        from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
+        from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+
         if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
             pytest.skip("Skip tests since async-io is not compatible")
 
         hidden_dim, nlayers = 1024, 2
         lr = 0.01
         momentum = 0.95
+        offload_optimizer_cfg = {
+            "device": "nvme",
+            "nvme_path": str(tmpdir),
+        }
+        if pipeline:
+            offload_optimizer_cfg["pipeline_read"] = True
+            offload_optimizer_cfg["pipeline_write"] = True
+
         config_dict = {
             "train_micro_batch_size_per_gpu": 1,
             "steps_per_print": 1,
@@ -495,10 +507,7 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 "stage": 3,
                 "reduce_scatter": False,
                 "save_muon_momentum_buffer_in_memory": True,
-                "offload_optimizer": {
-                    "device": "nvme",
-                    "nvme_path": str(tmpdir)
-                },
+                "offload_optimizer": offload_optimizer_cfg,
                 "sub_group_size": 100
             },
             "aio": {
@@ -519,6 +528,10 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         opt = engine.optimizer
         assert opt.swap_optimizer, "NVMe swap_optimizer must be enabled"
         assert opt.save_muon_momentum_buffer_in_memory
+        if pipeline:
+            assert isinstance(opt.optimizer_swapper, PipelinedOptimizerSwapper)
+        else:
+            assert isinstance(opt.optimizer_swapper, PartitionedOptimizerSwapper)
 
         # Step 1
         engine.backward(engine(x, y))
@@ -550,3 +563,70 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         engine.step()
         for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
             assert buf.numel() == int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
+
+    def test_zero3_nvme_aggregate_unswapped_fragments(self, tmpdir):
+        from deepspeed.ops.aio import AsyncIOBuilder
+        if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
+            pytest.skip("Skip tests since async-io is not compatible")
+
+        # 20 layers of 128x128: each parameter is 16,384 elements (< 1 MiB in FP32).
+        # Subgroup aggregate is 327,680 elements (> 262,144 elements / 1 MiB in FP32),
+        # making the subgroup swappable while all individual gradient fragments are unswapped.
+        class SmallMatrixModel(torch.nn.Module):
+
+            def __init__(self, num_layers=20, dim=128):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([torch.nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+
+            def forward(self, x):
+                for l in self.layers:
+                    x = l(x)
+                return x.sum()
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1,
+            "optimizer": {
+                "type": "muon",
+                "params": {
+                    "lr": 0.01,
+                    "momentum": 0.95
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.0
+            },
+            "zero_optimization": {
+                "stage": 3,
+                "reduce_scatter": False,
+                "save_muon_momentum_buffer_in_memory": True,
+                "offload_optimizer": {
+                    "device": "nvme",
+                    "nvme_path": str(tmpdir)
+                },
+                "sub_group_size": 1000000
+            },
+            "aio": {
+                "block_size": 1048576
+            }
+        }
+        torch.manual_seed(42)
+        model = SmallMatrixModel()
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               model_parameters=model.parameters(),
+                                               dist_init_required=False)
+
+        device = engine.device
+        x = torch.randn(1, 128, device=device).half()
+        opt = engine.optimizer
+        assert opt.swap_optimizer
+
+        initial_params = [p.clone().detach().cpu() for p in model.parameters()]
+        for step in range(2):
+            loss = engine(x)
+            engine.backward(loss)
+            engine.step()
+
+        assert any(not torch.equal(init, p.detach().cpu()) for init, p in zip(initial_params, model.parameters()))
