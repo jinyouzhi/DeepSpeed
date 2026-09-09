@@ -657,11 +657,15 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 self.small = torch.nn.Linear(128, 128, bias=False)
 
             def forward(self, x):
-                return self.small(self.proj(self.large(x))).sum()
+                # A squared loss over a wide batch keeps the weight gradients well conditioned,
+                # so Newton-Schulz does not amplify fp16 noise into the comparison. The constant
+                # factor lifts the gradients out of the fp16 subnormal range.
+                return self.small(self.proj(self.large(x))).pow(2).mean() * 1024.0
 
         lr = 0.01
         momentum = 0.95
         num_steps = 2
+        micro_batch = 256
 
         torch.manual_seed(42)
         base_model = MixedMatrixModel()
@@ -671,10 +675,11 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         device = get_accelerator().current_device_name()
         ref_masters = {n: p.clone().detach().cpu().float() for n, p in init_state.items()}
         init_masters = {n: p.clone() for n, p in ref_masters.items()}
-        ref_momentums = {n: torch.zeros_like(p).to(device).half() for n, p in ref_masters.items()}
+        # Muon momentum is a persistent optimizer state and is kept in fp32, matching ZeRO-1/2/3.
+        ref_momentums = {n: torch.zeros_like(p).to(device).float() for n, p in ref_masters.items()}
 
         gen = torch.Generator().manual_seed(1234)
-        inputs = [torch.randn(2, 512, generator=gen).to(device).half() for _ in range(num_steps)]
+        inputs = [torch.randn(micro_batch, 512, generator=gen).to(device).half() for _ in range(num_steps)]
 
         for step in range(num_steps):
             ref_model = MixedMatrixModel().to(device).half()
@@ -685,8 +690,8 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             loss.backward()
             with torch.no_grad():
                 for n, p in ref_model.named_parameters():
-                    update = muon_update(p.grad.clone(), ref_momentums[n], beta=momentum, ns_method="gram")
-                    ref_masters[n].add_(up := update.cpu().float(), alpha=-lr)
+                    update = muon_update(p.grad.detach().float(), ref_momentums[n], beta=momentum, ns_method="gram")
+                    ref_masters[n].add_(update.cpu().float(), alpha=-lr)
 
         ref_updates = {n: (init_masters[n] - ref_masters[n]) for n in ref_masters}
 
@@ -700,7 +705,7 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             nvme_cfg["pipeline_write"] = True
 
         config_dict = {
-            "train_micro_batch_size_per_gpu": 1,
+            "train_micro_batch_size_per_gpu": micro_batch,
             "steps_per_print": 1,
             "gradient_clipping": 0.0,
             "optimizer": {
@@ -761,7 +766,7 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             assert ref_norm > 0.01, f"Reference update vanished for {n}"
             assert applied_norm > 0.01, f"Engine update vanished for {n}"
             rel_err = ((applied_updates[n] - ref_updates[n]).norm() / (ref_norm + 1e-8)).item()
-            assert rel_err < 0.25, (f"Numerical divergence for {n} under pipeline={pipeline}: "
+            assert rel_err < 0.05, (f"Numerical divergence for {n} under pipeline={pipeline}: "
                                     f"rel_err={rel_err:.4f}, applied_norm={applied_norm:.4f}, ref_norm={ref_norm:.4f}")
 
 
@@ -794,15 +799,20 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
                 self.proj = torch.nn.Linear(1024, 128, bias=False)
                 # 128 x 128 = 16,384 elements (64 KiB in FP32).
                 # Partition per rank = 8,192 elements (< 1 MiB in FP32) -> UNSWAPPED
-                self.small = torch.nn.Linear(128, 128, bias=False)
+                self.small = torch.nn.Linear(128, 129, bias=False)
+                # 127 x 129 = 16,383 elements: odd numel, so ZeRO-3 pads the flat partition
+                # and the final rank owns a partially out-of-range slice -> UNSWAPPED
+                self.odd = torch.nn.Linear(129, 127, bias=False)
 
             def forward(self, x):
-                return self.small(self.proj(self.large(x))).sum()
+                # A squared loss keeps the per-sample output error distinct, so the weight
+                # gradients stay well conditioned and Newton-Schulz does not amplify fp16 noise.
+                return self.odd(self.small(self.proj(self.large(x)))).pow(2).mean() * 1024.0
 
         lr = 0.01
         momentum = 0.95
         num_steps = 2
-        micro_batch = 2
+        micro_batch = 256
         rank = dist.get_rank()
         device = get_accelerator().current_device_name()
 
@@ -820,7 +830,8 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
         if rank == 0:
             ref_masters = {n: p.clone().detach().cpu().float() for n, p in init_state.items()}
             init_masters = {n: p.clone() for n, p in ref_masters.items()}
-            ref_momentums = {n: torch.zeros_like(p).to(device).half() for n, p in ref_masters.items()}
+            # Muon momentum is a persistent optimizer state and is kept in fp32, matching ZeRO-1/2/3.
+            ref_momentums = {n: torch.zeros_like(p).to(device).float() for n, p in ref_masters.items()}
 
             for step in range(num_steps):
                 x0 = inputs_step[step][:micro_batch]
@@ -839,7 +850,9 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
                 loss1.backward()
                 grads1 = {n: p.grad.clone() for n, p in ref_model.named_parameters()}
 
-                avg_grads = {n: (grads0[n] + grads1[n]) / 2.0 for n in grads0}
+                # DeepSpeed averages DP gradients in the fp16 communication dtype, so the oracle
+                # must do the same before promoting to fp32 for momentum and Newton-Schulz.
+                avg_grads = {n: ((grads0[n] + grads1[n]) / 2.0).float() for n in grads0}
                 with torch.no_grad():
                     for n in ref_masters:
                         up = muon_update(avg_grads[n], ref_momentums[n], beta=momentum, ns_method="gram")
@@ -891,8 +904,16 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
 
         muon_named = [(n, p) for n, p in engine.module.named_parameters()
                       if getattr(p, "use_muon", False) or len(getattr(p, "ds_shape", p.shape)) >= 2]
-        assert len(muon_named) == 3
-        assert set(n for n, p in muon_named) == {"large.weight", "proj.weight", "small.weight"}
+        assert len(muon_named) == 4
+        assert set(n for n, p in muon_named) == {"large.weight", "proj.weight", "small.weight", "odd.weight"}
+
+        # Exercise the padded final partition: odd.weight cannot be split evenly across 2 ranks,
+        # so its last partition is padded and reconstruction must drop the out-of-range tail.
+        odd_param = dict(muon_named)["odd.weight"]
+        world_size = dist.get_world_size()
+        assert odd_param.ds_numel % world_size != 0, "odd.weight must not divide evenly across ranks"
+        assert odd_param.partition_numel() * world_size > odd_param.ds_numel, "expected a padded final partition"
+
         init_engine_params = {n: safe_get_full_fp32_param(p).clone().cpu() for n, p in muon_named}
 
         # Each rank executes on its own micro-batch slice
@@ -920,6 +941,6 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
                 assert ref_norm > 0.01, f"Reference update vanished for {n}"
                 assert applied_norm > 0.01, f"Engine update vanished for {n}"
                 rel_err = ((applied_updates[n] - ref_updates[n]).norm() / (ref_norm + 1e-8)).item()
-                assert rel_err < 0.25, (
+                assert rel_err < 0.05, (
                     f"Update divergence for {n} under pipeline={pipeline}: "
                     f"rel_err={rel_err:.4f}, applied_norm={applied_norm:.4f}, ref_norm={ref_norm:.4f}")

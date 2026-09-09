@@ -182,14 +182,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
             self.swap_buffer_manager.free(swap_in_op.allocated_buffers)
 
         if write_gradients and param_info.has_gradients():
-            if param_info.swapped_gradients:
-                param_gradients = param_info.swapped_gradients.values()
-                swap_buffers = [parameter.grad.narrow(0, grad.offset, grad.length) for grad in param_gradients]
-                swap_paths = [grad.path for grad in param_gradients]
-                swap_out_tensors(self.write_aio_handle, swap_buffers, swap_paths)
-                assert len(swap_buffers) == self.write_aio_handle.wait()
-            if param_info.unswapped_gradients:
-                param_info.write_unswapped_gradients(src_buffer=parameter.grad)
+            self._writeback_gradients(param_info, parameter, self.write_aio_handle)
 
         param_info.release_memory()
         self.swap_ops[SYNC_SWAP_IN] = None
