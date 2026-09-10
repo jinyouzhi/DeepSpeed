@@ -141,11 +141,7 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
 
     for param_group_id in range(param_groups_cnt):
 
-        flat_state = dict(
-            exp_avg=state_groups[param_group_id]["exp_avg"],
-            exp_avg_sq=state_groups[param_group_id]["exp_avg_sq"],
-            fp32=fp32_groups[param_group_id],
-        )
+        flat_state = _flat_optimizer_states(state_groups[param_group_id], fp32_groups[param_group_id])
 
         if "step" in state_groups[param_group_id]:
             flat_state["step"] = state_groups[param_group_id]["step"]
@@ -183,11 +179,8 @@ def extract_zero_shards_stage3(optim_files_grid,
     param_shapes = param_shapes_grid[tp_index]
 
     for idx, sub_group_shape in enumerate(param_shapes):
-        flat_state = dict(
-            exp_avg=optim_sd['optimizer_state_dict']['state'][idx]["exp_avg"],
-            exp_avg_sq=optim_sd['optimizer_state_dict']['state'][idx]["exp_avg_sq"],
-            fp32=optim_sd['fp32_flat_groups'][idx],
-        )
+        flat_state = _flat_optimizer_states(optim_sd['optimizer_state_dict']['state'][idx],
+                                            optim_sd['fp32_flat_groups'][idx])
         partition_metadata = partition_groups[idx] if idx < len(partition_groups) else {}
         partition_count = partition_metadata.get('partition_count', dp_degree)
         partition_rank = partition_metadata.get('partition_rank', dp_index)
@@ -228,6 +221,29 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     if state_name != "step" and torch.is_tensor(state_flat_tensor):
         state_flat_tensor = state_flat_tensor.narrow(0, offset, numel).clone()
     _save_checkpoint(path, state_flat_tensor)
+
+
+def _flat_optimizer_states(state_group, fp32_flat_tensor):
+    """Collect the flat optimizer states to serialize alongside the fp32 weights.
+
+    Which states exist depends on the optimizer: Adam keeps exp_avg/exp_avg_sq while Muon keeps
+    momentum_buffer, and a model can mix both across parameter groups.
+    """
+    flat_state = {'fp32': fp32_flat_tensor}
+    for state_key, state_value in state_group.items():
+        if torch.is_tensor(state_value) and state_value.numel() == fp32_flat_tensor.numel():
+            flat_state[state_key] = state_value
+    return flat_state
+
+
+def _dumped_state_names(param_base_path):
+    """Recover the state names that were dumped as ``<state>.<dp_index>`` fragments."""
+    names = set()
+    for path in glob.glob(os.path.join(param_base_path, "*", "*.*")):
+        state_name, _, dp_index = os.path.basename(path).rpartition(".")
+        if state_name and state_name != "step" and dp_index.isdigit():
+            names.add(state_name)
+    return sorted(names)
 
 
 def _merge_zero_shards(param_base_path, state, tp_degree, slice_shapes=None):
@@ -330,7 +346,7 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
     if step_merged:
         _save_checkpoint(os.path.join(param_base_path, "step.pt"), step_merged[0])
 
-    for state in ("fp32", "exp_avg", "exp_avg_sq"):
+    for state in _dumped_state_names(slice_base_path):
         slices = _merge_zero_shards(slice_base_path, state, tp_degree, per_tp_shapes)
         final_path = os.path.join(param_base_path, f"{state}.pt")
 
@@ -484,7 +500,7 @@ def merge_zero3_slices(dp_degree, dir, slice_dir, name):
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
 
-    for state in ("fp32", "exp_avg", "exp_avg_sq"):
+    for state in _dumped_state_names(slice_base_path):
         slices = _merge_zero_shards(slice_base_path, state, 1)
         final_path = os.path.join(param_base_path, f"{state}.pt")
         _save_checkpoint(final_path, slices[0])
@@ -753,11 +769,8 @@ def _consolidate_zero3_autoep_expert_states(output_dir, model_files, optim_files
 
         for sub_group_id, sub_group_shape in enumerate(param_shapes):
             optimizer_sub_state = zero_optim_state['optimizer_state_dict']['state'][sub_group_id]
-            flat_state = {
-                'fp32': zero_optim_state['fp32_flat_groups'][sub_group_id],
-                'exp_avg': optimizer_sub_state.get('exp_avg'),
-                'exp_avg_sq': optimizer_sub_state.get('exp_avg_sq'),
-            }
+            flat_state = _flat_optimizer_states(optimizer_sub_state,
+                                                zero_optim_state['fp32_flat_groups'][sub_group_id])
             partition_metadata = partition_groups[sub_group_id] if sub_group_id < len(partition_groups) else {}
             partition_count = partition_metadata.get('partition_count', len(model_states_by_rank))
             partition_rank = partition_metadata.get('partition_rank', rank)
@@ -777,9 +790,6 @@ def _consolidate_zero3_autoep_expert_states(output_dir, model_files, optim_files
                                                      ep_rank)] = layer_info['expert_data_parallel_world_size']
                     expected_ep_ranks_by_param[param_name] = set(range(layer_info['ep_size']))
                     for state_key, flat_tensor in flat_state.items():
-                        if flat_tensor is None:
-                            raise RuntimeError(f"Missing optimizer state '{state_key}' for AutoEP expert "
-                                               f"parameter {param_name} on ZeRO rank {rank}")
                         fragment = flat_tensor.narrow(0, offset, padding_free_numel).clone()
                         key = (param_name, state_key, ep_rank)
                         expert_fragments.setdefault(key, []).append((partition_rank, fragment, shape))

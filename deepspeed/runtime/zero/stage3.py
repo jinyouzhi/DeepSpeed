@@ -3595,26 +3595,35 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._load_global_state_stage3(optim_sd)
 
         # Generally the step of each optimizer file should be the same, we can obtain from any parameter.
-        state_step = optim_sd[OPTIMIZER_STATE_DICT]['state'][0]['step']
-        for key in ["fp32", "exp_avg", "exp_avg_sq"]:
-            for sub_group_id, fp16_group in enumerate(self.fp16_groups):
-                fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+        state_step = optim_sd[OPTIMIZER_STATE_DICT]['state'][0].get('step')
+        for sub_group_id, fp16_group in enumerate(self.fp16_groups):
+            fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+            param_names = []
+            for param in fp16_group:
+                if param not in self.param_names:
+                    raise ValueError(f"failed to find optimizer param in named params")
+                param_names.append(self.param_names[param])
+
+            # Which states exist depends on the optimizer that owns the subgroup: Adam keeps
+            # exp_avg/exp_avg_sq while Muon keeps momentum_buffer, and a model can mix both.
+            for key in self._universal_state_keys(os.path.join(checkpoint_dir, param_names[0])):
                 key_tensor = torch.zeros_like(fp32_param)
                 offset = 0
-                for param in fp16_group:
-                    if param not in self.param_names:
-                        raise ValueError(f"failed to find optimizer param in named params")
-                    param_name = self.param_names[param]
+                for param, param_name in zip(fp16_group, param_names):
                     key_layer_state_partition = self.load_hp_checkpoint_state(os.path.join(checkpoint_dir, param_name),
                                                                               key,
                                                                               param=param)
                     key_tensor.narrow(0, offset, key_layer_state_partition.numel()).copy_(key_layer_state_partition)
                     offset += key_layer_state_partition.numel()
                 if key == "fp32":
-                    self.fp32_partitioned_groups_flat[sub_group_id].data.copy_(key_tensor)
-                    self.optimizer.state[fp32_param]['step'] = state_step
+                    fp32_param.data.copy_(key_tensor)
                 else:
                     self.optimizer.state[fp32_param][key] = key_tensor
+
+            if state_step is not None:
+                self.optimizer.state[fp32_param]['step'] = state_step
+
+        self._restore_muon_momentum_residency()
 
         for param_group in self.optimizer.param_groups:
             # Generally, the hyperparameters of each parameter should be the same, we can obtain from any parameter.
@@ -3695,6 +3704,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.loss_scaler = sd.get(LOSS_SCALER, self.loss_scaler)
         self.dynamic_loss_scale = sd.get('dynamic_loss_scale', self.dynamic_loss_scale)
         self.overflow = sd.get('overflow', self.overflow)
+
+    def _universal_state_keys(self, folder):
+        """List the optimizer states a universal checkpoint holds for one parameter."""
+        suffix = ".pt"
+        return sorted(name[:-len(suffix)] for name in os.listdir(folder)
+                      if name.endswith(suffix) and name != "step" + suffix)
 
     def load_hp_checkpoint_state(self, folder, key, param=None):
         partition_group = self._get_param_partition_group(param) if param is not None else self.dp_process_group
