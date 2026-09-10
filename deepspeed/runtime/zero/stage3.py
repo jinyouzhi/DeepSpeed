@@ -3668,16 +3668,19 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 else:
                     param_group[key] = value
 
-        for sub_group_id in range(len(self.fp32_partitioned_groups_flat)):
+        for sub_group_id in range(len(self.fp16_partitioned_groups_flat)):
+            # With parameter NVMe offload a subgroup that does not fit in the CPU flat buffer has
+            # no LP partition; _reassign_or_swap_out_partitioned_parameters() already persisted its
+            # parameters to their swap files, so there is nothing left to copy or unflatten.
+            fp16_param = self.fp16_partitioned_groups_flat[sub_group_id]
+            if fp16_param is None:
+                continue
+
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
             if sum(fp32_param.size()) > 0:
-                fp16_param = self.fp16_partitioned_groups_flat[sub_group_id]
                 fp16_param.data.copy_(fp32_param.data)
 
-        for sub_group_id in range(len(self.fp16_partitioned_groups_flat)):
-            updated_params = self.unflatten(self.fp16_partitioned_groups_flat[sub_group_id],
-                                            self.fp16_partitioned_groups[sub_group_id])
-
+            updated_params = self.unflatten(fp16_param, self.fp16_partitioned_groups[sub_group_id])
             for partitioned_param, q in zip(self.fp16_partitioned_groups[sub_group_id], updated_params):
                 partitioned_param.data = q.data
 
