@@ -1379,7 +1379,7 @@ class TestMuonZero3UniversalCheckpointMixed(DistributedTest):
 
 
 @pytest.mark.parametrize("save_momentum_in_memory", [True, False])
-@pytest.mark.parametrize("offload", ["nvme", "nvme_pipelined"])
+@pytest.mark.parametrize("offload", ["nvme", "nvme_pipelined", "nvme_params"])
 class TestMuonZero3UniversalCheckpointNVMe(DistributedTest):
     """A universal checkpoint must load into a run that offloads the optimizer to NVMe.
 
@@ -1387,7 +1387,8 @@ class TestMuonZero3UniversalCheckpointNVMe(DistributedTest):
     offload those buffers are empty placeholders until the subgroup is swapped in, so the restored
     values used to be dropped on the floor. The engine also used to bypass the ZeRO load entirely
     and repopulate the swap files from the checkpoint directory, which a universal checkpoint does
-    not carry.
+    not carry. Offloading the parameters as well leaves some subgroups without an LP partition
+    altogether, which the loader has to skip instead of unflattening.
     """
 
     def _run_test(self, tmpdir, muon_uc_config, offload):
@@ -1409,12 +1410,27 @@ class TestMuonZero3UniversalCheckpointNVMe(DistributedTest):
             # per state tensor plus one for its gradient, which exceeds the default buffer count.
             offload_optimizer_cfg["buffer_count"] = 8
         muon_uc_config["zero_optimization"]["offload_optimizer"] = offload_optimizer_cfg
+        if offload == "nvme_params":
+            # The CPU flat buffer only holds one subgroup partition, so the rest of the parameters
+            # live in NVMe and their subgroups never get an LP partition.
+            muon_uc_config["zero_optimization"]["offload_param"] = {
+                "device": "nvme",
+                "nvme_path": str(tmpdir.mkdir(f"nvme_param_{dist.get_rank()}")),
+                "max_in_cpu": UC_HIDDEN_DIM * UC_HIDDEN_DIM // 2
+            }
         muon_uc_config["aio"] = {"block_size": 1048576}
         muon_uc_config["checkpoint"] = {"load_universal": True}
 
         engine = _muon_uc_build_engine(muon_uc_config)
         expected_swapper = PipelinedOptimizerSwapper if offload == "nvme_pipelined" else PartitionedOptimizerSwapper
         assert isinstance(engine.optimizer.optimizer_swapper, expected_swapper)
+
+        lp_partitions = engine.optimizer.fp16_partitioned_groups_flat
+        if offload == "nvme_params":
+            assert any(partition is None for partition in lp_partitions), \
+                "Test does not cover the NVMe parameter offload path: every subgroup got an LP partition"
+        else:
+            assert all(partition is not None for partition in lp_partitions)
 
         engine.load_checkpoint(str(tmpdir), tag=f"{UC_TAG}_universal", load_optimizer_states=True)
 
@@ -1441,6 +1457,12 @@ class TestMuonZero3UniversalCheckpointNVMe(DistributedTest):
 
     @pytest.mark.world_size(2)
     def test_dp_world_size_2to2(self, MuonUniversalBaselineWs2, tmpdir, muon_uc_config, offload):
+        if offload == "nvme_params":
+            # Multi-rank ZeRO-3 parameter NVMe offload trips an unrelated swap buffer accounting
+            # bug while prefetching partitions in the forward pass ("param N already assigned swap
+            # buffer id M"), which reproduces on a plain training run without any checkpointing.
+            # The single-rank test below still covers the loader path this class is about.
+            pytest.skip("Pre-existing ZeRO-3 NVMe parameter prefetch bug on more than one rank")
         self._run_test(tmpdir, muon_uc_config, offload)
 
     @pytest.mark.world_size(1)
