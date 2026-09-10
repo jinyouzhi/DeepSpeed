@@ -3,12 +3,14 @@
 
 # DeepSpeed Team
 
+import os
 import deepspeed
 import deepspeed.comm as dist
 import torch
 import pytest
+from types import SimpleNamespace
 
-from unit.common import DistributedTest
+from unit.common import DistributedTest, DistributedFixture
 from unit.simple_model import SimpleModel
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
@@ -28,6 +30,21 @@ for optimizer_name in ['muon', 'adam']:
                         for save_in_mem in ([True, False] if stage == 3 else [False]):
                             muon_configs.append(
                                 [optimizer_name, stage, lr, model_dim, nlayer, offload_optimizer, save_in_mem])
+
+
+class MuonMatrixModel(torch.nn.Module):
+    """Bias-free matrices, so every parameter takes the Muon path instead of the AdamW fallback."""
+
+    def __init__(self, hidden_dim, nlayers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(nlayers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        # Scaled up to keep the fp16 gradients out of the subnormal range.
+        return x.pow(2).mean() * 1024.0
 
 
 @pytest.mark.parametrize(
@@ -625,27 +642,12 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         if offload_optimizer_cfg is not None:
             config_dict["zero_optimization"]["offload_optimizer"] = offload_optimizer_cfg
 
-        # Bias-free matrices so that every parameter takes the Muon path and the resident momentum
-        # buffer is the only optimizer state that has to survive the checkpoint.
-        class MatrixOnlyModel(torch.nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.layers = torch.nn.ModuleList(
-                    [torch.nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(nlayers)])
-
-            def forward(self, x):
-                for layer in self.layers:
-                    x = layer(x)
-                # Scaled up to keep the fp16 gradients out of the subnormal range.
-                return x.pow(2).mean() * 1024.0
-
         def build_engine():
             # NVMe swap files are named after parameter ids, so every engine must number its
             # parameters the same way for the copied checkpoint files to be picked up.
             Init.param_id = 0
             torch.manual_seed(42)
-            model = MatrixOnlyModel()
+            model = MuonMatrixModel(hidden_dim, nlayers)
             engine, _, _, _ = deepspeed.initialize(config=config_dict,
                                                    model=model,
                                                    model_parameters=model.parameters(),
@@ -1096,3 +1098,156 @@ class TestMuonZero3NVMeMultiRankMixedFragments(DistributedTest):
                 assert rel_err < 0.05, (
                     f"Update divergence for {n} under pipeline={pipeline}: "
                     f"rel_err={rel_err:.4f}, applied_norm={applied_norm:.4f}, ref_norm={ref_norm:.4f}")
+
+
+UC_HIDDEN_DIM = 1024
+UC_NLAYERS = 2
+UC_TOTAL_STEPS = 4
+UC_INTERRUPT_AT = 2
+# A wide batch keeps the gradients full rank; rank-deficient gradients make Newton-Schulz amplify
+# fp16 noise in the near-null singular directions.
+UC_MICRO_BATCH = 256
+UC_TAG = "muon_uc"
+
+
+def _muon_uc_inputs():
+    torch.manual_seed(7)
+    return torch.randn(UC_TOTAL_STEPS, UC_MICRO_BATCH, UC_HIDDEN_DIM).half()
+
+
+def _muon_uc_build_engine(config_dict):
+    torch.manual_seed(42)
+    model = MuonMatrixModel(UC_HIDDEN_DIM, UC_NLAYERS)
+    engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                           model=model,
+                                           model_parameters=model.parameters(),
+                                           dist_init_required=False)
+    return engine
+
+
+def _muon_uc_run(engine, inputs, steps):
+    for step in steps:
+        # Every rank sees the same batch, so the data-parallel gradient average is independent of
+        # the world size and the run can be compared across a DP reshape.
+        engine.backward(engine(inputs[step].to(engine.device)))
+        engine.step()
+
+
+def _muon_uc_full_weights(engine):
+    params = list(engine.module.parameters())
+    with deepspeed.zero.GatheredParameters(params, modifier_rank=None):
+        return torch.cat([p.detach().float().cpu().reshape(-1) for p in params])
+
+
+@pytest.fixture
+def muon_uc_config(save_momentum_in_memory):
+    return {
+        "train_micro_batch_size_per_gpu": UC_MICRO_BATCH,
+        "steps_per_print": 1,
+        "optimizer": {
+            "type": "muon",
+            "params": {
+                "lr": 0.01,
+                "momentum": 0.95
+            }
+        },
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 1.0
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "reduce_scatter": False,
+            "save_muon_momentum_buffer_in_memory": save_momentum_in_memory,
+            "sub_group_size": 100
+        }
+    }
+
+
+class _MuonUniversalBaseline(DistributedFixture):
+    """Train, checkpoint mid-run, convert to universal format, then finish the run."""
+
+    world_size = None
+
+    def run(self, tmpdir, muon_uc_config):
+        from deepspeed.checkpoint import UNIVERSAL_CHECKPOINT_INFO
+        from deepspeed.checkpoint.ds_to_universal import main as convert_to_universal
+
+        inputs = _muon_uc_inputs()
+        engine = _muon_uc_build_engine(muon_uc_config)
+        _muon_uc_run(engine, inputs, range(UC_INTERRUPT_AT))
+        checkpoint_weights = _muon_uc_full_weights(engine)
+        engine.save_checkpoint(str(tmpdir), tag=UC_TAG, client_state={UNIVERSAL_CHECKPOINT_INFO: {}})
+
+        _muon_uc_run(engine, inputs, range(UC_INTERRUPT_AT, UC_TOTAL_STEPS))
+        reference_weights = _muon_uc_full_weights(engine)
+
+        dist.barrier()
+        if dist.get_rank() == 0:
+            cp_dir = os.path.join(str(tmpdir), UC_TAG)
+            convert_to_universal(
+                SimpleNamespace(input_folder=cp_dir,
+                                output_folder=f"{cp_dir}_universal",
+                                num_extract_workers=1,
+                                num_merge_workers=1,
+                                keep_temp_folder=False,
+                                strict=True,
+                                inject_missing_state=False))
+            torch.save((checkpoint_weights, reference_weights), os.path.join(str(tmpdir), "muon_uc_baseline.pt"))
+        dist.barrier()
+        engine.destroy()
+
+
+class MuonUniversalBaselineWs2(_MuonUniversalBaseline):
+    world_size = 2
+
+
+@pytest.mark.parametrize("save_momentum_in_memory", [True, False])
+class TestMuonZero3UniversalCheckpoint(DistributedTest):
+    """ZeRO-3 Muon momentum must round-trip through a universal checkpoint, including a DP reshape."""
+
+    def _run_test(self, tmpdir, muon_uc_config):
+        checkpoint_weights, reference_weights = torch.load(os.path.join(str(tmpdir), "muon_uc_baseline.pt"),
+                                                           weights_only=False)
+
+        muon_uc_config["checkpoint"] = {"load_universal": True}
+        engine = _muon_uc_build_engine(muon_uc_config)
+        engine.load_checkpoint(str(tmpdir), tag=f"{UC_TAG}_universal", load_optimizer_states=True)
+
+        assert torch.allclose(_muon_uc_full_weights(engine), checkpoint_weights, atol=1e-3), \
+            "Model weights were not restored from the universal checkpoint"
+
+        opt = engine.optimizer
+        assert len(opt.fp32_partitioned_groups_flat) > 0
+        for sub_group_id, fp32_param in enumerate(opt.fp32_partitioned_groups_flat):
+            momentum = opt.optimizer.state[fp32_param].get("momentum_buffer")
+            assert momentum is not None, f"Muon momentum missing for subgroup {sub_group_id} after universal load"
+            assert momentum.abs().max().item() > 0.0, \
+                f"Muon momentum for subgroup {sub_group_id} was restored as all zeros"
+            if muon_uc_config["zero_optimization"]["save_muon_momentum_buffer_in_memory"]:
+                assert momentum is opt.muon_momentum_buffer_partitioned_groups_flat[sub_group_id], \
+                    ("Optimizer state and the resident cache must reference the same momentum tensor, "
+                     "otherwise the next step silently discards the restored values")
+
+        _muon_uc_run(engine, _muon_uc_inputs(), range(UC_INTERRUPT_AT, UC_TOTAL_STEPS))
+
+        # Newton-Schulz runs in reduced precision, so compare the weight update accumulated after
+        # the checkpoint instead of requiring exact equality.
+        reference_update = reference_weights - checkpoint_weights
+        resumed_update = _muon_uc_full_weights(engine) - checkpoint_weights
+        relative_error = ((resumed_update - reference_update).norm() / reference_update.norm()).item()
+        assert relative_error < 0.05, ("Resuming from a universal checkpoint diverged from the uninterrupted run; "
+                                       f"relative update error {relative_error}")
+        engine.destroy()
+
+    @pytest.mark.world_size(2)
+    def test_dp_world_size_2to2(self, MuonUniversalBaselineWs2, tmpdir, muon_uc_config):
+        self._run_test(tmpdir, muon_uc_config)
+
+    @pytest.mark.world_size(1)
+    def test_dp_world_size_2to1(self, MuonUniversalBaselineWs2, tmpdir, muon_uc_config):
+        self._run_test(tmpdir, muon_uc_config)
+
+    @pytest.mark.world_size(4)
+    def test_dp_world_size_2to4(self, MuonUniversalBaselineWs2, tmpdir, muon_uc_config):
+        self._run_test(tmpdir, muon_uc_config)
