@@ -4424,7 +4424,11 @@ class DeepSpeedEngine(Module):
                                                          custom_load_fn=custom_load_fn)
 
         load_zero_checkpoint = load_path is not None and self.zero_optimization()
-        if load_zero_checkpoint and not self.zero_nvme_offload_optimizer():
+        # A universal checkpoint holds no rank-specific swap files to copy back, so even with NVMe
+        # offload it goes through the regular ZeRO loader, which writes the restored tensors into
+        # the swapper layout of the current run.
+        restore_nvme_from_swap_files = self.zero_nvme_offload_optimizer() and not self.load_universal_checkpoint()
+        if load_zero_checkpoint and not restore_nvme_from_swap_files:
             autoep_zero3_partition_native_load = self.has_moe_layers and self.zero_optimization_partition_weights()
             if ((load_optimizer_states and not load_module_only) or self.load_universal_checkpoint()
                     or autoep_zero3_partition_native_load):
@@ -4437,7 +4441,7 @@ class DeepSpeedEngine(Module):
             if not success:
                 self.optimizer._restore_from_bit16_weights()
 
-        if self.zero_nvme_offload_optimizer():
+        if restore_nvme_from_swap_files:
             from shutil import copytree, disk_usage
             rank = self.local_rank if self.use_node_local_storage() else self.global_rank
             rank_dir = "rank" + dp_index_to_str(rank)

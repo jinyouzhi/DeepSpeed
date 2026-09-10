@@ -1058,17 +1058,23 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         self.optimizer.state.setdefault(fp32_param, {})["momentum_buffer"] = resident_momentum
 
-    def _restore_muon_momentum_residency(self):
+    def _restore_muon_momentum_residency(self, sub_group_id=None):
         """Re-bind the in-memory Muon momentum cache to the freshly loaded optimizer state.
 
         ``Optimizer.load_state_dict()`` replaces the state tensors with new objects, so the
         resident cache would otherwise keep serving the pre-load (usually zero) momentum and
-        overwrite the restored values on the very next step.
+        overwrite the restored values on the very next step. Pass ``sub_group_id`` to re-bind a
+        single subgroup, which the universal loader needs before it swaps a subgroup back out.
         """
         if not (self.use_muon and self.save_muon_momentum_buffer_in_memory):
             return
 
-        for sub_group_id in self.muon_momentum_buffer_partitioned_groups_flat:
+        if sub_group_id is not None:
+            sub_group_ids = [sub_group_id] if sub_group_id in self.muon_momentum_buffer_partitioned_groups_flat else []
+        else:
+            sub_group_ids = list(self.muon_momentum_buffer_partitioned_groups_flat)
+
+        for sub_group_id in sub_group_ids:
             state = self.optimizer.state.get(self.fp32_partitioned_groups_flat[sub_group_id])
             restored_momentum = None if state is None else state.get("momentum_buffer")
             if restored_momentum is not None:
@@ -3594,9 +3600,21 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         optim_sd = torch.load(optim_state_path, weights_only=False)
         self._load_global_state_stage3(optim_sd)
 
-        # Generally the step of each optimizer file should be the same, we can obtain from any parameter.
-        state_step = optim_sd[OPTIMIZER_STATE_DICT]['state'][0].get('step')
+        saved_state = optim_sd[OPTIMIZER_STATE_DICT]['state']
+        saved_param_groups = optim_sd[OPTIMIZER_STATE_DICT]["param_groups"]
+        fallback_step = next((state['step'] for state in saved_state.values() if 'step' in state), None)
+
+        if self.swap_optimizer:
+            # The swapped state was built for the freshly created model, so drop it before writing
+            # the checkpoint values into the swap files of the current run.
+            self.optimizer_swapper.purge_state()
+            self._partition_all_parameters()
+
+        timer_names = set()
         for sub_group_id, fp16_group in enumerate(self.fp16_groups):
+            if self.swap_optimizer:
+                # Swappable subgroups only hold an empty placeholder until they are swapped in.
+                self._prepare_sub_group(sub_group_id, timer_names)
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
             param_names = []
             for param in fp16_group:
@@ -3620,32 +3638,35 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 else:
                     self.optimizer.state[fp32_param][key] = key_tensor
 
+            # Every subgroup keeps its own step, because Muon subgroups have none while the
+            # auxiliary Adam subgroups do; reading a single global step from one subgroup would
+            # leave Adam without its bias correction counter. A subgroup whose partition was empty
+            # on the saving rank has no state at all, so fall back to a step from another subgroup
+            # rather than restarting its counter from zero.
+            state_step = (saved_state.get(sub_group_id) or {}).get('step', fallback_step)
             if state_step is not None:
                 self.optimizer.state[fp32_param]['step'] = state_step
 
-        self._restore_muon_momentum_residency()
+            # Re-bind before swapping out, otherwise the freshly allocated momentum tensor would be
+            # written to NVMe even though the resident buffer is meant to stay in memory.
+            self._restore_muon_momentum_residency(sub_group_id)
 
-        for param_group in self.optimizer.param_groups:
-            # Generally, the hyperparameters of each parameter should be the same, we can obtain from any parameter.
-            for key, value in optim_sd[OPTIMIZER_STATE_DICT]["param_groups"][0].items():
+            if self.swap_optimizer:
+                self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
+                self._release_sub_group(sub_group_id, timer_names)
+
+        if self.swap_optimizer:
+            self._post_step(timer_names)
+
+        # DeepSpeed keeps one param group per user group -- with MuonWithAuxAdam the Muon groups
+        # come first and the auxiliary Adam groups after -- so each live group must be restored
+        # from its own saved group rather than from the first one.
+        for param_group, saved_param_group in zip(self.optimizer.param_groups, saved_param_groups):
+            for key, value in saved_param_group.items():
                 if key == 'params':
                     param_group['params'] = []
                 else:
                     param_group[key] = value
-
-        if self.swap_optimizer:
-            # Purge the swapped optimizer state, it was initialized to the freshly created model and not the checkpoint
-            self.optimizer_swapper.purge_state()
-
-        if self.swap_optimizer:
-            # Touch all parameters to synchronize all buffers
-            timer_names = set()
-            self._partition_all_parameters()
-            for sub_group_id, group in enumerate(self.fp16_groups):
-                self._prepare_sub_group(sub_group_id, timer_names)
-                self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
-                self._release_sub_group(sub_group_id, timer_names)
-            self._post_step(timer_names)
 
         for sub_group_id in range(len(self.fp32_partitioned_groups_flat)):
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
