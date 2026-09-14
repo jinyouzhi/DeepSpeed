@@ -251,6 +251,71 @@ class TestVocabParallelLMHeadRequiresSupportedHead(DistributedTest):
             deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
 
 
+@pytest.mark.sequential
+class TestVocabParallelLMHeadCheckpointParity(DistributedTest):
+    world_size = 2
+    reuse_dist_env = False
+
+    def test_save_load_round_trip_preserves_loss(self, tmpdir):
+        transformers = pytest.importorskip("transformers")
+        vocab_size = 37
+
+        def build_model(seed):
+            torch.manual_seed(seed)
+            model_config = transformers.LlamaConfig(vocab_size=vocab_size,
+                                                    hidden_size=32,
+                                                    intermediate_size=64,
+                                                    num_hidden_layers=1,
+                                                    num_attention_heads=4,
+                                                    num_key_value_heads=4,
+                                                    use_cache=False,
+                                                    tie_word_embeddings=False)
+            model_config.base_model_tp_plan = None
+            return transformers.LlamaForCausalLM(model_config)
+
+        ds_config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-6,
+                    "torch_adam": True,
+                },
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size,
+                "vocab_parallel_lm_head": True,
+            },
+            "zero_optimization": {
+                "stage": 0,
+            },
+        }
+
+        saved_engine, _, _, _ = deepspeed.initialize(model=build_model(42), config=ds_config)
+        assert isinstance(saved_engine.module.lm_head, VocabParallelLinear)
+
+        device = torch.device(get_accelerator().current_device_name())
+        input_ids = torch.randint(0, vocab_size, (1, 8), device=device)
+        dist.broadcast(input_ids,
+                       src=groups.get_tensor_model_parallel_src_rank(),
+                       group=groups.get_tensor_model_parallel_group())
+
+        saved_loss = saved_engine(input_ids=input_ids, labels=input_ids).loss.detach().clone()
+        ckpt_path = os.path.join(tmpdir, "vocab_parallel_lm_head")
+        saved_engine.save_checkpoint(ckpt_path)
+
+        loaded_engine, _, _, _ = deepspeed.initialize(model=build_model(7), config=ds_config)
+        # A different initialization keeps the comparison meaningful: a checkpoint that never
+        # reaches the sharded head would leave this diverged loss in place.
+        diverged_loss = loaded_engine(input_ids=input_ids, labels=input_ids).loss.detach().clone()
+        assert not torch.allclose(diverged_loss, saved_loss)
+
+        loaded_engine.load_checkpoint(ckpt_path)
+        restored_loss = loaded_engine(input_ids=input_ids, labels=input_ids).loss
+
+        torch.testing.assert_close(restored_loss, saved_loss)
+
+
 @contextmanager
 def should_assert_with_msg(expected_message):
     try:
