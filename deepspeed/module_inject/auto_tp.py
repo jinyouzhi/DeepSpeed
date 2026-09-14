@@ -454,6 +454,7 @@ class AutoTP():
             return child
 
         if self._is_vocab_parallel_lm_head(child, name):
+            self._warn_overridden_lm_head_spec(name)
             return self._create_vocab_parallel_layer(child, name)
 
         # Build the full parameter name for pattern matching
@@ -547,6 +548,19 @@ class AutoTP():
             f"distributed causal-LM loss",
             ranks=[0])
         return VocabParallelLinear(child, self.mp_group, name=name, tp_meta=self.tp_meta)
+
+    def _warn_overridden_lm_head_spec(self, name):
+        # A no-gather vocab-parallel head ignores whatever the plan asked for, so say so rather
+        # than letting an explicit lm_head spec disappear without a trace.
+        param_name = name if name.endswith(".weight") else name + ".weight"
+        spec = self.partition_config.find_matching_spec(param_name, self._get_model_type())
+        if spec is None:
+            return
+        log_dist(
+            f"AutoTP: vocab_parallel_lm_head supersedes the configured '{spec.partition_type.value}' "
+            f"partitioning for '{name}'; the head stays vocabulary-sharded and its output is not gathered.",
+            ranks=[0],
+            level=logging.WARNING)
 
     def _validate_untied_vocab_head(self, lm_head):
         if id(lm_head) in self._originally_tied_vocab_head_ids:

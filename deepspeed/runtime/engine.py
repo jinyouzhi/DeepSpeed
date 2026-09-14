@@ -857,6 +857,11 @@ class DeepSpeedEngine(Module):
             if vocab_parallel_heads:
                 from deepspeed.sequence.cross_entropy import configure_vocab_parallel_loss
                 configure_vocab_parallel_loss(model, vocab_parallel_heads[0])
+            elif tp_config.vocab_parallel_lm_head:
+                # Every partitioning path must agree; otherwise the request degrades into ordinary
+                # AutoTP with a gathered head and no distributed loss, which is easy to miss.
+                raise ValueError(
+                    "vocab_parallel_lm_head requires a supported nn.Linear named 'lm_head' or 'embed_out'")
 
             if attach_uc_metadata:
                 setattr(model, UNIVERSAL_CHECKPOINT_INFO, collect_autotp_universal_checkpoint_info(model))

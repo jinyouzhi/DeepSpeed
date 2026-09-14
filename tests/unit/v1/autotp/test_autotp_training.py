@@ -204,6 +204,53 @@ class TestHeuristicVocabParallelLMHead(DistributedTest):
         assert engine.module.lm_head.weight.grad is not None
 
 
+@pytest.mark.sequential
+class TestVocabParallelLMHeadRequiresSupportedHead(DistributedTest):
+    world_size = 2
+    reuse_dist_env = False
+
+    def test_unsupported_head_name_raises_instead_of_downgrading(self):
+
+        class NonStandardHeadModel(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(32, 8)
+                self.output_proj = torch.nn.Linear(8, 32, bias=False)
+
+            def forward(self, x):
+                return self.output_proj(self.embed_tokens(x))
+
+        ds_config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-6,
+                    "torch_adam": True,
+                },
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size,
+                "vocab_parallel_lm_head": True,
+                "partition_config": {
+                    "use_default_specs": False,
+                    "layer_specs": [{
+                        "patterns": [".*output_proj\\.weight$"],
+                        "partition_type": "column",
+                    }],
+                },
+            },
+            "zero_optimization": {
+                "stage": 0,
+            },
+        }
+        model = NonStandardHeadModel()
+
+        with pytest.raises(ValueError, match="requires a supported nn.Linear"):
+            deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+
+
 @contextmanager
 def should_assert_with_msg(expected_message):
     try:

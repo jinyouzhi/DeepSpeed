@@ -166,6 +166,12 @@ installs a pure-PyTorch distributed causal-LM loss through the model's
 log-sum-exp and target lookup without gathering vocabulary logits. Uneven
 vocabulary shards are supported.
 
+Only an `nn.Linear` whose final name segment is `lm_head` or `embed_out` is
+supported. If no such head exists, initialization fails instead of quietly
+falling back to an ordinary gathered head. When `partition_config` or a
+HuggingFace `tp_plan` also describes that head, `vocab_parallel_lm_head` takes
+precedence and a warning names the superseded partitioning.
+
 This option requires an untied output head and a model with a writable
 `loss_function` hook. Models that share the output weight with the input
 embedding must continue using gathered output until coupled vocabulary-parallel

@@ -8,6 +8,8 @@ path).  Patterns like ``model.layers.0.self_attn.q_proj`` never matched
 because the name was just ``0.self_attn.q_proj``.
 """
 
+import logging
+
 import pytest
 import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
@@ -16,6 +18,7 @@ from deepspeed.module_inject.auto_tp import AutoTP, AutoTPConfig, PartitionType,
 from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, LmHeadLinearAllreduce, VocabParallelLinear,
                                             set_autotp_mode)
 from deepspeed.module_inject.tp_plan_converter import TPPlanConverter
+from deepspeed.utils import logger as ds_logger
 from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, configure_vocab_parallel_loss
 
 
@@ -295,6 +298,36 @@ def test_plain_colwise_lm_head_uses_vocab_parallel_layer():
     assert isinstance(model.lm_head, VocabParallelLinear)
 
 
+def test_vocab_parallel_lm_head_warns_when_it_supersedes_an_explicit_spec(caplog):
+    model = OutputModel(tied=False)
+    config = AutoTPConfig(layer_specs=[
+        TPLayerSpec(patterns=[r".*lm_head\.weight$"], partition_type=PartitionType.COLUMN, gather_output=True),
+    ])
+    autotp = AutoTP(
+        module=model,
+        all_reduce_linears=[],
+        prefix="",
+        state_dict=None,
+        linear_layer_setting=None,
+        orig_layer_impl=None,
+        partition_config=config,
+        vocab_parallel_lm_head=True,
+    )
+    autotp.set_tensor_parallel_config(1, None)
+    autotp.update_linear_policies()
+
+    # The DeepSpeed logger does not propagate to the root logger, so attach caplog's handler to it.
+    ds_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=ds_logger.name):
+            autotp._replace_module(model)
+    finally:
+        ds_logger.removeHandler(caplog.handler)
+
+    assert isinstance(model.lm_head, VocabParallelLinear)
+    assert any("supersedes" in record.message and "lm_head" in record.message for record in caplog.records)
+
+
 def test_plain_colwise_lm_head_without_flag_keeps_local_logits():
     model = OutputModel(tied=False)
 
@@ -326,10 +359,12 @@ def test_plain_colwise_lm_head_rejects_tied_weights():
 
 def test_plain_colwise_lm_head_rejects_tie_before_embedding_is_sliced():
     model = OutputModel(tied=True)
-    specs = TPPlanConverter.convert({
-        "embed_tokens": "embedding_rowwise",
-        "lm_head": "colwise",
-    })
+    # A row-partitioned embedding is rebuilt by _slice_embedding with a fresh parameter, so by the
+    # time traversal reaches the head the tie is no longer observable through weight identity.
+    specs = [
+        TPLayerSpec(patterns=[r".*embed_tokens\.weight$"], partition_type=PartitionType.ROW),
+        TPLayerSpec(patterns=[r".*lm_head\.weight$"], partition_type=PartitionType.COLUMN),
+    ]
     autotp = AutoTP(
         module=model,
         all_reduce_linears=[],
