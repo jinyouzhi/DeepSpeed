@@ -14,9 +14,11 @@ import pytest
 import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
 
+from deepspeed.checkpoint.affine import contiguous_split_map
+from deepspeed.checkpoint.constants import AFFINE_MAP, AFFINE_MAP_PARAMS, VOCABULARY_PARAMETER_PATTERNS
 from deepspeed.module_inject.auto_tp import AutoTP, AutoTPConfig, PartitionType, TPLayerSpec
 from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, LmHeadLinearAllreduce, VocabParallelLinear,
-                                            set_autotp_mode)
+                                            collect_autotp_universal_checkpoint_info, set_autotp_mode)
 from deepspeed.module_inject.tp_plan_converter import TPPlanConverter
 from deepspeed.utils import logger as ds_logger
 from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, configure_vocab_parallel_loss
@@ -288,6 +290,23 @@ def test_vocab_parallel_linear_exposes_vocab_metadata():
     assert layer.vocab_start_index == 0
     assert layer.vocab_end_index == 101
     assert not layer.gather_output
+
+
+def test_vocab_parallel_linear_emits_uneven_affine_map_with_legacy_pattern(monkeypatch):
+    model = OutputModel(tied=False)
+    monkeypatch.setattr("deepspeed.module_inject.layers.dist.get_world_size", lambda group: 2)
+    monkeypatch.setattr("deepspeed.module_inject.layers.dist.get_rank", lambda group: 0)
+    model.lm_head = VocabParallelLinear(nn.Linear(32, 101), mp_group=object(), skip_partition=True, name="lm_head")
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+    maps = uc_info[AFFINE_MAP][AFFINE_MAP_PARAMS]
+    expected = {
+        r"^lm_head\.weight$": contiguous_split_map((101, 32), [51, 50], 0).to_dict(),
+        r"^lm_head\.bias$": contiguous_split_map((101, ), [51, 50], 0).to_dict(),
+    }
+
+    assert maps == expected
+    assert r"^lm_head\.weight$" in uc_info[VOCABULARY_PARAMETER_PATTERNS]
 
 
 def test_plain_colwise_lm_head_uses_vocab_parallel_layer():

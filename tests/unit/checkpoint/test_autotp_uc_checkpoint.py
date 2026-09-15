@@ -15,11 +15,13 @@ import torch.nn as nn
 import deepspeed
 import deepspeed.comm as dist
 import deepspeed.checkpoint.ds_to_universal as ds_to_universal
-from deepspeed.checkpoint.constants import (
-    AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS, CAT_DIM, FP32_FLAT_GROUPS, FP32_WEIGHT_KEY, OPTIMIZER_STATE_DICT, PARAM,
-    PARAM_GROUPS, PARAM_SHAPES, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE,
-    SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO,
-    UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE, VOCABULARY_PARAMETER_PATTERNS, ZERO_STAGE)
+from deepspeed.checkpoint.constants import (AFFINE_MAP, AFFINE_MAP_PARAMS, AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS,
+                                            CAT_DIM, FP32_FLAT_GROUPS, FP32_WEIGHT_KEY, OPTIMIZER_STATE_DICT, PARAM,
+                                            PARAM_GROUPS, PARAM_SHAPES, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
+                                            PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE, SUB_PARAM_SHARD_WIDTHS,
+                                            TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO,
+                                            UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
+                                            VOCABULARY_PARAMETER_PATTERNS, ZERO_STAGE)
 from deepspeed.checkpoint.universal_checkpoint import SubparamShape as CheckpointSubparamShape
 from deepspeed.checkpoint.ds_to_universal import (_group_per_tp_shapes, _validate_autotp_conversion_support, main as
                                                   convert_to_universal, merge_tp_slices)
@@ -990,6 +992,7 @@ class UnevenVocabLmHeadModel(torch.nn.Module):
     def __init__(self, hidden_dim, vocab_size):
         super().__init__()
         self.lm_head = torch.nn.Linear(hidden_dim, vocab_size)
+        self.loss_function = torch.nn.CrossEntropyLoss()
 
     def forward(self, x):
         return self.lm_head(x).sum()
@@ -1081,6 +1084,7 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
             },
             "tensor_parallel": {
                 "autotp_size": self.world_size,
+                "vocab_parallel_lm_head": True,
                 "partition_config": {
                     "use_default_specs":
                     False,
@@ -1118,9 +1122,14 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
         x_ref = x.detach().cpu()
         with torch.no_grad():
             out = engine.module.lm_head(x).cpu()
-        torch.testing.assert_close(out, reference.lm_head(x_ref), atol=1e-2, rtol=1e-2)
+        reference_out = reference.lm_head(x_ref).split(shard_sizes, dim=-1)[tp_rank]
+        torch.testing.assert_close(out, reference_out, atol=1e-2, rtol=1e-2)
 
         # ====== Phase 2: universal ckpt save -> convert -> load is lossless ======
+        uc_info = getattr(engine.module, UNIVERSAL_CHECKPOINT_INFO)
+        affine_maps = uc_info[AFFINE_MAP][AFFINE_MAP_PARAMS]
+        assert set(affine_maps) >= {r"^lm_head\.weight$", r"^lm_head\.bias$"}
+        assert r"^lm_head\.weight$" in uc_info[VOCABULARY_PARAMETER_PATTERNS]
         _train_steps(engine, hidden_dim)
         expected_weight = engine.module.lm_head.weight.detach().cpu().clone()
         expected_bias = engine.module.lm_head.bias.detach().cpu().clone()
@@ -1151,7 +1160,7 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
         dist.broadcast(x2, src=0, group=tp_group)
         with torch.no_grad():
             restored_out = restored_engine.module.lm_head(x2).cpu()
-        ref2 = torch.nn.functional.linear(x2.cpu(), exp_w_full, exp_b_full)
+        ref2 = torch.nn.functional.linear(x2.cpu(), exp_w_full, exp_b_full).split(shard_sizes, dim=-1)[tp_rank]
         torch.testing.assert_close(restored_out, ref2, atol=1e-2, rtol=1e-2)
 
         # The optimizer must be usable after the restore.
