@@ -1167,6 +1167,95 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
         _train_steps(restored_engine, hidden_dim, steps=1)
 
 
+def _vocab_affine_engine(tp_size, load_universal=False):
+    hidden_dim = 12
+    vocab_size = 101
+    model = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+    config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1e-3
+            }
+        },
+        "zero_optimization": {
+            "stage": 1
+        },
+        "checkpoint": {
+            "load_universal": load_universal
+        },
+    }
+    if tp_size > 1:
+        config["tensor_parallel"] = {
+            "autotp_size": tp_size,
+            "vocab_parallel_lm_head": True,
+            "partition_config": {
+                "use_default_specs": False,
+                "layer_specs": [{
+                    "patterns": [r".*lm_head\.weight$"],
+                    "partition_type": "column",
+                }],
+            },
+        }
+    engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+    return engine
+
+
+class vocab_affine_checkpoint(DistributedFixture):
+    world_size = 2
+
+    def run(self, tmpdir):
+        torch.manual_seed(42)
+        engine = _vocab_affine_engine(self.world_size)
+        _train_steps(engine, hidden_dim=12)
+
+        tp_group = groups.get_tensor_model_parallel_group()
+        weight = _all_gather_cat_dim0(engine.module.lm_head.weight.detach(), tp_group).cpu()
+        bias = _all_gather_cat_dim0(engine.module.lm_head.bias.detach().view(-1, 1), tp_group).view(-1).cpu()
+        if dist.get_rank() == 0:
+            torch.save({"weight": weight, "bias": bias}, os.path.join(tmpdir, "vocab_affine_reference.pt"))
+
+        _save_and_convert(engine, tmpdir)
+        engine.destroy()
+
+
+@pytest.mark.parametrize("world_size", [1, 2], ids=["tp1", "tp2"])
+class TestVocabAffineCrossTpResume(DistributedTest):
+
+    def test_resume_from_tp2(self, vocab_affine_checkpoint, tmpdir, world_size):
+        tp_size = dist.get_world_size()
+        engine = _vocab_affine_engine(tp_size, load_universal=True)
+        load_path, _ = engine.load_checkpoint(tmpdir, tag=UNIVERSAL_TAG, load_optimizer_states=True)
+        assert load_path is not None
+
+        expected = torch.load(os.path.join(tmpdir, "vocab_affine_reference.pt"), weights_only=False)
+        if tp_size == 1:
+            actual_weight = engine.module.lm_head.weight.detach().cpu()
+            actual_bias = engine.module.lm_head.bias.detach().cpu()
+        else:
+            tp_group = groups.get_tensor_model_parallel_group()
+            actual_weight = _all_gather_cat_dim0(engine.module.lm_head.weight.detach(), tp_group).cpu()
+            actual_bias = _all_gather_cat_dim0(engine.module.lm_head.bias.detach().view(-1, 1),
+                                               tp_group).view(-1).cpu()
+        torch.testing.assert_close(actual_weight, expected["weight"])
+        torch.testing.assert_close(actual_bias, expected["bias"])
+
+        generator = torch.Generator().manual_seed(123)
+        x = torch.randn(2, 12, generator=generator).to(engine.device)
+        with torch.no_grad():
+            actual_out = engine.module.lm_head(x).cpu()
+        expected_out = torch.nn.functional.linear(x.cpu(), expected["weight"], expected["bias"])
+        if tp_size > 1:
+            shard_sizes = engine.module.lm_head._partition_sizes
+            tp_rank = groups.get_tensor_model_parallel_rank()
+            expected_out = expected_out.split(shard_sizes, dim=-1)[tp_rank]
+        torch.testing.assert_close(actual_out, expected_out, atol=1e-2, rtol=1e-2)
+
+        _train_steps(engine, hidden_dim=12, steps=1)
+        engine.destroy()
+
+
 class TestUnevenRowUniversalCheckpoint(DistributedTest):
     world_size = 4
     reuse_dist_env = False
