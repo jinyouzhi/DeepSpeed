@@ -419,7 +419,7 @@ class AutoTP():
         down_proj = False
         if 'down_proj' in name:
             down_proj = True
-        legacy_lm_head = name == "lm_head" or name == 'embed_out'
+        legacy_lm_head = self._is_lm_head_name(name)
         training_column_lm_head = self.training_mode and legacy_lm_head
         if (name in self.all_reduce_linears or arctic_w2_all_reduce_linear
                 or down_proj) and not training_column_lm_head:
@@ -485,7 +485,7 @@ class AutoTP():
         """Create row-parallel layer (AllReduce after forward)."""
         if self.conv_linear_layer:
             return Conv_LinearALlreduce(module, self.mp_group, name=name, tp_meta=self.tp_meta)
-        if name == "lm_head" or name == 'embed_out':
+        if self._is_lm_head_name(name):
             if not self.training_mode:
                 return LmHeadLinearAllreduce(module, self.mp_group, tp_meta=self.tp_meta)
             if self.mp_size > 1:
@@ -530,10 +530,20 @@ class AutoTP():
         return LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output, tp_meta=self.tp_meta)
 
     @staticmethod
-    def _is_lm_head_name(name):
+    def _default_lm_head_patterns():
+        return ("lm_head", "embed_out")
+
+    def _lm_head_patterns(self):
+        # AutoTPConfig.lm_head_patterns is the single source of truth once a partition_config
+        # is supplied; the heuristic (no-config) path falls back to the legacy pair.
+        if self.partition_config is not None and self.partition_config.lm_head_patterns:
+            return tuple(self.partition_config.lm_head_patterns)
+        return self._default_lm_head_patterns()
+
+    def _is_lm_head_name(self, name):
         # Only the final path segment may match, so auxiliary projections whose names
         # merely contain "lm_head" (e.g. "lm_head_proj") are never captured.
-        return str(name).split('.')[-1] in ("lm_head", "embed_out")
+        return str(name).split('.')[-1] in self._lm_head_patterns()
 
     def _is_vocab_parallel_lm_head(self, child, name):
         # VocabParallelLinear assumes an [vocab, hidden] nn.Linear weight; a Conv1D head
@@ -637,8 +647,7 @@ class AutoTP():
                 continue
 
             if self.partition_config is None:
-                uses_gathered_column = module_name in ("lm_head",
-                                                       "embed_out") and module_name in self.all_reduce_linears
+                uses_gathered_column = self._is_lm_head_name(module_name) and module_name in self.all_reduce_linears
             else:
                 spec = self.partition_config.find_matching_spec(module_name + ".weight", model_type)
                 uses_gathered_column = (spec is not None and spec.partition_type == PartitionType.COLUMN
@@ -885,14 +894,10 @@ class AutoTP():
 
     def _replace_last_linear_module(self, r_module):
         self._configure_gathered_column_tie_fallbacks()
-        if hasattr(r_module, "lm_head"):
-            name = "lm_head"
-            child = r_module.lm_head
-        elif hasattr(r_module, "embed_out"):
-            name = "embed_out"
-            child = r_module.embed_out
-        else:
+        name = next((pattern for pattern in self._lm_head_patterns() if hasattr(r_module, pattern)), None)
+        if name is None:
             return r_module
+        child = getattr(r_module, name)
         if name in self._tied_gathered_column_module_names:
             return r_module
         if child.__class__ in self.linear_policies:
