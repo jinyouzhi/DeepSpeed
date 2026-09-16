@@ -113,10 +113,10 @@ def test_causal_lm_loss_vocab_size_mismatch_warns_instead_of_raising():
     torch.testing.assert_close(loss, expected)
 
 
-def test_vocab_metadata_validation_runs_once(monkeypatch):
+def test_vocab_parallel_cross_entropy_revalidates_every_bare_call(monkeypatch):
+    # The bare functional API has no owning object to cache on, so it must not rely on any
+    # process-wide cache: each call re-runs the validation collective independently.
     torch.manual_seed(10)
-    # A vocab size unique to this test keeps the process-wide metadata cache from being
-    # warmed by the other tests, whatever order pytest runs them in.
     vocab_size = 23
     logits = torch.randn(2, 3, vocab_size)
     target = torch.zeros(2, 3, dtype=torch.long)
@@ -131,7 +131,43 @@ def test_vocab_metadata_validation_runs_once(monkeypatch):
     vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
     vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
 
+    assert len(calls) == 2
+
+
+def test_causal_lm_loss_validates_shard_metadata_once(monkeypatch):
+    # VocabParallelCausalLMLoss owns tp_group/vocab bounds already, so it caches the
+    # validated shard metadata on itself instead of using any global cache.
+    torch.manual_seed(10)
+    vocab_size = 23
+    logits = torch.randn(2, 3, vocab_size)
+    labels = torch.zeros(2, 3, dtype=torch.long)
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+    calls = []
+    original_validate = cross_entropy._validate_vocab_shard_bounds
+
+    def counting_validate(*args, **kwargs):
+        calls.append(1)
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(cross_entropy, "_validate_vocab_shard_bounds", counting_validate)
+    loss_fn(logits=logits, labels=labels)
+    loss_fn(logits=logits, labels=labels)
+
     assert len(calls) == 1
+
+
+def test_causal_lm_loss_rejects_shard_metadata_changed_after_first_call():
+    torch.manual_seed(11)
+    vocab_size = 19
+    logits = torch.randn(2, 3, vocab_size)
+    labels = torch.zeros(2, 3, dtype=torch.long)
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+
+    loss_fn(logits=logits, labels=labels)
+    loss_fn.vocab_start_index = 1
+
+    with pytest.raises(RuntimeError, match="shard metadata changed"):
+        loss_fn(logits=logits, labels=labels)
 
 
 class TestVocabParallelCrossEntropyTP(DistributedTest):

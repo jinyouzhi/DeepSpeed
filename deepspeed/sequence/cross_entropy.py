@@ -119,22 +119,16 @@ def _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_
     return expected_start
 
 
-_vocab_metadata_cache = {}
-
-
 def _resolve_vocab_metadata(local_vocab_size, vocab_start_index, vocab_end_index, tp_group, device):
-    """Collectively validate the vocabulary shard layout once and cache the result.
+    """Infer (if needed) and collectively validate the vocabulary shard layout.
 
-    The shard geometry is fixed for the lifetime of the layers, so the repeated calls a
-    training loop makes every micro-batch must not re-run the validation collectives or
-    their host synchronizations. Decisions are made from identical all-gathered data, so
-    every TP rank raises together instead of diverging into a collective hang.
+    This always re-runs the validation collective; it does not cache across calls. A
+    process-wide cache keyed on ``tp_group`` would hold a strong reference to that group
+    for as long as the cache entry lives, which is arbitrarily longer than any single
+    caller's own lifetime and can keep a destroyed process group's resources alive.
+    Callers that invoke this repeatedly for a fixed shard (e.g. ``VocabParallelCausalLMLoss``)
+    should resolve and cache the result once on an object they already own instead.
     """
-    key = (tp_group, local_vocab_size, vocab_start_index, vocab_end_index)
-    cached = _vocab_metadata_cache.get(key)
-    if cached is not None:
-        return cached
-
     if vocab_start_index is None:
         tp_world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
@@ -150,10 +144,7 @@ def _resolve_vocab_metadata(local_vocab_size, vocab_start_index, vocab_end_index
         vocab_end_index = vocab_start_index + local_vocab_size
     global_vocab_size = _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_index, tp_group,
                                                      device)
-
-    metadata = (vocab_start_index, vocab_end_index, global_vocab_size)
-    _vocab_metadata_cache[key] = metadata
-    return metadata
+    return vocab_start_index, vocab_end_index, global_vocab_size
 
 
 def vocab_parallel_cross_entropy(vocab_parallel_logits,
@@ -162,6 +153,7 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
                                  sp_group=None,
                                  vocab_start_index=None,
                                  vocab_end_index=None,
+                                 global_vocab_size=None,
                                  ignore_index=-100,
                                  reduction="mean",
                                  gather_sequence_loss=False):
@@ -169,6 +161,11 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
 
     Tensor parallel ranks collectively own the last (vocabulary) dimension. Sequence
     parallel ranks may independently own shards of the leading sequence dimension.
+
+    ``global_vocab_size`` lets a caller that already validated the shard layout once (e.g.
+    ``VocabParallelCausalLMLoss``) skip the collective re-validation on every call; it
+    requires explicit ``vocab_start_index``/``vocab_end_index`` and is trusted as-is. Bare
+    calls that omit it always re-run the validation collective.
     """
     if vocab_parallel_logits.shape[:-1] != target.shape:
         raise ValueError("vocab_parallel_logits and target must have matching non-vocabulary dimensions")
@@ -185,8 +182,12 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
     if (vocab_start_index is None) != (vocab_end_index is None):
         raise ValueError("vocab_start_index and vocab_end_index must be provided together")
 
-    vocab_start_index, vocab_end_index, global_vocab_size = _resolve_vocab_metadata(
-        local_vocab_size, vocab_start_index, vocab_end_index, tp_group, vocab_parallel_logits.device)
+    if global_vocab_size is not None:
+        if vocab_start_index is None:
+            raise ValueError("global_vocab_size requires explicit vocab_start_index and vocab_end_index")
+    else:
+        vocab_start_index, vocab_end_index, global_vocab_size = _resolve_vocab_metadata(
+            local_vocab_size, vocab_start_index, vocab_end_index, tp_group, vocab_parallel_logits.device)
     # Data-dependent, so it cannot be hoisted out of the training loop: an out-of-range
     # target belongs to no shard and would otherwise silently contribute a wrong, finite loss.
     invalid_target = (target != ignore_index) & ((target < 0) | (target >= global_vocab_size))
@@ -279,6 +280,16 @@ class VocabParallelCausalLMLoss:
     valid-token count, so an additional SP reduction here would double-count tokens.
     Pass ``sp_group`` only when this loss is the sole aggregation over a manually
     constructed TP x SP process-group mesh.
+
+    Each instance is bound to a single, fixed vocabulary shard: the first call
+    collectively validates ``tp_group``/``vocab_start_index``/``vocab_end_index`` once and
+    caches the result on ``self``, so the cache's lifetime is exactly this instance's
+    lifetime and never outlives (or is shared beyond) the object that already holds
+    ``tp_group``. Create a separate instance per shard -- e.g. one each for a teacher and a
+    student model, even if they happen to share a shard layout -- instead of mutating
+    ``vocab_start_index``/``vocab_end_index`` on a shared instance; reusing one instance
+    for a different shard raises rather than silently computing loss against stale
+    metadata.
     """
 
     def __init__(self, tp_group=None, sp_group=None, vocab_start_index=None, vocab_end_index=None, ignore_index=-100):
@@ -287,6 +298,24 @@ class VocabParallelCausalLMLoss:
         self.vocab_start_index = vocab_start_index
         self.vocab_end_index = vocab_end_index
         self.ignore_index = ignore_index
+        self._resolved_vocab_key = None
+        self._resolved_global_vocab_size = None
+
+    def _resolve_metadata_once(self, local_vocab_size, device):
+        if self._resolved_vocab_key is None:
+            vocab_start_index, vocab_end_index, global_vocab_size = _resolve_vocab_metadata(
+                local_vocab_size, self.vocab_start_index, self.vocab_end_index, self.tp_group, device)
+            self.vocab_start_index = vocab_start_index
+            self.vocab_end_index = vocab_end_index
+            self._resolved_global_vocab_size = global_vocab_size
+            self._resolved_vocab_key = (self.tp_group, device, local_vocab_size, vocab_start_index, vocab_end_index)
+            return global_vocab_size
+
+        key = (self.tp_group, device, local_vocab_size, self.vocab_start_index, self.vocab_end_index)
+        if key != self._resolved_vocab_key:
+            raise RuntimeError("VocabParallelCausalLMLoss shard metadata changed after its first call; create a "
+                               "new instance instead of reusing one across different vocabulary shards")
+        return self._resolved_global_vocab_size
 
     def __call__(self, logits, labels=None, vocab_size=None, shift_labels=None, num_items_in_batch=None, **kwargs):
         if shift_labels is None:
@@ -297,15 +326,13 @@ class VocabParallelCausalLMLoss:
         else:
             shift_labels = shift_labels.contiguous()
 
-        if vocab_size is not None and self.vocab_start_index is not None and self.vocab_end_index is not None:
+        # Resolved and validated once per instance; see the class docstring.
+        global_vocab_size = self._resolve_metadata_once(logits.shape[-1], logits.device)
+        if vocab_size is not None and vocab_size != global_vocab_size:
             # The LM head's shard metadata is the source of truth; a mismatch usually means
             # the embedding was resized, which gathered loss implementations tolerated.
-            _, _, global_vocab_size = _resolve_vocab_metadata(self.vocab_end_index - self.vocab_start_index,
-                                                              self.vocab_start_index, self.vocab_end_index,
-                                                              self.tp_group, logits.device)
-            if vocab_size != global_vocab_size:
-                logger.warning_once(f"Vocab-parallel LM head holds vocab_size={global_vocab_size}, but the caller "
-                                    f"described vocab_size={vocab_size}; the LM head's weights win")
+            logger.warning_once(f"Vocab-parallel LM head holds vocab_size={global_vocab_size}, but the caller "
+                                f"described vocab_size={vocab_size}; the LM head's weights win")
 
         reduction = "sum" if num_items_in_batch is not None else "mean"
         loss = vocab_parallel_cross_entropy(logits,
@@ -314,6 +341,7 @@ class VocabParallelCausalLMLoss:
                                             sp_group=self.sp_group,
                                             vocab_start_index=self.vocab_start_index,
                                             vocab_end_index=self.vocab_end_index,
+                                            global_vocab_size=global_vocab_size,
                                             ignore_index=self.ignore_index,
                                             reduction=reduction)
         if num_items_in_batch is not None:
