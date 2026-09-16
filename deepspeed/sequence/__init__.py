@@ -9,5 +9,4 @@ from deepspeed.sequence.autosp_fusion import (ModalityFusionSPAdapter, LlavaFusi
                                               Qwen2VLFusionAdapter)
 from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
 from deepspeed.sequence.cross_entropy import (VocabParallelCausalLMLoss, VocabParallelCrossEntropyLoss,
-                                              configure_vocab_parallel_loss, vocab_parallel_cross_entropy,
-                                              vocab_sequence_parallel_cross_entropy)
+                                              configure_vocab_parallel_loss, vocab_parallel_cross_entropy)
