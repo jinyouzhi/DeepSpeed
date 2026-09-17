@@ -30,8 +30,9 @@ class TPPlanConverter:
 
         Supported styles that must stay whole become SKIP specs, which keeps those layers
         untouched on purpose while the rest of the plan is still applied: `embedding_rowwise`,
-        because vocabulary-parallel embeddings are not supported yet, and
-        `replicated_with_grad_allreduce`, which additionally sums the gradient across the group.
+        because this SKIP spec only opts the embedding out of the generic pattern-matched
+        partitioning path, and `replicated_with_grad_allreduce`, which additionally sums the
+        gradient across the group.
 
         Returns None only for an empty plan, so the caller can fall back to the existing AutoTP
         path for models that give us nothing to work with.
@@ -60,8 +61,11 @@ class TPPlanConverter:
             elif partition_style == "rowwise":
                 partition_type = PartitionType.ROW
             elif partition_style == "embedding_rowwise":
-                # Vocabulary-parallel embeddings are not supported yet, so the embedding stays whole and
-                # the gathered-column tie fallback keeps any LM head tied to it replicated as well.
+                # The SKIP spec here only means "don't shard this via the generic
+                # pattern-matched path". A tied embedding whose lm_head becomes
+                # vocab-parallel (opt-in via `vocab_parallel_lm_head`) is still detected and
+                # jointly vocab-sharded by AutoTP._create_vocab_parallel_layer, independent of
+                # this spec; without that opt-in, the tied pair stays replicated as before.
                 partition_type = PartitionType.SKIP
             else:  # replicated_with_grad_allreduce, the only other supported style
                 # The parameter stays whole; only its gradient needs summing across the group.
