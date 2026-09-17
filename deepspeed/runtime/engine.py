@@ -1047,7 +1047,7 @@ class DeepSpeedEngine(Module):
         from deepspeed.runtime.tensor_parallel.config import _get_hf_tp_plan
         hf_tp_plan = _get_hf_tp_plan(model)
 
-        def finalize_autotp(autotp=None, attach_uc_metadata=False):
+        def finalize_autotp(autotp=None, attach_uc_metadata=False, require_vocab_parallel_lm_head=False):
             if autotp is not None:
                 autotp.register_replicated_grad_hooks(model)
 
@@ -1058,7 +1058,7 @@ class DeepSpeedEngine(Module):
             if vocab_parallel_heads:
                 from deepspeed.sequence.cross_entropy import configure_vocab_parallel_loss
                 configure_vocab_parallel_loss(model, vocab_parallel_heads[0])
-            elif tp_config.vocab_parallel_lm_head:
+            elif require_vocab_parallel_lm_head:
                 # Every partitioning path must agree; otherwise the request degrades into ordinary
                 # AutoTP with a gathered head and no distributed loss, which is easy to miss.
                 raise ValueError(
@@ -1084,7 +1084,9 @@ class DeepSpeedEngine(Module):
             autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
             autotp.update_linear_policies()
             autotp._replace_module(model)
-            finalize_autotp(autotp, attach_uc_metadata=True)
+            finalize_autotp(autotp,
+                            attach_uc_metadata=True,
+                            require_vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head)
             return
 
         if tp_size <= 1:
@@ -1098,6 +1100,25 @@ class DeepSpeedEngine(Module):
 
             layer_specs = TPPlanConverter.convert(hf_tp_plan)
             if layer_specs is not None:
+                hf_requests_vocab_parallel_embedding = any(style.lower() == "embedding_rowwise"
+                                                           for style in hf_tp_plan.values())
+                has_tied_vocab_head = False
+                if hf_requests_vocab_parallel_embedding:
+                    embedding_weight_ids = {
+                        id(module.weight)
+                        for module in model.modules() if isinstance(module, torch.nn.Embedding)
+                    }
+                    has_tied_vocab_head = any(
+                        isinstance(module, torch.nn.Linear) and module_name.split(".")[-1] in (
+                            "lm_head", "embed_out") and id(module.weight) in embedding_weight_ids
+                        for module_name, module in model.named_modules())
+                use_vocab_parallel_lm_head = tp_config.vocab_parallel_lm_head or has_tied_vocab_head
+                if has_tied_vocab_head and not tp_config.vocab_parallel_lm_head:
+                    log_dist(
+                        "AutoTP: HuggingFace tp_plan requests 'embedding_rowwise' for a tied output head; "
+                        "enabling vocabulary-parallel embedding/head sharding and distributed causal-LM loss.",
+                        ranks=[0],
+                    )
                 gathered_output_patterns = [
                     pattern for pattern, style in hf_tp_plan.items()
                     if style.lower() in ("colwise_rep", "colwise_gather_output")
@@ -1117,7 +1138,7 @@ class DeepSpeedEngine(Module):
                     orig_layer_impl=None,
                     keep_module_on_host=tp_config.keep_module_on_host,
                     partition_config=tp_plan_config,
-                    vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head,
+                    vocab_parallel_lm_head=use_vocab_parallel_lm_head,
                     model_config=model_config,
                     tp_grain_size=tp_config.tensor_parallel.tp_grain_size,
                     training_mode=True,
@@ -1125,7 +1146,9 @@ class DeepSpeedEngine(Module):
                 autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
                 autotp.update_linear_policies()
                 autotp._replace_module(model)
-                finalize_autotp(autotp, attach_uc_metadata=True)
+                finalize_autotp(autotp,
+                                attach_uc_metadata=True,
+                                require_vocab_parallel_lm_head=use_vocab_parallel_lm_head)
                 return
             log_dist(
                 f"AutoTP: effective HuggingFace tp_plan could not be converted; falling back to heuristic AutoTP. "
@@ -1159,7 +1182,7 @@ class DeepSpeedEngine(Module):
 
         if vocab_head_autotp is not None:
             vocab_head_autotp._replace_vocab_parallel_lm_head()
-        finalize_autotp(attach_uc_metadata=True)
+        finalize_autotp(attach_uc_metadata=True, require_vocab_parallel_lm_head=tp_config.vocab_parallel_lm_head)
 
     def __del__(self):
         try:

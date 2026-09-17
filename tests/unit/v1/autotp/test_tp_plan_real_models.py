@@ -144,8 +144,8 @@ class TestTPPlanRealHFModels(DistributedTest):
         outputs = engine(input_ids)
         assert outputs.logits.shape == (1, 16, config.vocab_size)
 
-    def test_qwen2_tied_lm_head_falls_back_to_replicated(self):
-        """Test that an actual Qwen2 Parameter tie remains replicated."""
+    def test_qwen2_tied_lm_head_without_embedding_rowwise_falls_back_to_replicated(self, monkeypatch):
+        """Test that a tied Qwen2 model without the new HF style remains replicated."""
         skip_on_device()
 
         try:
@@ -164,6 +164,18 @@ class TestTPPlanRealHFModels(DistributedTest):
         )
         model = AutoModelForCausalLM.from_config(config)
         assert model.lm_head.weight is model.model.embed_tokens.weight
+
+        import deepspeed.runtime.tensor_parallel.config as tp_config_module
+
+        original_get_hf_tp_plan = tp_config_module._get_hf_tp_plan
+
+        def get_hf_tp_plan_without_embedding_rowwise(model):
+            return {
+                pattern: style
+                for pattern, style in original_get_hf_tp_plan(model).items() if style.lower() != "embedding_rowwise"
+            }
+
+        monkeypatch.setattr(tp_config_module, "_get_hf_tp_plan", get_hf_tp_plan_without_embedding_rowwise)
 
         ds_config = {
             "train_micro_batch_size_per_gpu": 1,
@@ -195,8 +207,8 @@ class TestTPPlanRealHFModels(DistributedTest):
 
     def test_qwen2_tied_lm_head_with_embedding_rowwise_becomes_vocab_parallel(self, monkeypatch):
         """Test HF's tied-model `embedding_rowwise` tp_plan entry (transformers#47579) drives
-        real vocab-parallel sharding, not just the SKIP-and-fall-back-to-replicated path, once
-        `vocab_parallel_lm_head` is opted in. See #8290."""
+        real vocab-parallel sharding automatically, not just the SKIP-and-fall-back-to-replicated
+        path. See #8290."""
         skip_on_device()
 
         try:
@@ -240,7 +252,6 @@ class TestTPPlanRealHFModels(DistributedTest):
             },
             "tensor_parallel": {
                 "autotp_size": 2,
-                "vocab_parallel_lm_head": True,
             },
             "zero_optimization": {
                 "stage": 0

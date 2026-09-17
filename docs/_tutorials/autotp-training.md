@@ -178,18 +178,21 @@ shards it jointly with `lm_head`, so both modules keep reading from and
 accumulating gradients into a single physical, per-rank-sharded weight
 `Parameter` instead of falling back to a gathered, replicated head. This also
 covers the HuggingFace `tp_plan` `embedding_rowwise` style that newer
-`transformers` releases inject for tied-embedding models; without
-`vocab_parallel_lm_head` enabled, that style still falls back to the previous
-replicated-tied behavior, matching the untied case above. A conflicting
-explicit `partition_config` spec on the tied embedding is likewise superseded,
-with a warning.
+`transformers` releases inject for tied-embedding models. That style
+automatically enables the same vocabulary-parallel embedding/head path, so no
+separate `vocab_parallel_lm_head` setting is required. Tied models whose plan
+does not contain `embedding_rowwise` retain the previous replicated behavior
+unless the flag is enabled explicitly. A conflicting explicit
+`partition_config` spec on the tied embedding is likewise superseded, with a
+warning.
 
 This option requires a model with a writable `loss_function` hook. The head's
 vocabulary must also be at least as large as `autotp_size`; smaller
 vocabularies fail at startup instead of leaving TP ranks with empty shards. The
-flag itself is the only trigger: a `colwise` `lm_head` specification with local
-output keeps the previous behavior of returning rank-local logits without
-installing the distributed loss.
+flag or a tied HuggingFace `embedding_rowwise` plan entry triggers this path. A
+plain `colwise` `lm_head` specification with local output keeps the previous
+behavior of returning rank-local logits without installing the distributed
+loss.
 
 The lower-level `vocab_parallel_cross_entropy` API also accepts an explicit
 sequence-parallel group. With `reduction="none"`, callers may return local token

@@ -63,9 +63,8 @@ class TPPlanConverter:
             elif partition_style == "embedding_rowwise":
                 # The SKIP spec here only means "don't shard this via the generic
                 # pattern-matched path". A tied embedding whose lm_head becomes
-                # vocab-parallel (opt-in via `vocab_parallel_lm_head`) is still detected and
-                # jointly vocab-sharded by AutoTP._create_vocab_parallel_layer, independent of
-                # this spec; without that opt-in, the tied pair stays replicated as before.
+                # vocab-parallel is still detected and jointly vocab-sharded by
+                # AutoTP._create_vocab_parallel_layer, independent of this spec.
                 partition_type = PartitionType.SKIP
             else:  # replicated_with_grad_allreduce, the only other supported style
                 # The parameter stays whole; only its gradient needs summing across the group.
