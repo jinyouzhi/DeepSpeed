@@ -533,17 +533,24 @@ class AutoTP():
     def _default_lm_head_patterns():
         return ("lm_head", "embed_out")
 
-    def _lm_head_patterns(self):
+    def _lm_head_patterns(self=None):
         # AutoTPConfig.lm_head_patterns is the single source of truth once a partition_config
         # is supplied; the heuristic (no-config) path falls back to the legacy pair.
-        if self.partition_config is not None and self.partition_config.lm_head_patterns:
-            return tuple(self.partition_config.lm_head_patterns)
-        return self._default_lm_head_patterns()
+        partition_config = getattr(self, "partition_config", None)
+        if partition_config is not None and partition_config.lm_head_patterns:
+            return tuple(partition_config.lm_head_patterns)
+        return AutoTP._default_lm_head_patterns()
 
-    def _is_lm_head_name(self, name):
+    def _is_lm_head_name(self_or_name=None, name=None):
         # Only the final path segment may match, so auxiliary projections whose names
         # merely contain "lm_head" (e.g. "lm_head_proj") are never captured.
-        return str(name).split('.')[-1] in self._lm_head_patterns()
+        if isinstance(self_or_name, AutoTP):
+            patterns = self_or_name._lm_head_patterns()
+        else:
+            patterns = AutoTP._default_lm_head_patterns()
+            if name is None:
+                name = self_or_name
+        return str(name).split('.')[-1] in patterns
 
     def _is_vocab_parallel_lm_head(self, child, name):
         # VocabParallelLinear assumes an [vocab, hidden] nn.Linear weight; a Conv1D head
