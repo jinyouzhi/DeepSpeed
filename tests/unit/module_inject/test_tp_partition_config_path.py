@@ -347,24 +347,17 @@ def test_plain_colwise_lm_head_without_flag_keeps_local_logits():
     ("inner_lm_head.block", False),
 ])
 def test_lm_head_name_matching_ignores_projections(name, expected):
-    assert AutoTP._is_lm_head_name(name) is expected
+    autotp = _build_legacy_lm_head_autotp(OutputModel(tied=False))
+
+    assert autotp._is_lm_head_name(name) is expected
 
 
-def test_lm_head_name_matching_respects_custom_partition_config_patterns():
-    model = OutputModel(tied=False)
-    config = AutoTPConfig(lm_head_patterns=["custom_head"])
-    autotp = AutoTP(
-        module=model,
-        all_reduce_linears=[],
-        prefix="",
-        state_dict=None,
-        linear_layer_setting=None,
-        orig_layer_impl=None,
-        partition_config=config,
-    )
-    assert autotp._is_lm_head_name("custom_head") is True
-    assert autotp._is_lm_head_name("model.custom_head") is True
-    assert autotp._is_lm_head_name("lm_head") is False
+def test_lm_head_name_matching_uses_configured_patterns():
+    autotp = _build_legacy_lm_head_autotp(OutputModel(tied=False))
+    autotp.partition_config = AutoTPConfig(lm_head_patterns=["output_proj"])
+
+    assert autotp._is_lm_head_name("model.output_proj") is True
+    assert autotp._is_lm_head_name("model.lm_head") is False
 
 
 def test_plain_colwise_lm_head_rejects_tied_weights():
