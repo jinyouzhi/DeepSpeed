@@ -1875,7 +1875,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                      param_momentum,
                                      optimizer_group["momentum"],
                                      ns_method=optimizer_group.get("ns_method", "gram"),
-                                     is_expert_group=getattr(param, "is_expert_group", False))
+                                     is_expert_group=getattr(param, "is_expert_group", False),
+                                     num_heads=getattr(param, "muon_num_heads", None))
 
                 if rank not in self.param_to_partition_ids[group_idx][param_id]:
                     continue

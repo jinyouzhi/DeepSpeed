@@ -2593,7 +2593,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                      full_momentum,
                                      beta=optimizer_group["momentum"],
                                      ns_method=optimizer_group.get("ns_method", "gram"),
-                                     is_expert_group=getattr(param, "is_expert_group", False))
+                                     is_expert_group=getattr(param, "is_expert_group", False),
+                                     num_heads=getattr(param, "muon_num_heads", None))
                 partition_numel = param.partition_numel()
                 partition_rank = self._get_param_partition_rank(param)
                 start = partition_rank * partition_numel
