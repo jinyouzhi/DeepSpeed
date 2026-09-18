@@ -1626,6 +1626,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _apply_distributed_muon_update(self, communication_data_type: torch.dtype, buffer_to_reduce: Tensor):
         """
         Update the momentum buffer of the parameters using muon.
+
+        NOTE: this runs from the reduce-and-partition path (called once per micro-batch,
+        not once per optimizer step), so under gradient accumulation the momentum
+        update/orthogonalization currently applies more often than intended (see #8443).
+        The CPU-offload Muon path avoids this by deferring the update to step() and
+        gating it on is_gradient_accumulation_boundary() (see
+        `_apply_muon_updates_cpu_offload` in stage_1_and_2.py); a similar boundary-gated,
+        step-time rewrite of this method - re-gathering the accumulated partition via
+        `_muon_all_gather_partitions`/`_partitioned_buffers_all_gather` - is the intended
+        fix here too.
         Args:
             communication_data_type: torch.dtype
             buffer_to_reduce: Tensor
