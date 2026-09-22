@@ -546,6 +546,7 @@ class TestAutoEPConfig:
 
     def test_autoep_layer_emits_uniform_placement_and_param_restore_metadata(self):
         from deepspeed.checkpoint.constants import (
+            AFFINE_MAP,
             AUTOEP_EXPERT_PLACEMENT,
             AUTOEP_PARAM_EP_RANK,
             AUTOEP_PARAM_LOCAL_EXPERTS,
@@ -585,6 +586,7 @@ class TestAutoEPConfig:
             assert restore_metadata[AUTOEP_PARAM_LOGICAL_SHAPE] == [4, *param.shape[1:]]
             assert restore_metadata[AUTOEP_PARAM_EP_RANK] == 1
             assert restore_metadata[AUTOEP_PARAM_LOCAL_EXPERTS] == [2, 3]
+            assert restore_metadata[AFFINE_MAP]["logical_shape"] == [4, *param.shape[1:]]
 
         for param in layer.router.parameters():
             assert not hasattr(param, DS_AUTOEP_UC_META)

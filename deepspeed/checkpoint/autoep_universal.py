@@ -13,8 +13,10 @@ import glob
 import torch
 
 from deepspeed.utils import logger
+from .affine import AFFINE_MAP_FORMAT_VERSION
 
 from .constants import (
+    AUTOEP_AFFINE_MAPS,
     AUTOEP_EP_SIZE,
     AUTOEP_EXPERT_PLACEMENT,
     AUTOEP_EXPERT_KEY_PREFIX,
@@ -26,6 +28,8 @@ from .constants import (
     AUTOEP_PLACEMENT_RANK,
     AUTOEP_PLACEMENT_RANKS,
     AUTOEP_ZERO12_REQUIRED_FIELDS,
+    AFFINE_MAP_PARAMS,
+    AFFINE_MAP_VERSION,
     PARAM,
     CAT_DIM,
     EP_IS_EXPERT_PARAM,
@@ -46,7 +50,7 @@ from .constants import (
     FOLDING_FAMILY,
     FOLDING_PARAM_FAMILIES,
 )
-from .autoep_affine import autoep_placement_to_affine_map, validate_autoep_placement_descriptor
+from .autoep_affine import autoep_metadata_to_affine_map, validate_autoep_placement_descriptor
 
 
 def make_folding_metadata(*,
@@ -284,7 +288,17 @@ def get_autoep_zero12_expert_param_info(autoep_layers_metadata):
             param_name = f"{prefix}.{weight_name}"
             if param_name in param_info:
                 raise RuntimeError(f"Duplicate AutoEP expert parameter metadata for {param_name}.")
-            param_info[param_name] = normalized
+            param_metadata = dict(normalized)
+            affine_maps = layer_info.get(AUTOEP_AFFINE_MAPS, {})
+            if affine_maps:
+                try:
+                    if affine_maps.get(AFFINE_MAP_VERSION) != AFFINE_MAP_FORMAT_VERSION:
+                        raise RuntimeError(f"Unsupported AutoEP affine map format version "
+                                           f"{affine_maps.get(AFFINE_MAP_VERSION)!r}.")
+                    param_metadata['affine_map'] = affine_maps[AFFINE_MAP_PARAMS][param_name]
+                except KeyError as exc:
+                    raise RuntimeError(f"AutoEP layer metadata is missing affine map for {param_name}.") from exc
+            param_info[param_name] = param_metadata
 
     return param_info
 
@@ -331,7 +345,7 @@ def consolidate_autoep_zero12_expert_states(temp_dir, output_dir, expert_param_i
         affine_map = None
         if placement is not None:
             logical_shape = (num_experts, ) + local_shape[1:]
-            affine_map = autoep_placement_to_affine_map(placement, logical_shape)
+            affine_map = autoep_metadata_to_affine_map(metadata, logical_shape)
         elif local_shape[0] != metadata['num_local_experts']:
             raise RuntimeError(f"AutoEP local shape mismatch for {param_name}: shape={local_shape}, "
                                f"num_local_experts={metadata['num_local_experts']}.")

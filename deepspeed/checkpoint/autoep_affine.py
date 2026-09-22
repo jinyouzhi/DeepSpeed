@@ -7,8 +7,9 @@ fragments are deliberately outside this map: callers must first normalize
 storage to one logical, packed expert tensor per EP rank.
 """
 
-from deepspeed.checkpoint.affine import AffinePiece, ParamAffineMap
-from deepspeed.checkpoint.constants import (AUTOEP_PLACEMENT_EP_SIZE, AUTOEP_PLACEMENT_EXPERTS,
+from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION, AffinePiece, ParamAffineMap
+from deepspeed.checkpoint.constants import (AFFINE_MAP, AFFINE_MAP_PARAMS, AFFINE_MAP_VERSION, AUTOEP_AFFINE_MAPS,
+                                            AUTOEP_PLACEMENT_EP_SIZE, AUTOEP_PLACEMENT_EXPERTS,
                                             AUTOEP_PLACEMENT_NUM_EXPERTS, AUTOEP_PLACEMENT_RANK,
                                             AUTOEP_PLACEMENT_RANKS, AUTOEP_PLACEMENT_VERSION,
                                             AUTOEP_PLACEMENT_VERSION_KEY)
@@ -19,6 +20,7 @@ __all__ = [
     'validate_autoep_placement_descriptor',
     'legacy_uniform_autoep_placement_descriptor',
     'autoep_placement_to_affine_map',
+    'autoep_metadata_to_affine_map',
     'extract_autoep_rank_tensor',
 ]
 
@@ -134,6 +136,32 @@ def autoep_placement_to_affine_map(descriptor, logical_shape):
     # check to every tensor element is prohibitively expensive for expert weights.
     affine_map.validate()
     return affine_map
+
+
+def autoep_metadata_to_affine_map(metadata, logical_shape, param_name=None):
+    """Load a persisted AutoEP affine map, falling back to legacy placement lowering."""
+    serialized_map = metadata.get(AFFINE_MAP)
+    if serialized_map is None and param_name is not None:
+        affine_maps = metadata.get(AUTOEP_AFFINE_MAPS, {})
+        if affine_maps:
+            if affine_maps.get(AFFINE_MAP_VERSION) != AFFINE_MAP_FORMAT_VERSION:
+                raise ValueError(f"Unsupported AutoEP affine map format version "
+                                 f"{affine_maps.get(AFFINE_MAP_VERSION)!r}.")
+            serialized_map = affine_maps.get(AFFINE_MAP_PARAMS, {}).get(param_name)
+
+    if serialized_map is not None:
+        affine_map = ParamAffineMap.from_dict(serialized_map)
+        expected_shape = tuple(int(dim) for dim in logical_shape)
+        if affine_map.logical_shape != expected_shape:
+            raise ValueError(f"AutoEP affine map logical shape {affine_map.logical_shape} does not match "
+                             f"parameter logical shape {expected_shape}.")
+        affine_map.validate()
+        return affine_map
+
+    placement = metadata.get('expert_placement')
+    if placement is None:
+        raise ValueError("AutoEP metadata has neither an affine map nor an expert placement descriptor.")
+    return autoep_placement_to_affine_map(placement, logical_shape)
 
 
 def extract_autoep_rank_tensor(full_param, target_map, ep_rank):

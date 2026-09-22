@@ -21,10 +21,11 @@ import torch
 import torch.nn as nn
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.checkpoint.autoep_affine import legacy_uniform_autoep_placement_descriptor
-from deepspeed.checkpoint.constants import (AUTOEP_EXPERT_PLACEMENT, AUTOEP_PARAM_EP_RANK, AUTOEP_PARAM_LOCAL_EXPERTS,
-                                            AUTOEP_PARAM_LOGICAL_SHAPE, AUTOEP_PLACEMENT_EXPERTS,
-                                            AUTOEP_PLACEMENT_RANKS, DS_AUTOEP_UC_META)
+from deepspeed.checkpoint.autoep_affine import (autoep_placement_to_affine_map,
+                                                legacy_uniform_autoep_placement_descriptor)
+from deepspeed.checkpoint.constants import (AFFINE_MAP, AUTOEP_EXPERT_PLACEMENT, AUTOEP_PARAM_EP_RANK,
+                                            AUTOEP_PARAM_LOCAL_EXPERTS, AUTOEP_PARAM_LOGICAL_SHAPE,
+                                            AUTOEP_PLACEMENT_EXPERTS, AUTOEP_PLACEMENT_RANKS, DS_AUTOEP_UC_META)
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
 from deepspeed.module_inject.auto_ep_folding import mark_autoep_folding_router_parameter
 from deepspeed.ops.triton_ops import autoep_fused_token_ops as fused_token_ops
@@ -607,11 +608,13 @@ class AutoEPMoELayer(nn.Module):
         for param in (self.experts.w1, self.experts.w2, self.experts.w3):
             physical_shape = getattr(param, 'ds_shape', param.shape)
             logical_shape = [self.num_experts, *physical_shape[1:]]
+            affine_map = autoep_placement_to_affine_map(self.expert_placement_descriptor, logical_shape)
             setattr(
                 param,
                 DS_AUTOEP_UC_META,
                 {
                     AUTOEP_EXPERT_PLACEMENT: self.expert_placement_descriptor,
+                    AFFINE_MAP: affine_map.to_dict(),
                     AUTOEP_PARAM_LOGICAL_SHAPE: logical_shape,
                     AUTOEP_PARAM_EP_RANK: self.ep_rank,
                     AUTOEP_PARAM_LOCAL_EXPERTS: list(local_experts),

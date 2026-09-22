@@ -14,7 +14,7 @@ from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_S
                         AUTOEP_EXPERT_PLACEMENT, AUTOEP_PARAM_EP_RANK, AUTOEP_PARAM_LOCAL_EXPERTS,
                         AUTOEP_PARAM_LOGICAL_SHAPE, AUTOEP_PLACEMENT_EXPERTS, AUTOEP_PLACEMENT_RANK,
                         AUTOEP_PLACEMENT_RANKS, UNIVERSAL_CHECKPOINT_VERSION_KEY)
-from .autoep_affine import autoep_placement_to_affine_map, extract_autoep_rank_tensor
+from .autoep_affine import autoep_metadata_to_affine_map, extract_autoep_rank_tensor
 
 
 @dataclass
@@ -85,7 +85,7 @@ def _resolve_autoep_partition(current_param, ckpt_dict, full_hp_param, ep_rank):
                            f"checkpoint={checkpoint_num_experts}, target={logical_shape}.")
 
     try:
-        target_map = autoep_placement_to_affine_map(meta[AUTOEP_EXPERT_PLACEMENT], logical_shape)
+        target_map = autoep_metadata_to_affine_map(meta, logical_shape)
         if not isinstance(ep_rank, int) or isinstance(ep_rank, bool):
             raise ValueError(f"ep_rank must be an integer, got {ep_rank!r}.")
         metadata_ep_rank = meta[AUTOEP_PARAM_EP_RANK]

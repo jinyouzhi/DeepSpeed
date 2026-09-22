@@ -6,10 +6,13 @@ import json
 import pytest
 import torch
 
-from deepspeed.checkpoint.affine import ParamAffineMap
-from deepspeed.checkpoint.autoep_affine import (AUTOEP_PLACEMENT_VERSION, autoep_placement_to_affine_map,
-                                                extract_autoep_rank_tensor, legacy_uniform_autoep_placement_descriptor,
+from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION, ParamAffineMap
+from deepspeed.checkpoint.autoep_affine import (AUTOEP_PLACEMENT_VERSION, autoep_metadata_to_affine_map,
+                                                autoep_placement_to_affine_map, extract_autoep_rank_tensor,
+                                                legacy_uniform_autoep_placement_descriptor,
                                                 make_autoep_placement_descriptor, validate_autoep_placement_descriptor)
+from deepspeed.checkpoint.constants import (AFFINE_MAP, AFFINE_MAP_PARAMS, AFFINE_MAP_VERSION, AUTOEP_AFFINE_MAPS,
+                                            AUTOEP_EXPERT_PLACEMENT)
 
 
 def _oracle_shards(full_tensor, experts_by_rank):
@@ -50,6 +53,40 @@ def test_non_contiguous_non_uniform_placement_preserves_local_order():
     assert affine_map.shard_shapes == {0: (3, 2), 1: (1, 2), 2: (2, 2)}
     assert torch.equal(affine_map.extract(full_tensor, 0), torch.tensor([[50, 51], [20, 21], [60, 61]]))
     assert torch.equal(affine_map.rebuild(expected_shards), full_tensor)
+
+
+def test_persisted_autoep_affine_map_takes_precedence_over_placement_lowering():
+    logical_shape = (4, 2)
+    persisted_placement = make_autoep_placement_descriptor(4, [[3, 1], [2, 0]])
+    legacy_placement = make_autoep_placement_descriptor(4, [[0, 1], [2, 3]])
+    persisted_map = autoep_placement_to_affine_map(persisted_placement, logical_shape)
+
+    metadata = {
+        AUTOEP_EXPERT_PLACEMENT: legacy_placement,
+        AFFINE_MAP: persisted_map.to_dict(),
+    }
+    loaded_map = autoep_metadata_to_affine_map(metadata, logical_shape)
+    full_tensor = torch.arange(8, dtype=torch.float32).reshape(logical_shape)
+
+    assert torch.equal(loaded_map.extract(full_tensor, 0), torch.tensor([[6., 7.], [2., 3.]]))
+
+
+def test_versioned_autoep_map_collection_loads_by_parameter_name():
+    logical_shape = (2, 2)
+    descriptor = make_autoep_placement_descriptor(2, [[1], [0]])
+    persisted_map = autoep_placement_to_affine_map(descriptor, logical_shape)
+    metadata = {
+        AUTOEP_AFFINE_MAPS: {
+            AFFINE_MAP_VERSION: AFFINE_MAP_FORMAT_VERSION,
+            AFFINE_MAP_PARAMS: {
+                'experts.w1': persisted_map.to_dict()
+            },
+        },
+    }
+
+    loaded_map = autoep_metadata_to_affine_map(metadata, logical_shape, 'experts.w1')
+
+    assert loaded_map.to_dict() == persisted_map.to_dict()
 
 
 def test_replication_records_exact_holders_and_stops_piece_merging():

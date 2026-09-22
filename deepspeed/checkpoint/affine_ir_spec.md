@@ -568,13 +568,15 @@ and fp16 alike, because dividing by `2^k` only shifts the exponent — so a bias
 bit-exactly at every TP degree in normal use. It is lossy for non-power-of-two `N` (3, 6,
 12), where a converted-and-restored bias may differ in the last bits from the original.
 
-**8.4 AutoEP, ZeRO, and offload placement.** Phase 1 additively introduces a versioned
-AutoEP placement descriptor in EP-local rank coordinates and lowers one logical
-`[num_experts, ...]` tensor through the existing `AffinePiece` / `ParamAffineMap` IR. The
-descriptor records each rank's ordered global expert IDs, including uneven,
-non-contiguous, replicated, and empty placements. It describes placement provenance, not
-a scheduling policy. ZeRO and EDP fragments remain outside the map: callers first
-normalize storage to one logical packed expert tensor per EP rank.
+**8.4 AutoEP, ZeRO, and offload placement.** AutoEP persists a versioned
+`ParamAffineMap` for each expert parameter in addition to a versioned placement
+descriptor in EP-local rank coordinates. The persisted map is the geometry execution
+contract for conversion and restore; descriptor lowering is retained only as a legacy
+checkpoint fallback. The descriptor records each rank's ordered global expert IDs,
+including uneven, non-contiguous, replicated, and empty placements, so it remains useful
+for placement provenance and validation rather than scheduling policy. ZeRO and EDP
+fragments remain outside the map: callers first normalize storage to one logical packed
+expert tensor per EP rank.
 
 This phase does not change the current runtime's uniform contiguous scheduling, choose an
 arbitrary future expert schedule, or implement direct phase-2 shard-to-shard transfer.

@@ -66,6 +66,10 @@ from deepspeed.runtime.constants import \
     DATA_PARALLEL_GROUP, GLOBAL_RANK, DDP_BFLOAT16, GRADIENT_ALLREDUCE_OP_MEAN
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.checkpoint.constants import (
+    AFFINE_MAP,
+    AFFINE_MAP_PARAMS,
+    AFFINE_MAP_VERSION,
+    AUTOEP_AFFINE_MAPS,
     AUTOEP_EXPERT_PLACEMENT,
     AUTOEP_PLACEMENT_EXPERTS,
     AUTOEP_PLACEMENT_RANKS,
@@ -83,11 +87,13 @@ from deepspeed.checkpoint.constants import (
     UNIVERSAL_CHECKPOINT_INFO,
     UNIVERSAL_CHECKPOINT_VERSION_KEY,
     UNIVERSAL_CHECKPOINT_VERSION_VALUE,
+    DS_AUTOEP_UC_META,
 )
 from deepspeed.checkpoint.autoep_zero3_metadata import (
     is_autoep_zero3_partitioned_entry,
     validate_autoep_zero3_partitioned_metadata,
 )
+from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 from deepspeed.checkpoint.ds_to_universal import dp_index_to_str
 from deepspeed.runtime.sparse_tensor import SparseTensor
@@ -5063,6 +5069,13 @@ class DeepSpeedEngine(Module):
                 exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
                 module_prefix = f"{n_module}." if n_module else ""
                 expert_params = [getattr(module.experts, wname) for wname in ('w1', 'w2', 'w3')]
+                expert_affine_maps = {}
+                for wname, param in zip(('w1', 'w2', 'w3'), expert_params):
+                    param_metadata = getattr(param, DS_AUTOEP_UC_META, None)
+                    if not isinstance(param_metadata, dict) or AFFINE_MAP not in param_metadata:
+                        raise RuntimeError(f"AutoEP expert parameter {module_prefix}experts.{wname} "
+                                           "is missing save-time affine map metadata.")
+                    expert_affine_maps[f"{module_prefix}experts.{wname}"] = param_metadata[AFFINE_MAP]
                 if self.zero_optimization_partition_weights():
                     frozen_expert_names = [
                         f"{module_prefix}experts.{wname}" for wname, param in zip(('w1', 'w2', 'w3'), expert_params)
@@ -5087,6 +5100,10 @@ class DeepSpeedEngine(Module):
                     module.ep_size,
                     AUTOEP_EXPERT_PLACEMENT:
                     module.expert_placement_descriptor,
+                    AUTOEP_AFFINE_MAPS: {
+                        AFFINE_MAP_VERSION: AFFINE_MAP_FORMAT_VERSION,
+                        AFFINE_MAP_PARAMS: expert_affine_maps,
+                    },
                     'expert_key_prefix':
                     f"{module_prefix}experts",
                     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY:
