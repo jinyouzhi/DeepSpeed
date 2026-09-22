@@ -1678,36 +1678,58 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             process_group = self._get_sub_group_process_group(i)
             world_sz = dist.get_world_size(process_group)
             rank = dist.get_rank(process_group)
-            grads_pad = [param.grad for param in params] + [torch.empty_like(params[-1].grad)] * (
-                (world_sz - len(params) % world_sz) % world_sz)
-            gathered_momentums_pad = gathered_params_momentums + [torch.empty_like(gathered_params_momentums[-1])] * (
-                (world_sz - len(gathered_params_momentums) % world_sz) % world_sz)
-            grad_handles = []
-            momentum_handles = []
-            for base_i in range(len(params))[::world_sz]:
-                if base_i + rank < len(params):
-                    param = params[base_i + rank]
+            # A round can mix projection shapes under GQA, so use padded flat tensors when ranks do not
+            # contribute equally sized parameters. Process one round at a time to bound temporary memory.
+            for base_i in range(0, len(params), world_sz):
+                round_params = params[base_i:base_i + world_sz]
+                round_momentums = gathered_params_momentums[base_i:base_i + world_sz]
+                round_count = len(round_params)
+                numels = [param.grad.numel() for param in round_params]
+                uniform_shape = round_count == world_sz and len(set(numels)) == 1
+
+                if rank < round_count:
+                    param = round_params[rank]
                     g = param.grad
-                    m = gathered_momentums_pad[base_i + rank]
+                    m = round_momentums[rank]
                     update = muon_update(g,
                                          m,
                                          beta=self.muon_beta,
                                          ns_method=getattr(self, 'muon_ns_method', 'gram'),
                                          num_heads=getattr(param, 'muon_num_heads', None))
                     g.data.copy_(update, non_blocking=False)
-                grad_handle = dist.all_gather(grads_pad[base_i:base_i + world_sz],
-                                              grads_pad[base_i + rank],
-                                              group=process_group,
-                                              async_op=True)
-                grad_handles.append(grad_handle)
-                momentum_handle = dist.all_gather(gathered_momentums_pad[base_i:base_i + world_sz],
-                                                  gathered_momentums_pad[base_i + rank],
-                                                  group=process_group,
-                                                  async_op=True)
-                momentum_handles.append(momentum_handle)
 
-            for handle in momentum_handles:
-                handle.wait()
+                if uniform_shape:
+                    local_grad = round_params[rank].grad
+                    local_momentum = round_momentums[rank]
+                    grad_out = [param.grad for param in round_params]
+                    momentum_out = round_momentums
+                else:
+                    max_numel = max(numels)
+                    if rank < round_count:
+                        local_grad = torch.zeros(max_numel, dtype=g.dtype, device=g.device)
+                        local_grad[:g.numel()] = g.view(-1)
+                        local_momentum = torch.zeros(max_numel, dtype=m.dtype, device=m.device)
+                        local_momentum[:m.numel()] = m.view(-1)
+                    else:
+                        # This rank has no param to contribute in this round; participate with a dummy
+                        # tensor of the agreed-upon shape so the collective still completes.
+                        ref_grad = round_params[0].grad
+                        ref_momentum = round_momentums[0]
+                        local_grad = torch.zeros(max_numel, dtype=ref_grad.dtype, device=ref_grad.device)
+                        local_momentum = torch.zeros(max_numel, dtype=ref_momentum.dtype, device=ref_momentum.device)
+                    grad_out = [torch.empty_like(local_grad) for _ in range(world_sz)]
+                    momentum_out = [torch.empty_like(local_momentum) for _ in range(world_sz)]
+
+                grad_handle = dist.all_gather(grad_out, local_grad, group=process_group, async_op=True)
+                momentum_handle = dist.all_gather(momentum_out, local_momentum, group=process_group, async_op=True)
+                momentum_handle.wait()
+                grad_handle.wait()
+                if not uniform_shape:
+                    for param, momentum, gathered_grad, gathered_momentum in zip(round_params, round_momentums,
+                                                                                 grad_out, momentum_out):
+                        param.grad.data.copy_(gathered_grad[:param.grad.numel()].view_as(param.grad),
+                                              non_blocking=False)
+                        momentum.view(-1).data.copy_(gathered_momentum[:momentum.numel()], non_blocking=False)
             for idx, (param, dest_offset, _) in enumerate(group_items):
                 gathered_momentum = gathered_params_momentums[idx]
                 chunk_sz = math.ceil(param.grad.numel() / world_sz)
@@ -1736,8 +1758,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         0, dest_offset, param.partition_numel()).data.copy_(buffer_to_update, non_blocking=False)
             if self._swappable_optimizer_subgroup(i) and not self.save_muon_momentum_buffer_in_memory:
                 self.optimizer_swapper.swap_out_optimizer_state(parameter=self.fp32_partitioned_groups_flat[i])
-            for handle in grad_handles:
-                handle.wait()
             for param, _, params_size_offset in group_items:
                 buffer_to_reduce.narrow(0, params_size_offset, param.grad.numel()).data.copy_(param.grad.view(-1),
                                                                                               non_blocking=False)
