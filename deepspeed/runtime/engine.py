@@ -71,8 +71,6 @@ from deepspeed.checkpoint.constants import (
     AFFINE_MAP_VERSION,
     AUTOEP_AFFINE_MAPS,
     AUTOEP_EXPERT_PLACEMENT,
-    AUTOEP_PLACEMENT_EXPERTS,
-    AUTOEP_PLACEMENT_RANKS,
     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_VERSION,
     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_VERSION_KEY,
     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY,
@@ -94,6 +92,7 @@ from deepspeed.checkpoint.autoep_zero3_metadata import (
     validate_autoep_zero3_partitioned_metadata,
 )
 from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION
+from deepspeed.checkpoint.autoep_affine import autoep_experts_for_rank
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 from deepspeed.checkpoint.ds_to_universal import dp_index_to_str
 from deepspeed.runtime.sparse_tensor import SparseTensor
@@ -4437,10 +4436,10 @@ class DeepSpeedEngine(Module):
                 for module_name, module in model.named_modules():
                     if not isinstance(module, _AutoEPMoELayer):
                         continue
-                    rank_entry = module.expert_placement_descriptor[AUTOEP_PLACEMENT_RANKS][module.ep_rank]
                     expected_runtime_layers[module_name] = {
                         'ep_rank': module.ep_rank,
-                        'local_experts': list(rank_entry[AUTOEP_PLACEMENT_EXPERTS]),
+                        'local_experts':
+                        list(autoep_experts_for_rank(module.expert_placement_descriptor, module.ep_rank)),
                     }
                 if not expected_runtime_layers:
                     expected_runtime_layers = None

@@ -574,9 +574,11 @@ descriptor in EP-local rank coordinates. The persisted map is the geometry execu
 contract for conversion and restore; descriptor lowering is retained only as a legacy
 checkpoint fallback. The descriptor records each rank's ordered global expert IDs,
 including uneven, non-contiguous, replicated, and empty placements, so it remains useful
-for placement provenance and validation rather than scheduling policy. ZeRO and EDP
-fragments remain outside the map: callers first normalize storage to one logical packed
-expert tensor per EP rank.
+for placement provenance and validation rather than scheduling policy. Rank entries are
+identified by their explicit rank IDs, not their list positions. When a checkpoint carries
+both forms, lowering the descriptor must reproduce the persisted map exactly; a conflict
+invalidates the checkpoint. ZeRO and EDP fragments remain outside the map: callers first
+normalize storage to one logical packed expert tensor per EP rank.
 
 This phase does not change the current runtime's uniform contiguous scheduling, choose an
 arbitrary future expert schedule, or implement direct phase-2 shard-to-shard transfer.

@@ -9,15 +9,16 @@ storage to one logical, packed expert tensor per EP rank.
 
 from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION, AffinePiece, ParamAffineMap
 from deepspeed.checkpoint.constants import (AFFINE_MAP, AFFINE_MAP_PARAMS, AFFINE_MAP_VERSION, AUTOEP_AFFINE_MAPS,
-                                            AUTOEP_PLACEMENT_EP_SIZE, AUTOEP_PLACEMENT_EXPERTS,
-                                            AUTOEP_PLACEMENT_NUM_EXPERTS, AUTOEP_PLACEMENT_RANK,
-                                            AUTOEP_PLACEMENT_RANKS, AUTOEP_PLACEMENT_VERSION,
+                                            AUTOEP_EXPERT_PLACEMENT, AUTOEP_PLACEMENT_EP_SIZE,
+                                            AUTOEP_PLACEMENT_EXPERTS, AUTOEP_PLACEMENT_NUM_EXPERTS,
+                                            AUTOEP_PLACEMENT_RANK, AUTOEP_PLACEMENT_RANKS, AUTOEP_PLACEMENT_VERSION,
                                             AUTOEP_PLACEMENT_VERSION_KEY)
 
 __all__ = [
     'AUTOEP_PLACEMENT_VERSION',
     'make_autoep_placement_descriptor',
     'validate_autoep_placement_descriptor',
+    'autoep_experts_for_rank',
     'legacy_uniform_autoep_placement_descriptor',
     'autoep_placement_to_affine_map',
     'autoep_metadata_to_affine_map',
@@ -89,6 +90,15 @@ def validate_autoep_placement_descriptor(descriptor):
         raise ValueError(f'AutoEP placement descriptor does not cover global expert IDs {missing}.')
 
 
+def autoep_experts_for_rank(descriptor, rank):
+    """Return expert IDs in one rank's local packed order."""
+    validate_autoep_placement_descriptor(descriptor)
+    entries_by_rank = {entry[AUTOEP_PLACEMENT_RANK]: entry for entry in descriptor[AUTOEP_PLACEMENT_RANKS]}
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank not in entries_by_rank:
+        raise ValueError(f'AutoEP placement rank {rank!r} is outside [0, {len(entries_by_rank)}).')
+    return entries_by_rank[rank][AUTOEP_PLACEMENT_EXPERTS]
+
+
 def legacy_uniform_autoep_placement_descriptor(num_experts, num_local_experts, ep_size):
     """Synthesize the legacy contiguous, uniform AutoEP placement."""
     num_experts = _positive_int(num_experts, 'num_experts')
@@ -156,9 +166,14 @@ def autoep_metadata_to_affine_map(metadata, logical_shape, param_name=None):
             raise ValueError(f"AutoEP affine map logical shape {affine_map.logical_shape} does not match "
                              f"parameter logical shape {expected_shape}.")
         affine_map.validate()
+        placement = metadata.get(AUTOEP_EXPERT_PLACEMENT)
+        if placement is not None:
+            expected_map = autoep_placement_to_affine_map(placement, expected_shape)
+            if affine_map.to_dict() != expected_map.to_dict():
+                raise ValueError("AutoEP affine map disagrees with the expert placement descriptor.")
         return affine_map
 
-    placement = metadata.get('expert_placement')
+    placement = metadata.get(AUTOEP_EXPERT_PLACEMENT)
     if placement is None:
         raise ValueError("AutoEP metadata has neither an affine map nor an expert placement descriptor.")
     return autoep_placement_to_affine_map(placement, logical_shape)

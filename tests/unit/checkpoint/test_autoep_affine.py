@@ -7,9 +7,9 @@ import pytest
 import torch
 
 from deepspeed.checkpoint.affine import AFFINE_MAP_FORMAT_VERSION, ParamAffineMap
-from deepspeed.checkpoint.autoep_affine import (AUTOEP_PLACEMENT_VERSION, autoep_metadata_to_affine_map,
-                                                autoep_placement_to_affine_map, extract_autoep_rank_tensor,
-                                                legacy_uniform_autoep_placement_descriptor,
+from deepspeed.checkpoint.autoep_affine import (AUTOEP_PLACEMENT_VERSION, autoep_experts_for_rank,
+                                                autoep_metadata_to_affine_map, autoep_placement_to_affine_map,
+                                                extract_autoep_rank_tensor, legacy_uniform_autoep_placement_descriptor,
                                                 make_autoep_placement_descriptor, validate_autoep_placement_descriptor)
 from deepspeed.checkpoint.constants import (AFFINE_MAP, AFFINE_MAP_PARAMS, AFFINE_MAP_VERSION, AUTOEP_AFFINE_MAPS,
                                             AUTOEP_EXPERT_PLACEMENT)
@@ -55,20 +55,36 @@ def test_non_contiguous_non_uniform_placement_preserves_local_order():
     assert torch.equal(affine_map.rebuild(expected_shards), full_tensor)
 
 
-def test_persisted_autoep_affine_map_takes_precedence_over_placement_lowering():
+@pytest.mark.parametrize('use_collection', [False, True])
+def test_persisted_autoep_affine_map_must_match_placement_descriptor(use_collection):
     logical_shape = (4, 2)
     persisted_placement = make_autoep_placement_descriptor(4, [[3, 1], [2, 0]])
     legacy_placement = make_autoep_placement_descriptor(4, [[0, 1], [2, 3]])
     persisted_map = autoep_placement_to_affine_map(persisted_placement, logical_shape)
 
-    metadata = {
-        AUTOEP_EXPERT_PLACEMENT: legacy_placement,
-        AFFINE_MAP: persisted_map.to_dict(),
-    }
-    loaded_map = autoep_metadata_to_affine_map(metadata, logical_shape)
-    full_tensor = torch.arange(8, dtype=torch.float32).reshape(logical_shape)
+    metadata = {AUTOEP_EXPERT_PLACEMENT: legacy_placement}
+    if use_collection:
+        metadata[AUTOEP_AFFINE_MAPS] = {
+            AFFINE_MAP_VERSION: AFFINE_MAP_FORMAT_VERSION,
+            AFFINE_MAP_PARAMS: {
+                'experts.w1': persisted_map.to_dict()
+            },
+        }
+    else:
+        metadata[AFFINE_MAP] = persisted_map.to_dict()
+    with pytest.raises(ValueError, match='disagrees with the expert placement'):
+        autoep_metadata_to_affine_map(metadata, logical_shape, 'experts.w1')
 
-    assert torch.equal(loaded_map.extract(full_tensor, 0), torch.tensor([[6., 7.], [2., 3.]]))
+
+def test_explicit_rank_ids_define_entries_independently_of_list_order():
+    descriptor = make_autoep_placement_descriptor(4, [[0, 2], [3, 1]])
+    descriptor['ranks'].reverse()
+
+    assert autoep_experts_for_rank(descriptor, 0) == [0, 2]
+    assert autoep_experts_for_rank(descriptor, 1) == [3, 1]
+    affine_map = autoep_placement_to_affine_map(descriptor, (4, 2))
+    full_tensor = torch.arange(8).reshape(4, 2)
+    assert torch.equal(affine_map.extract(full_tensor, 0), torch.stack([full_tensor[0], full_tensor[2]]))
 
 
 def test_versioned_autoep_map_collection_loads_by_parameter_name():

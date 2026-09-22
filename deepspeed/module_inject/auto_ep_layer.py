@@ -21,11 +21,10 @@ import torch
 import torch.nn as nn
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.checkpoint.autoep_affine import (autoep_placement_to_affine_map,
+from deepspeed.checkpoint.autoep_affine import (autoep_experts_for_rank, autoep_placement_to_affine_map,
                                                 legacy_uniform_autoep_placement_descriptor)
 from deepspeed.checkpoint.constants import (AFFINE_MAP, AUTOEP_EXPERT_PLACEMENT, AUTOEP_PARAM_EP_RANK,
-                                            AUTOEP_PARAM_LOCAL_EXPERTS, AUTOEP_PARAM_LOGICAL_SHAPE,
-                                            AUTOEP_PLACEMENT_EXPERTS, AUTOEP_PLACEMENT_RANKS, DS_AUTOEP_UC_META)
+                                            AUTOEP_PARAM_LOCAL_EXPERTS, AUTOEP_PARAM_LOGICAL_SHAPE, DS_AUTOEP_UC_META)
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
 from deepspeed.module_inject.auto_ep_folding import mark_autoep_folding_router_parameter
 from deepspeed.ops.triton_ops import autoep_fused_token_ops as fused_token_ops
@@ -603,8 +602,7 @@ class AutoEPMoELayer(nn.Module):
         self.experts.w1.requires_grad_(w1_requires_grad)
         self.experts.w2.requires_grad_(w2_requires_grad)
         self.experts.w3.requires_grad_(w3_requires_grad)
-        local_experts = self.expert_placement_descriptor[AUTOEP_PLACEMENT_RANKS][
-            self.ep_rank][AUTOEP_PLACEMENT_EXPERTS]
+        local_experts = autoep_experts_for_rank(self.expert_placement_descriptor, self.ep_rank)
         for param in (self.experts.w1, self.experts.w2, self.experts.w3):
             physical_shape = getattr(param, 'ds_shape', param.shape)
             logical_shape = [self.num_experts, *physical_shape[1:]]
