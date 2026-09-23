@@ -48,6 +48,8 @@ toc_label: "Contents"
 
 Muon optimizer is supported with ZeRO Stage 1, 2, and 3. To use Muon, set the optimizer name to `Muon`. The parameters applied for Muon are automatically determined by the matrix shape and name. For ZeRO Stage 3 with NVMe offloading, set `save_muon_momentum_buffer_in_memory` to `true` under `zero_optimization` to keep the Muon momentum buffer in GPU/CPU memory instead of swapping to NVMe.
 
+Keeping Muon momentum in memory does not keep gradients resident: swappable ZeRO-3 subgroups still load their gradients from NVMe before computing Muon updates.
+
 Muon supports the following params:
 
 | "params" key   | Description                                                                                                          | Default   |

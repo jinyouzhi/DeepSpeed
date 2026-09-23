@@ -530,6 +530,8 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         opt = engine.optimizer
         assert opt.swap_optimizer, "NVMe swap_optimizer must be enabled"
         assert opt.save_muon_momentum_buffer_in_memory
+        assert any(
+            opt.optimizer_swapper.is_swappable_tensor(numel=numel) for numel in opt.fp16_partitioned_groups_flat_numel)
         if pipeline:
             assert isinstance(opt.optimizer_swapper, PipelinedOptimizerSwapper)
         else:
@@ -633,7 +635,8 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         assert any(not torch.equal(init, p.detach().cpu()) for init, p in zip(initial_params, model.parameters()))
 
     @pytest.mark.parametrize("pipeline", [False, True])
-    def test_zero3_nvme_mixed_fragments_numerical_equivalence(self, tmpdir, pipeline):
+    @pytest.mark.parametrize("save_in_memory", [False, True])
+    def test_zero3_nvme_mixed_fragments_numerical_equivalence(self, tmpdir, pipeline, save_in_memory):
         import copy
         from deepspeed.ops.aio import AsyncIOBuilder
         from deepspeed.utils import safe_get_full_fp32_param
@@ -721,7 +724,7 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
             "zero_optimization": {
                 "stage": 3,
                 "reduce_scatter": False,
-                "save_muon_momentum_buffer_in_memory": True,
+                "save_muon_momentum_buffer_in_memory": save_in_memory,
                 "offload_optimizer": nvme_cfg,
                 "sub_group_size": 1000000
             },
