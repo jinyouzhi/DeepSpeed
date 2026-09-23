@@ -1705,7 +1705,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             round_momentums = gathered_params_momentums[base_i:base_i + world_sz]
             round_count = len(round_grads)
             numels = [g.numel() for g in round_grads]
-            uniform_shape = round_count == world_sz and len(set(numels)) == 1
+            uniform_shape = round_count == world_sz and all(g.shape == round_grads[0].shape for g in round_grads)
 
             if rank < round_count:
                 param = round_params[rank]
