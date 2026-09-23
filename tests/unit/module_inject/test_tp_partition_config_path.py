@@ -19,7 +19,9 @@ from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, LmHead
                                             VocabParallelEmbedding, set_autotp_mode)
 from deepspeed.module_inject.tp_plan_converter import TPPlanConverter
 from deepspeed.utils import logger as ds_logger
-from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, configure_vocab_parallel_loss
+from deepspeed.sequence.cross_entropy import (VocabParallelCausalLMLoss, configure_vocab_parallel_loss,
+                                              validate_vocab_parallel_loss)
+from deepspeed.runtime.tensor_parallel.config import TPTrainingConfig
 
 
 class SubAttn(nn.Module):
@@ -290,6 +292,17 @@ def test_vocab_parallel_linear_exposes_vocab_metadata():
     assert not layer.gather_output
 
 
+@pytest.mark.parametrize("config,expected", [({}, None), ({
+    "vocab_parallel_lm_head": None
+}, None), ({
+    "vocab_parallel_lm_head": False
+}, False), ({
+    "vocab_parallel_lm_head": True
+}, True)])
+def test_vocab_parallel_config_distinguishes_automatic_and_explicit_choices(config, expected):
+    assert TPTrainingConfig(**config).vocab_parallel_lm_head is expected
+
+
 def test_plain_colwise_lm_head_uses_vocab_parallel_layer():
     model = OutputModel(tied=False)
 
@@ -443,6 +456,17 @@ def test_configure_vocab_parallel_loss_installs_and_preserves_hook():
 
     assert isinstance(model.loss_function, VocabParallelCausalLMLoss)
     assert model._deepspeed_original_loss_function is original_loss_function
+
+
+def test_vocab_parallel_loss_validation_preserves_registered_loss_module():
+    model = OutputModel(tied=True)
+    model.loss_function = nn.CrossEntropyLoss()
+    original_loss = model.loss_function
+
+    validate_vocab_parallel_loss(model)
+
+    assert model.loss_function is original_loss
+    assert model.get_submodule("loss_function") is original_loss
 
 
 def test_configure_vocab_parallel_loss_installs_on_huggingface_model():

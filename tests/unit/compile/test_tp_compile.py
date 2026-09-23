@@ -152,7 +152,7 @@ class TestAutoTPCompileTiedEmbeddings(DistributedTest):
     non_daemonic_procs = True
 
     @pytest.mark.sequential
-    @pytest.mark.parametrize("explicit_vocab_parallel", [False, True])
+    @pytest.mark.parametrize("explicit_vocab_parallel", [None, False, True])
     def test_embedding_rowwise_plan_preserves_compile_compatibility(self, explicit_vocab_parallel):
         device = get_accelerator().current_device_name()
         torch.manual_seed(42)
