@@ -218,6 +218,8 @@ class OptimizerSwapper(object):
             swap_out_tensors(aio_handle, swap_buffers, swap_paths)
             assert len(swap_buffers) == aio_handle.wait()
         if swap_info.unswapped_gradients:
+            # Keep these updated CPU fragments for the next swap-in before the
+            # optimizer step; only the post-step swap-out may release them.
             swap_info.write_unswapped_gradients(src_buffer=parameter.grad)
 
     def is_swappable_tensor(self, tensor=None, numel=None):

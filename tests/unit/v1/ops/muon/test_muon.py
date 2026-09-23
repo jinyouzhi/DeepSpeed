@@ -649,8 +649,12 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         for sub_group_id, buf in opt.muon_momentum_buffer_partitioned_groups_flat.items():
             assert buf.numel() == int(opt.fp16_partitioned_groups_flat_numel[sub_group_id])
 
-    def test_zero3_nvme_aggregate_unswapped_fragments(self, tmpdir):
+    @pytest.mark.parametrize("pipeline", [False, True])
+    def test_zero3_nvme_aggregate_unswapped_fragments(self, tmpdir, pipeline):
         from deepspeed.ops.aio import AsyncIOBuilder
+        from deepspeed.runtime.zero.muon.original_muon import muon_update
+        from deepspeed.utils import safe_get_full_fp32_param
+
         if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
             pytest.skip("Skip tests since async-io is not compatible")
 
@@ -664,13 +668,12 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 self.layers = torch.nn.ModuleList([torch.nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
 
             def forward(self, x):
-                for l in self.layers:
-                    x = l(x)
-                return x.sum()
+                return sum(layer(x).square().mean() for layer in self.layers) * 1024.0
 
         config_dict = {
-            "train_micro_batch_size_per_gpu": 1,
+            "train_micro_batch_size_per_gpu": 256,
             "steps_per_print": 1,
+            "gradient_clipping": 0.0,
             "optimizer": {
                 "type": "muon",
                 "params": {
@@ -688,7 +691,9 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 "save_muon_momentum_buffer_in_memory": True,
                 "offload_optimizer": {
                     "device": "nvme",
-                    "nvme_path": str(tmpdir)
+                    "nvme_path": str(tmpdir),
+                    "pipeline_read": pipeline,
+                    "pipeline_write": pipeline,
                 },
                 "sub_group_size": 1000000
             },
@@ -698,23 +703,40 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
         }
         torch.manual_seed(42)
         model = SmallMatrixModel()
+        initial_state = {name: param.detach().clone() for name, param in model.named_parameters()}
         engine, _, _, _ = deepspeed.initialize(config=config_dict,
                                                model=model,
                                                model_parameters=model.parameters(),
                                                dist_init_required=False)
 
         device = engine.device
-        x = torch.randn(1, 128, device=device).half()
+        x = torch.randn(256, 128, device=device).half()
         opt = engine.optimizer
         assert opt.swap_optimizer
 
-        initial_params = [p.clone().detach().cpu() for p in model.parameters()]
-        for step in range(2):
-            loss = engine(x)
-            engine.backward(loss)
+        reference = SmallMatrixModel().to(device).half()
+        masters = {name: param.to(device) for name, param in initial_state.items()}
+        momentums = {name: torch.zeros_like(param) for name, param in masters.items()}
+        for _ in range(2):
+            reference.load_state_dict(masters)
+            reference.zero_grad(set_to_none=True)
+            reference(x).backward()
+            with torch.no_grad():
+                for name, param in reference.named_parameters():
+                    update = muon_update(param.grad.float(), momentums[name], beta=0.95)
+                    masters[name].add_(update, alpha=-0.01)
+
+            engine.backward(engine(x))
             engine.step()
 
-        assert any(not torch.equal(init, p.detach().cpu()) for init, p in zip(initial_params, model.parameters()))
+            # Writeback must preserve every small fragment for the optimizer's
+            # second swap-in, even when no gradient fragment has an NVMe file.
+            for name, param in model.named_parameters():
+                actual = safe_get_full_fp32_param(param).to(device)
+                expected_update = initial_state[name].to(device) - masters[name]
+                assert expected_update.norm() > 0
+                relative_error = (actual - masters[name]).norm() / expected_update.norm()
+                assert relative_error < 0.05, f"{name}: gradient writeback relative error {relative_error.item():.4f}"
 
     @pytest.mark.parametrize("pipeline", [False, True])
     @pytest.mark.parametrize("save_in_memory", [False, True])
