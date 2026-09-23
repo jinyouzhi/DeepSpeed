@@ -776,6 +776,12 @@ When a HuggingFace model provides a built-in `tp_plan` (via `model.config.base_m
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | Keep an `lm_head`/`embed_out` output vocabulary sharded and install DeepSpeed's pure-PyTorch vocab-parallel causal-LM loss instead of gathering logits. Tied input embeddings are jointly vocabulary-sharded with the output head. | `false` |
 
+An HF `embedding_rowwise` plan also enables tied vocabulary sharding automatically,
+except when the DeepCompile `autotp` pass is enabled: automatic sharding then keeps
+the tied embedding/head replicated for compiler compatibility. Explicit vocabulary
+sharding is not silently downgraded. See [Vocabulary-parallel LM Loss](/tutorials/autotp-training/#vocabulary-parallel-lm-loss)
+for supported embedding semantics and compiler limitations.
+
 ***partition_config***: [dictionary]
 
 | Description                                                                                                                     | Default |

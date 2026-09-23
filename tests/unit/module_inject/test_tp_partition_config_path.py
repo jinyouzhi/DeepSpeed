@@ -370,6 +370,34 @@ def test_plain_colwise_lm_head_supports_tied_weights():
     assert model.lm_head.weight is model.embed_tokens.weight
 
 
+def test_vocab_parallel_lm_head_rejects_unsupported_embedding_forward():
+
+    class OffsetEmbedding(nn.Embedding):
+
+        def forward(self, input_ids):
+            return super().forward(input_ids) + 1
+
+    model = OutputModel(tied=True)
+    model.embed_tokens = OffsetEmbedding(100, 32)
+    model.lm_head.weight = model.embed_tokens.weight
+
+    with pytest.raises(NotImplementedError, match="embedding forward"):
+        _build_local_lm_head_autotp(model)._replace_module(model)
+
+    assert model.lm_head.weight.shape == (100, 32)
+    assert model.lm_head.weight is model.embed_tokens.weight
+
+
+@pytest.mark.parametrize("embedding_kwargs", [{"max_norm": 1.0}, {"scale_grad_by_freq": True}, {"sparse": True}])
+def test_vocab_parallel_lm_head_rejects_unsupported_embedding_options(embedding_kwargs):
+    model = OutputModel(tied=True)
+    model.embed_tokens = nn.Embedding(100, 32, **embedding_kwargs)
+    model.lm_head.weight = model.embed_tokens.weight
+
+    with pytest.raises(NotImplementedError, match="embedding options"):
+        _build_local_lm_head_autotp(model)._replace_module(model)
+
+
 def test_vocab_parallel_lm_head_supersedes_conflicting_embedding_spec(caplog):
     model = OutputModel(tied=True)
     # A tied vocab-parallel head forces its embedding onto the same vocab-dimension shard as

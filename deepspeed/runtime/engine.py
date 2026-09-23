@@ -1113,11 +1113,20 @@ class DeepSpeedEngine(Module):
                         for module_name, module in model.named_modules())
                 use_vocab_parallel_lm_head = tp_config.vocab_parallel_lm_head or has_tied_vocab_head
                 if has_tied_vocab_head and not tp_config.vocab_parallel_lm_head:
-                    log_dist(
-                        "AutoTP: HuggingFace tp_plan requests 'embedding_rowwise' for a tied output head; "
-                        "enabling vocabulary-parallel embedding/head sharding and distributed causal-LM loss.",
-                        ranks=[0],
-                    )
+                    if self.is_deepcompile_enabled() and self.compile_autotp():
+                        use_vocab_parallel_lm_head = False
+                        log_dist(
+                            "AutoTP: keeping the tied embedding and output head replicated despite the "
+                            "HuggingFace 'embedding_rowwise' plan because the DeepCompile 'autotp' pass "
+                            "does not support vocabulary-parallel embeddings.",
+                            ranks=[0],
+                            level=logging.WARNING)
+                    else:
+                        log_dist(
+                            "AutoTP: HuggingFace tp_plan requests 'embedding_rowwise' for a tied output head; "
+                            "enabling vocabulary-parallel embedding/head sharding and distributed causal-LM loss.",
+                            ranks=[0],
+                        )
                 gathered_output_patterns = [
                     pattern for pattern, style in hf_tp_plan.items()
                     if style.lower() in ("colwise_rep", "colwise_gather_output")

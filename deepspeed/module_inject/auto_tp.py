@@ -563,6 +563,9 @@ class AutoTP():
 
     def _create_vocab_parallel_layer(self, child, name):
         tied_embedding = self._find_tied_embedding_module(child)
+        if tied_embedding is not None:
+            embed_parent, embed_child_name, embed_module, embed_full_name = tied_embedding
+            VocabParallelEmbedding.validate_embedding(embed_module)
         setattr(child, "replaced", True)
         vocab_parallel_linear = VocabParallelLinear(child, self.mp_group, name=name, tp_meta=self.tp_meta)
         # Guards re-entry if this instance is later revisited by the same replacement walk,
@@ -572,7 +575,6 @@ class AutoTP():
 
         message = f"AutoTP: vocab_parallel_lm_head keeps '{name}'"
         if tied_embedding is not None:
-            embed_parent, embed_child_name, embed_module, embed_full_name = tied_embedding
             self._warn_overridden_embedding_spec(embed_full_name)
             setattr(embed_module, "replaced", True)
             vocab_parallel_embedding = VocabParallelEmbedding(embed_module,
@@ -709,7 +711,7 @@ class AutoTP():
             self._tied_gathered_column_module_names.update((module_name, tied_embedding_name))
             log_dist(
                 f"AutoTP: '{module_name}.weight' is tied to '{tied_embedding_name}.weight'; leaving both modules "
-                "replicated because coupled vocabulary-parallel embedding is not supported yet.",
+                "replicated to preserve tied weights with gathered output.",
                 ranks=[0],
                 level=logging.WARNING,
             )

@@ -1103,24 +1103,41 @@ class VocabParallelEmbedding(TensorParallel_Layer):
     copy, so both modules read from and accumulate gradients into the same physical tensor.
     """
 
+    @staticmethod
+    def validate_embedding(module):
+        if module.max_norm is not None or module.scale_grad_by_freq or module.sparse:
+            raise NotImplementedError(
+                "Vocabulary-parallel embedding options max_norm, scale_grad_by_freq, and sparse are not supported.")
+        embedding_type = type(module)
+        if embedding_type.forward is nn.Embedding.forward:
+            return
+        if (embedding_type.__module__ == "transformers.models.gemma3.modeling_gemma3"
+                and embedding_type.__name__ == "Gemma3TextScaledWordEmbedding"):
+            return
+        raise NotImplementedError(f"Vocabulary-parallel sharding does not support the custom embedding forward of "
+                                  f"{embedding_type.__name__}.")
+
     def __init__(self, module, mp_group=None, tied_vocab_parallel_linear=None, **kwargs):
         super().__init__(mp_group, **kwargs)
+        self.validate_embedding(module)
         self.weight = module.weight
         # nn.Embedding has no bias, but the base class's extra_repr() unconditionally reads
         # self.bias, same as every other TensorParallel_Layer subclass here.
         self.bias = None
-        self._orig_weight_shape = self._shape_before_zero3_partition(module.weight)
+        self.support_training = True
 
         if tied_vocab_parallel_linear is not None:
             # The lm_head side already partitioned and materialized its shard; share that
             # Parameter verbatim so the tied weight has exactly one physical copy per rank.
             # Its gather_params/_tp_partition hooks are equivalent to ours (both split dim 0
             # the same way), so we deliberately leave them attached instead of re-configuring.
+            self._orig_weight_shape = tied_vocab_parallel_linear._orig_weight_shape
             self._partition_sizes = tied_vocab_parallel_linear._partition_sizes
             self.vocab_start_index = tied_vocab_parallel_linear.vocab_start_index
             self.vocab_end_index = tied_vocab_parallel_linear.vocab_end_index
             self.weight = tied_vocab_parallel_linear.weight
         else:
+            self._orig_weight_shape = self._shape_before_zero3_partition(module.weight)
             self._freeze_partition_sizes(self._orig_weight_shape[0])
             if self._should_materialize_tp_partition():
                 self._tp_partition([self.weight])
@@ -1129,7 +1146,13 @@ class VocabParallelEmbedding(TensorParallel_Layer):
             self.config_tp_params(self.weight)
 
         self.vocab_size = self._orig_weight_shape[0]
-        self.support_training = True
+        self.padding_idx = None
+        if module.padding_idx is not None and self.vocab_start_index <= module.padding_idx < self.vocab_end_index:
+            self.padding_idx = module.padding_idx - self.vocab_start_index
+        embed_scale = None
+        if type(module).forward is not nn.Embedding.forward:
+            embed_scale = module.embed_scale.to(self.weight.device)
+        self.register_buffer("embed_scale", embed_scale, persistent=False)
         # collect_autotp_universal_checkpoint_info() re-invokes _mark_uc_metadata() on every
         # module unconditionally, so whichever of the tied pair runs last determines the
         # metadata actually attached to the shared Parameter. Calling it here too keeps this
@@ -1141,16 +1164,18 @@ class VocabParallelEmbedding(TensorParallel_Layer):
     def forward(self, input):
         self._assert_compiled_if_deferred()
         if self.mp_group is None or self.tp_world_size == 1:
-            return F.embedding(input, self.weight)
-
-        # Tokens outside this rank's vocab shard are remapped to index 0 so the local lookup
-        # never runs out of bounds; their (wrong) contribution is then zeroed before the
-        # cross-rank reduction assembles the correct embedding for every token.
-        input_mask = (input < self.vocab_start_index) | (input >= self.vocab_end_index)
-        local_input = (input - self.vocab_start_index).masked_fill(input_mask, 0)
-        output = F.embedding(local_input, self.weight)
-        output = output.masked_fill(input_mask.unsqueeze(-1), 0.0)
-        output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
+            output = F.embedding(input, self.weight, padding_idx=self.padding_idx)
+        else:
+            # Tokens outside this rank's vocab shard are remapped to index 0 so the local lookup
+            # never runs out of bounds; their (wrong) contribution is then zeroed before the
+            # cross-rank reduction assembles the correct embedding for every token.
+            input_mask = (input < self.vocab_start_index) | (input >= self.vocab_end_index)
+            local_input = (input - self.vocab_start_index).masked_fill(input_mask, 0)
+            output = F.embedding(local_input, self.weight, padding_idx=self.padding_idx)
+            output = output.masked_fill(input_mask.unsqueeze(-1), 0.0)
+            output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
+        if self.embed_scale is not None:
+            output = output * self.embed_scale.to(self.weight.dtype)
         return output
 
     @torch.no_grad()

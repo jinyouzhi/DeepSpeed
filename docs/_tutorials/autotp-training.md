@@ -156,7 +156,7 @@ If you need to override the model's built-in `tp_plan`, provide a
 ## Vocabulary-parallel LM Loss
 
 Causal language models normally gather the complete `lm_head` output before
-computing cross entropy. To keep an untied output vocabulary sharded, enable
+computing cross entropy. To keep an output vocabulary sharded, enable
 `vocab_parallel_lm_head`:
 
 ```json
@@ -207,6 +207,19 @@ does not contain `embedding_rowwise` retain the previous replicated behavior
 unless the flag is enabled explicitly. A conflicting explicit
 `partition_config` spec on the tied embedding is likewise superseded, with a
 warning.
+
+Vocabulary-parallel embeddings preserve `padding_idx` gradient suppression and
+Gemma3's scaled-embedding forward behavior. Other custom embedding forwards and
+the `max_norm`, `scale_grad_by_freq`, and `sparse` options are rejected rather
+than silently changing their semantics. Tied embeddings retain the full
+vocabulary shape in universal-checkpoint metadata, including uneven shards.
+
+With `compile.deepcompile: true` and `"autotp"` in `compile.passes`, automatic
+sharding from `embedding_rowwise` is disabled: the tied embedding and output
+head remain replicated with gathered logits, while the other supported layers
+are still tensor-parallel. An explicit `vocab_parallel_lm_head: true` request
+is not downgraded; vocabulary-parallel embeddings are not supported by the
+AutoTP compile pass.
 
 This option requires a model with a writable `loss_function` hook. The head's
 vocabulary must also be at least as large as `autotp_size`; smaller
