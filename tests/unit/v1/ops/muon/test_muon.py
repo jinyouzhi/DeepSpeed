@@ -547,7 +547,6 @@ class TestMuonZero3NVMeMomentumResidency(DistributedTest):
                 f"Resident momentum for subgroup {sub_group_id} had numel={buf.numel()} "
                 f"instead of {expected_numel}; storage was evicted by NVMe swapper!")
             assert not getattr(buf, "swappable", True)
-            assert getattr(buf, "is_resident", False)
             step1_momentums[sub_group_id] = buf.clone()
 
         # Step 2: verify multi-step execution does not crash and momentum accumulates

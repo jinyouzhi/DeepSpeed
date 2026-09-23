@@ -1027,7 +1027,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             unpinned_fp32_buffer_momentum.requires_grad = False
             if self.save_muon_momentum_buffer_in_memory:
                 unpinned_fp32_buffer_momentum.swappable = False
-                unpinned_fp32_buffer_momentum.is_resident = True
                 self.muon_momentum_buffer_partitioned_groups_flat[i] = unpinned_fp32_buffer_momentum
                 self.muon_momentum_buffer_partitioned_groups_flat[i].ds_id = ds_id
             if self.fp32_partitioned_groups_flat[i] not in self.optimizer.state:
