@@ -2530,7 +2530,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if not muon_params:
                 continue
 
-            if self._swappable_optimizer_subgroup(sub_group_id):
+            if (self._swappable_optimizer_subgroup(sub_group_id) and not self.save_muon_momentum_buffer_in_memory):
                 self._optimizer_states_and_gradient_swap_in(sub_group_id)
 
             fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
