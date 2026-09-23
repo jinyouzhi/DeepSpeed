@@ -378,6 +378,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._muon_allgather_buffers = OrderedDict()
         self._muon_allgather_buffer_bytes = 0
         self._muon_allgather_max_cached_bytes = 256 * 1024 * 1024
+        self._muon_allgather_max_buffer_bytes = 64 * 1024 * 1024
 
         self.round_robin_bit16_groups = []
         self.round_robin_bit16_indices = []
@@ -1748,82 +1749,98 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         world_size = dist.get_world_size(group=process_group)
         rank = dist.get_rank(group=process_group)
         partition_size = int(self.partition_size[group_idx])
-
-        param_ids = [self.get_param_id(param) for param in params]
-        partition_numels = []
-        for param, param_id in zip(params, param_ids):
-            partition_numel = 0
+        slices = [[] for _ in range(world_size)]
+        rank_numels = [0] * world_size
+        for param_index, param in enumerate(params):
+            param_id = self.get_param_id(param)
             for partition_id in self.param_to_partition_ids[group_idx][param_id]:
                 source_offset = int(self.grad_partition_insertion_offset[group_idx][partition_id][param_id])
                 param_offset = int(self.grad_start_offset[group_idx][partition_id][param_id])
-                partition_numel = max(partition_numel, min(param.numel() - param_offset,
-                                                           partition_size - source_offset))
-            partition_numels.append(partition_numel)
-        slot_offsets = [0]
-        for partition_numel in partition_numels:
-            slot_offsets.append(slot_offsets[-1] + partition_numel)
-        slots_numel = slot_offsets[-1]
+                numel = min(param.numel() - param_offset, partition_size - source_offset)
+                slices[partition_id].append(
+                    (param_index, source_offset, param_offset, rank_numels[partition_id], numel))
+                rank_numels[partition_id] += numel
 
-        def reconstruct(flat_buffer, buffer_index=0, compact=True):
-            outputs = []
-            for param, param_id, slot_offset in zip(params, param_ids, slot_offsets):
-                full_param = torch.zeros(param.numel(), dtype=flat_buffer.dtype, device=device)
-                partition_ids = self.param_to_partition_ids[group_idx][param_id]
-                for partition_id in partition_ids:
-                    source_offset = int(self.grad_partition_insertion_offset[group_idx][partition_id][param_id])
-                    param_offset = int(self.grad_start_offset[group_idx][partition_id][param_id])
-                    num_elements = int(min(param.numel() - param_offset, partition_size - source_offset))
-                    if num_elements > 0:
-                        if compact:
-                            source_offset_in_buffer = (partition_id * (slots_numel * len(flat_buffers)) +
-                                                       buffer_index * slots_numel + slot_offset)
-                        else:
-                            source_offset_in_buffer = source_offset
-                        source = flat_buffer.narrow(0, source_offset_in_buffer, num_elements)
-                        full_param.narrow(0, param_offset, num_elements).copy_(source)
-                outputs.append(full_param.view_as(param))
-            return outputs
+        outputs = [[torch.empty(param.shape, dtype=flat_buffers[0].dtype, device=device) for param in params]
+                   for _ in flat_buffers]
 
         if world_size == 1:
-            outputs = [reconstruct(buffer, index, compact=False) for index, buffer in enumerate(flat_buffers)]
+            for buffer, full_params in zip(flat_buffers, outputs):
+                for param_index, source_offset, param_offset, _, numel in slices[rank]:
+                    full_params[param_index].view(-1).narrow(0, param_offset,
+                                                             numel).copy_(buffer.narrow(0, source_offset, numel))
             return outputs[0] if len(outputs) == 1 else outputs
 
-        cache_key = (group_idx, world_size, slots_numel, len(flat_buffers), flat_buffers[0].dtype, device)
+        # Pack only owned slices, and chunk even a single large matrix so skewed
+        # ownership cannot multiply scratch memory by the process-group size.
+        num_buffers = len(flat_buffers)
+        bytes_per_element = flat_buffers[0].element_size()
+        max_rank_numel = max(rank_numels)
+        chunk_numel = min(
+            max_rank_numel,
+            max(1, self._muon_allgather_max_buffer_bytes // ((world_size + 1) * num_buffers * bytes_per_element)))
+        local_numel = chunk_numel * num_buffers
+        gathered_numel = local_numel * world_size
+        cache_key = (group_idx, world_size, chunk_numel, num_buffers, flat_buffers[0].dtype, device)
         cache = self._muon_allgather_buffers.pop(cache_key, None)
-        gathered_numel = slots_numel * len(flat_buffers) * world_size
-        cache_bytes = (slots_numel * len(flat_buffers) + gathered_numel) * flat_buffers[0].element_size()
-        if cache is None or cache[0].numel() != slots_numel * len(flat_buffers) or cache[1].numel() != gathered_numel:
-            local_buffer = torch.empty(slots_numel * len(flat_buffers), dtype=flat_buffers[0].dtype, device=device)
-            gathered_buffer = torch.empty(gathered_numel, dtype=flat_buffers[0].dtype, device=device)
-            if cache is not None:
-                self._muon_allgather_buffer_bytes -= cache[2]
+        cache_bytes = (local_numel + gathered_numel) * bytes_per_element
+        if cache is None:
             while (self._muon_allgather_buffers
                    and self._muon_allgather_buffer_bytes + cache_bytes > self._muon_allgather_max_cached_bytes):
                 _, evicted = self._muon_allgather_buffers.popitem(last=False)
                 self._muon_allgather_buffer_bytes -= evicted[2]
+                del evicted
+            local_buffer = torch.empty(local_numel, dtype=flat_buffers[0].dtype, device=device)
+            gathered_buffer = torch.empty(gathered_numel, dtype=flat_buffers[0].dtype, device=device)
             if cache_bytes <= self._muon_allgather_max_cached_bytes:
                 self._muon_allgather_buffers[cache_key] = (local_buffer, gathered_buffer, cache_bytes)
                 self._muon_allgather_buffer_bytes += cache_bytes
         else:
             local_buffer, gathered_buffer, _ = cache
             self._muon_allgather_buffers[cache_key] = cache
-        for index, flat_buffer in enumerate(flat_buffers):
-            for param_index, (param, param_id, slot_offset) in enumerate(zip(params, param_ids, slot_offsets)):
-                destination = local_buffer.narrow(0, index * slots_numel + slot_offset, partition_numels[param_index])
-                destination.zero_()
-                partition_offset = self.grad_partition_insertion_offset[group_idx][rank].get(param_id)
-                if partition_offset is not None:
-                    source_offset = int(partition_offset)
-                    param_offset = int(self.grad_start_offset[group_idx][rank][param_id])
-                    num_elements = int(min(param.numel() - param_offset, partition_size - source_offset))
-                    if num_elements > 0:
-                        destination.narrow(0, 0,
-                                           num_elements).copy_(flat_buffer.narrow(0, source_offset, num_elements),
-                                                               non_blocking=True)
 
-        dist.all_gather_into_tensor(gathered_buffer, local_buffer, group=process_group)
-        outputs = [reconstruct(gathered_buffer, index) for index in range(len(flat_buffers))]
+        for chunk_start in range(0, max_rank_numel, chunk_numel):
+            chunk_end = chunk_start + chunk_numel
+            local_buffer.zero_()
+            for _, source_offset, _, packed_offset, numel in slices[rank]:
+                start = max(chunk_start, packed_offset)
+                end = min(chunk_end, packed_offset + numel)
+                if start >= end:
+                    continue
+                for index, buffer in enumerate(flat_buffers):
+                    destination = local_buffer.narrow(0, index * chunk_numel + start - chunk_start, end - start)
+                    destination.copy_(buffer.narrow(0, source_offset + start - packed_offset, end - start),
+                                      non_blocking=True)
+
+            dist.all_gather_into_tensor(gathered_buffer, local_buffer, group=process_group)
+            for partition_id, partition_slices in enumerate(slices):
+                for param_index, _, param_offset, packed_offset, numel in partition_slices:
+                    start = max(chunk_start, packed_offset)
+                    end = min(chunk_end, packed_offset + numel)
+                    if start >= end:
+                        continue
+                    for index, full_params in enumerate(outputs):
+                        source_offset = partition_id * local_numel + index * chunk_numel + start - chunk_start
+                        destination = full_params[param_index].view(-1).narrow(0, param_offset + start - packed_offset,
+                                                                               end - start)
+                        destination.copy_(gathered_buffer.narrow(0, source_offset, end - start))
         return outputs[0] if len(outputs) == 1 else outputs
+
+    def _muon_param_batches(self, params, element_size):
+        # Full gradients and momentums must coexist for Newton-Schulz. A matrix
+        # larger than the budget is processed alone, without splitting its update.
+        max_numel = max(1, self._muon_allgather_max_buffer_bytes // (2 * element_size))
+        batch = []
+        batch_numel = 0
+        for param in params:
+            if batch and batch_numel + param.numel() > max_numel:
+                yield batch
+                batch = []
+                batch_numel = 0
+            batch.append(param)
+            batch_numel += param.numel()
+        if batch:
+            yield batch
 
     def _clear_muon_allgather_buffers(self):
         self._muon_allgather_buffers.clear()
@@ -1854,47 +1871,47 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 # A newly allocated state is zero on every rank, so it needs no all-gather.
                 momentum = torch.zeros_like(flat_param)
                 state["momentum_buffer"] = momentum
-            if momentum_was_created:
-                full_grad = self._muon_all_gather_partitions(muon_params, group_idx, [local_grad], process_group,
-                                                             accelerator_device)
-                full_momentum = [torch.zeros_like(grad) for grad in full_grad]
-            else:
-                full_grad, full_momentum = self._muon_all_gather_partitions(muon_params, group_idx,
-                                                                            [local_grad, momentum], process_group,
-                                                                            accelerator_device)
-
-            # Unscale gathered gradients prior to Newton-Schulz and momentum tracking,
-            # since Newton-Schulz normalizes spectral norm and loses gradient scale.
             loss_scale = float(self.loss_scale)
-            if loss_scale != 1.0:
-                for grad in full_grad:
-                    grad.div_(loss_scale)
-
             optimizer_group = self.optimizer.param_groups[group_idx]
-            for param, grad, param_momentum in zip(muon_params, full_grad, full_momentum):
-                param_id = self.get_param_id(param)
-                update = muon_update(grad,
-                                     param_momentum,
-                                     optimizer_group["momentum"],
-                                     ns_method=optimizer_group.get("ns_method", "gram"),
-                                     is_expert_group=getattr(param, "is_expert_group", False),
-                                     num_heads=getattr(param, "muon_num_heads", None))
+            for batch in self._muon_param_batches(muon_params, local_grad.element_size()):
+                if momentum_was_created:
+                    full_grad = self._muon_all_gather_partitions(batch, group_idx, [local_grad], process_group,
+                                                                 accelerator_device)
+                    full_momentum = [torch.zeros_like(grad) for grad in full_grad]
+                else:
+                    full_grad, full_momentum = self._muon_all_gather_partitions(batch, group_idx,
+                                                                                [local_grad, momentum], process_group,
+                                                                                accelerator_device)
 
-                if rank not in self.param_to_partition_ids[group_idx][param_id]:
-                    continue
-                source_offset = int(self.grad_start_offset[group_idx][rank][param_id])
-                dest_offset = int(self.grad_partition_insertion_offset[group_idx][rank][param_id])
-                num_elements = int(min(param.numel() - source_offset, partition_size - dest_offset))
-                if num_elements > 0:
-                    local_update = update.view(-1).narrow(0, source_offset, num_elements)
-                    # Rescale by loss_scale so downstream unscale_and_clip_grads cancels it cleanly
-                    scaled_local_update = local_update * loss_scale if loss_scale != 1.0 else local_update
-                    self.single_partition_of_fp32_groups[group_idx].grad.view(-1).narrow(
-                        0, dest_offset, num_elements).copy_(
-                            scaled_local_update.to(self.single_partition_of_fp32_groups[group_idx].grad.dtype))
-                    self.norm_for_param_grads[param_id] = scaled_local_update.to(get_norm_dtype()).norm(2)
-                    momentum_update = param_momentum.view(-1).narrow(0, source_offset, num_elements)
-                    momentum.narrow(0, dest_offset, num_elements).copy_(momentum_update.to(momentum.dtype))
+                # Newton-Schulz normalizes spectral norm and loses gradient scale.
+                if loss_scale != 1.0:
+                    for grad in full_grad:
+                        grad.div_(loss_scale)
+
+                for param, grad, param_momentum in zip(batch, full_grad, full_momentum):
+                    param_id = self.get_param_id(param)
+                    update = muon_update(grad,
+                                         param_momentum,
+                                         optimizer_group["momentum"],
+                                         ns_method=optimizer_group.get("ns_method", "gram"),
+                                         is_expert_group=getattr(param, "is_expert_group", False),
+                                         num_heads=getattr(param, "muon_num_heads", None))
+
+                    if rank not in self.param_to_partition_ids[group_idx][param_id]:
+                        continue
+                    source_offset = int(self.grad_start_offset[group_idx][rank][param_id])
+                    dest_offset = int(self.grad_partition_insertion_offset[group_idx][rank][param_id])
+                    num_elements = int(min(param.numel() - source_offset, partition_size - dest_offset))
+                    if num_elements > 0:
+                        local_update = update.view(-1).narrow(0, source_offset, num_elements)
+                        # Rescale so downstream unscale_and_clip_grads cancels it.
+                        scaled_local_update = local_update * loss_scale if loss_scale != 1.0 else local_update
+                        local_grad.narrow(0, dest_offset, num_elements).copy_(scaled_local_update.to(local_grad.dtype))
+                        self.norm_for_param_grads[param_id] = scaled_local_update.to(get_norm_dtype()).norm(2)
+                        momentum_update = param_momentum.view(-1).narrow(0, source_offset, num_elements)
+                        momentum.narrow(0, dest_offset, num_elements).copy_(momentum_update.to(momentum.dtype))
+                        del local_update, scaled_local_update, momentum_update
+                del full_grad, full_momentum, grad, param_momentum, update
 
     ############################################################################################
     def copy_grads_in_partition(self, param):

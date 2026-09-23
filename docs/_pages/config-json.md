@@ -50,6 +50,8 @@ Muon optimizer is supported with ZeRO Stage 1, 2, and 3. To use Muon, set the op
 
 Keeping Muon momentum in memory does not keep gradients resident: swappable ZeRO-3 subgroups still load their gradients from NVMe before computing Muon updates.
 
+With ZeRO Stage 1/2 CPU optimizer offload, Muon gathers only locally owned gradient and momentum slices. Communication is chunked to a 64 MiB combined send/receive scratch budget per rank, independently of the 256 MiB buffer-cache limit. Full gradients and momentum are processed in batches targeting 64 MiB; a matrix exceeding that target is processed alone because Newton-Schulz requires the full matrix. These limits exclude Newton-Schulz workspaces and other training memory.
+
 Muon supports the following params:
 
 | "params" key   | Description                                                                                                          | Default   |

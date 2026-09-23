@@ -224,6 +224,88 @@ class TestMuonOptimizerOffload(DistributedTest):
                    for initial, current in zip(initial_params, model.parameters()))
 
 
+class TestMuonOffloadGatherMemory(DistributedTest):
+    """Chunking must bound communication memory without changing multi-step updates."""
+
+    world_size = [1, 2, 4]
+
+    @pytest.mark.parametrize("zero_stage", [1, 2])
+    def test_bounded_gather_matches_unbucketed_training(self, zero_stage):
+        import math
+        from deepspeed.utils import safe_get_full_fp32_param
+
+        def train(buffer_bytes):
+            torch.manual_seed(42)
+            model = SimpleModel(hidden_dim=31, nlayers=4)
+            total_numel = sum(param.numel() for param in model.parameters())
+            config = {
+                "train_micro_batch_size_per_gpu": 4,
+                "gradient_clipping": 1.0,
+                "optimizer": {
+                    "type": "muon",
+                    "params": {
+                        "lr": 0.01,
+                        "momentum": 0.95,
+                    },
+                },
+                "fp16": {
+                    "enabled": True,
+                    "loss_scale": 16.0,
+                },
+                "zero_optimization": {
+                    "stage": zero_stage,
+                    "reduce_scatter": False,
+                    "offload_optimizer": {
+                        "device": "cpu",
+                    },
+                },
+            }
+            engine, _, _, _ = deepspeed.initialize(config=config,
+                                                   model=model,
+                                                   model_parameters=model.parameters(),
+                                                   dist_init_required=False)
+            # Force both multi-matrix batches and chunks smaller than one matrix.
+            # This pins the regression where an LRU limit did not bound allocations.
+            engine.optimizer._muon_allgather_max_buffer_bytes = buffer_bytes
+            gather_bytes = []
+            all_gather = dist.all_gather_into_tensor
+
+            def record_gather(output_tensor, input_tensor, *args, **kwargs):
+                if input_tensor.dtype == torch.float32:
+                    gather_bytes.append((input_tensor.numel() + output_tensor.numel()) * input_tensor.element_size())
+                return all_gather(output_tensor, input_tensor, *args, **kwargs)
+
+            torch.manual_seed(100 + dist.get_rank())
+            x = torch.randn(4, 31, device=engine.device, dtype=torch.half)
+            y = torch.randint(0, 31, (4, ), device=engine.device)
+            before = [safe_get_full_fp32_param(param).clone() for param in model.parameters()]
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(dist, "all_gather_into_tensor", record_gather)
+                for _ in range(3):
+                    engine.backward(engine(x, y))
+                    engine.step()
+            after = [safe_get_full_fp32_param(param).clone() for param in model.parameters()]
+            assert any(not torch.equal(initial, final) for initial, final in zip(before, after))
+
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                assert gather_bytes
+                assert max(gather_bytes) <= buffer_bytes
+                # Owned slices fit inside one ZeRO partition, not the full group.
+                partition_numel = math.ceil(total_numel / world_size)
+                assert max(gather_bytes) <= 2 * (world_size + 1) * partition_numel * 4
+            else:
+                assert not gather_bytes
+            engine.destroy()
+            return after
+
+        reference = train(1024 * 1024)
+        for buffer_bytes in [4096, 16384]:
+            actual = train(buffer_bytes)
+            for expected, result in zip(reference, actual):
+                torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+
 class TestMuonAllGatherBufferLifecycle:
 
     @pytest.mark.parametrize("optimizer_class", [DeepSpeedZeroOptimizer, DeepSpeedZeroOptimizer_Stage3])
