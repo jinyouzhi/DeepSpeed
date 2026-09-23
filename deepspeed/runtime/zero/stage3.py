@@ -1642,8 +1642,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         Returns:
             None
         """
-        # Without optimizer offload Muon runs once per step, in _apply_muon_to_accumulated_grads.
-        if not self.use_muon or not self.offload_optimizer:
+        if not self.use_muon or self.offload_optimizer:
             return
 
         params_by_group = {}
