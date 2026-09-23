@@ -1732,8 +1732,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         `gradient_accumulation_steps` times per step and orthogonalized partial gradients
         (#8443). Called after the overflow check, so a step the loss scaler discards leaves the
         momentum alone, and before the norm, which keeps being taken over the Muon update.
+        CPU/NVMe offload dispatches to its storage-aware update using the same step boundary.
         """
-        if not self.use_muon or self.offload_optimizer:
+        if not self.use_muon:
+            return
+        if self.offload_optimizer:
+            self._apply_muon_updates_cpu_offload()
             return
         for i, group in enumerate(self.fp16_groups):
             if not self.sub_groups_using_muon[i] or not group:
@@ -2459,8 +2463,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     @instrument_w_nvtx
     def _get_norm_groups(self):
-        if self.offload_optimizer:
-            self._apply_muon_updates_cpu_offload()
         norm_groups = []
         for i, group in enumerate(self.fp16_groups):
             if self.offload_optimizer:

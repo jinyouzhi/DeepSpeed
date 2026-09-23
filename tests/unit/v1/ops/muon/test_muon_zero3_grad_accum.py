@@ -151,6 +151,20 @@ class TestZero3MuonOncePerStep(DistributedTest):
                               for a, b in zip(one, four)]).norm() / torch.cat([a.flatten() for a in one]).norm()
         assert relative.item() < 5e-3, f"Single-rank ZeRO-3 accumulation diverged: {relative.item()}"
 
+    @pytest.mark.world_size(1)
+    def test_single_rank_offloaded_gradient_accumulation_matches_one_large_micro_batch(self):
+        initial = [param.detach().float().clone() for param in _model().parameters()]
+        one = _train(3, gas=1, steps=3, offload_optimizer=True)
+        four = _train(3, gas=4, steps=3, offload_optimizer=True)
+
+        for trained in (one, four):
+            update_norm = torch.cat([(after - before).flatten() for before, after in zip(initial, trained)]).norm()
+            assert update_norm.item() > 0.0, "Single-rank offloaded ZeRO-3 Muon did not update the model"
+
+        relative = torch.cat([(a - b).flatten()
+                              for a, b in zip(one, four)]).norm() / torch.cat([a.flatten() for a in one]).norm()
+        assert relative.item() < 5e-3, f"Single-rank offloaded accumulation diverged: {relative.item()}"
+
     @pytest.mark.parametrize("save_muon_momentum_buffer_in_memory", [False, True])
     def test_offloaded_gradient_accumulation_matches_one_large_micro_batch(self, save_muon_momentum_buffer_in_memory):
         one = _train(3,
