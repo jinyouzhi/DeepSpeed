@@ -1622,52 +1622,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 event.record()
                 self.param_reduce_events.append(event)
 
-    def _apply_distributed_muon_update(self, communication_data_type: torch.dtype, buffer_to_reduce: Tensor):
-        """
-        Update the momentum buffer of the parameters using muon.
-
-        NOTE: this runs from the reduce-and-partition path (called once per micro-batch,
-        not once per optimizer step), so under gradient accumulation the momentum
-        update/orthogonalization currently applies more often than intended (see #8443).
-        The CPU-offload Muon path avoids this by deferring the update to step() and
-        gating it on is_gradient_accumulation_boundary() (see
-        `_apply_muon_updates_cpu_offload` in stage_1_and_2.py); a similar boundary-gated,
-        step-time rewrite of this method - re-gathering the accumulated partition via
-        `_muon_all_gather_partitions`/`_partitioned_buffers_all_gather` - is the intended
-        fix here too.
-        Args:
-            communication_data_type: torch.dtype
-            buffer_to_reduce: Tensor
-        Returns:
-            None
-        """
-        if not self.use_muon or self.offload_optimizer:
-            return
-
-        params_by_group = {}
-        params_size_offset = 0
-        for param in self.ipg_buckets[communication_data_type].params:
-            i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
-            if self.sub_groups_using_muon[i]:
-                # copy the gradients back to the params in the ipg bucket for the muon update
-                param.grad.data.copy_(buffer_to_reduce.narrow(0, params_size_offset,
-                                                              param.grad.numel()).view_as(param.grad),
-                                      non_blocking=False)
-                if i not in params_by_group:
-                    params_by_group[i] = []
-                params_by_group[i].append((param, dest_offset, params_size_offset))
-            params_size_offset += param.grad.numel()
-
-        # process muon updates per subgroup to avoid holding all parameters and states at once
-        for i, group_items in params_by_group.items():
-            if not group_items:
-                continue
-            self._muon_update_sub_group(i, [(param, dest_offset, param.grad) for param, dest_offset, _ in group_items],
-                                        communication_data_type)
-            for param, _, params_size_offset in group_items:
-                buffer_to_reduce.narrow(0, params_size_offset, param.grad.numel()).data.copy_(param.grad.view(-1),
-                                                                                              non_blocking=False)
-
     def _muon_update_sub_group(self, i, group_items, communication_data_type: torch.dtype):
         """Run Muon in place on full gradients, for part of sub-group `i`.
 
@@ -1833,7 +1787,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         grad_partitions = []
         grad_offset_in_buffer = 0
-        self._apply_distributed_muon_update(communication_data_type, buffer_to_reduce)
         for param in params_in_bucket:
             grad = param.grad
             chunk_sz = math.ceil(grad.numel() / world_sz)
@@ -2045,21 +1998,22 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         cache = self._muon_allgather_buffers.pop(cache_key, None)
         if cache is None:
             reduce_buffer = torch.empty(partition_count * local_numel, dtype=communication_data_type, device=device)
-            rearrange_buffer = torch.empty(output_numel, dtype=communication_data_type, device=device)
             local_buffer = torch.empty(local_numel, dtype=communication_data_type, device=device)
-            cache_bytes = (local_buffer.numel() + reduce_buffer.numel() + rearrange_buffer.numel()) * \
-                communication_data_type.itemsize
+            cache_bytes = (local_buffer.numel() + reduce_buffer.numel()) * communication_data_type.itemsize
             if cache_bytes <= self._muon_allgather_max_cached_bytes:
                 while (self._muon_allgather_buffers
                        and self._muon_allgather_buffer_bytes + cache_bytes > self._muon_allgather_max_cached_bytes):
                     _, evicted = self._muon_allgather_buffers.popitem(last=False)
-                    self._muon_allgather_buffer_bytes -= evicted[3]
-                self._muon_allgather_buffers[cache_key] = (local_buffer, reduce_buffer, rearrange_buffer, cache_bytes)
+                    self._muon_allgather_buffer_bytes -= evicted[2]
+                self._muon_allgather_buffers[cache_key] = (local_buffer, reduce_buffer, cache_bytes)
                 self._muon_allgather_buffer_bytes += cache_bytes
         else:
-            local_buffer, reduce_buffer, rearrange_buffer, cache_bytes = cache
+            local_buffer, reduce_buffer, cache_bytes = cache
             self._muon_allgather_buffers[cache_key] = cache
 
+        # Returned tensors remain live through the Muon update; don't recycle their storage
+        # as scratch for the next all-gather (e.g. the momentum gather that follows the grad gather).
+        rearrange_buffer = torch.empty(output_numel, dtype=communication_data_type, device=device)
         buffer_offsets = [0]
         for buffer_numel in buffer_numels:
             buffer_offsets.append(buffer_offsets[-1] + buffer_numel)
