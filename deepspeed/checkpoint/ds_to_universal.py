@@ -1190,6 +1190,7 @@ def main(args):
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         from deepspeed.checkpoint.autoep_universal import (consolidate_autoep_zero12_expert_states,
+                                                           get_autoep_zero12_fp32_fallback_param_names,
                                                            get_autoep_zero12_expert_param_info)
 
         expert_files = glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*_model_states.pt'))
@@ -1224,13 +1225,25 @@ def main(args):
         if autoep_expert_file_type == 'autoep':
             print('*** 2.5. Consolidating AutoEP expert model states')
             from deepspeed.checkpoint.autoep_universal import consolidate_autoep_expert_files
-            consolidate_autoep_expert_files(args.input_folder, args.output_folder, autoep_metadata)
+            autoep_slice_shapes = {name: per_tp_shapes[0] for name, per_tp_shapes in slice_shapes.items()}
+            fp32_fallback_param_names = get_autoep_zero12_fp32_fallback_param_names(
+                temp_dir, autoep_expert_param_info, autoep_slice_shapes, ds_checkpoint.dp_degree,
+                use_data_before_expert_parallel)
+            consolidate_autoep_expert_files(args.input_folder,
+                                            args.output_folder,
+                                            autoep_metadata,
+                                            fp32_fallback_param_names=fp32_fallback_param_names,
+                                            fp32_fallback_dir=temp_dir)
             print(f'    Consolidated {len(autoep_metadata)} AutoEP layer(s)')
             print('*** 2.6. Consolidating AutoEP ZeRO-1/2 expert states')
-            autoep_slice_shapes = {name: per_tp_shapes[0] for name, per_tp_shapes in slice_shapes.items()}
-            consolidate_autoep_zero12_expert_states(temp_dir, args.output_folder, autoep_expert_param_info,
-                                                    autoep_slice_shapes, ds_checkpoint.dp_degree,
-                                                    ds_checkpoint.tp_degree, use_data_before_expert_parallel)
+            consolidate_autoep_zero12_expert_states(temp_dir,
+                                                    args.output_folder,
+                                                    autoep_expert_param_info,
+                                                    autoep_slice_shapes,
+                                                    ds_checkpoint.dp_degree,
+                                                    ds_checkpoint.tp_degree,
+                                                    use_data_before_expert_parallel,
+                                                    fp32_fallback_dir=temp_dir)
         elif autoep_expert_file_type == 'native_moe':
             print(f'    Found {len(expert_files)} expert checkpoint file(s) but no AutoEP metadata; '
                   'assuming native DeepSpeed MoE and skipping AutoEP consolidation')

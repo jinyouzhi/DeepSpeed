@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from deepspeed.checkpoint.autoep_affine import make_autoep_placement_descriptor
-from deepspeed.checkpoint.autoep_universal import (consolidate_autoep_zero12_expert_states,
+from deepspeed.checkpoint.autoep_universal import (consolidate_autoep_expert_files,
+                                                   consolidate_autoep_zero12_expert_states, _zero12_fragment_path,
+                                                   get_autoep_zero12_fp32_fallback_param_names,
                                                    get_autoep_zero12_expert_param_info)
 from deepspeed.checkpoint.constants import (
     AUTOEP_EXPERT_PLACEMENT, AUTOEP_LAYERS_KEY, AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY,
@@ -104,6 +106,71 @@ def test_zero12_uniform_affine_consolidation_matches_legacy_order(tmp_path):
                                             {param_name: (2, 2)}, 2, 1, False)
 
     assert torch.equal(_load_consolidated(str(tmp_path / "output"), param_name)[PARAM], full)
+
+
+def test_zero12_consolidation_uses_expert_file_fallback_for_missing_master_rank(tmp_path):
+    param_name = "layer.experts.w1"
+    placement = make_autoep_placement_descriptor(4, [[2, 0, 3], [1]])
+    model_tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
+    master_tensor = model_tensor + 10
+    fragments_dir = str(tmp_path / "fragments")
+    output_dir = str(tmp_path / "output")
+    fallback_dir = str(tmp_path / "fallback")
+    _write_zero12_fragments(fragments_dir, param_name, {0: master_tensor[[2, 0, 3]], 1: model_tensor[1:2]})
+    os.remove(_zero12_fragment_path(fragments_dir, param_name, "fp32", 1))
+
+    os.makedirs(os.path.join(fallback_dir, param_name))
+    torch.save({PARAM: model_tensor}, os.path.join(fallback_dir, param_name, "fp32.pt"))
+    info = {
+        param_name: {
+            'num_experts': 4,
+            'num_local_experts': 2,
+            'ep_size': 2,
+            'expert_placement': placement,
+        }
+    }
+    slice_shapes = {param_name: (2, 2)}
+
+    fallback_names = get_autoep_zero12_fp32_fallback_param_names(fragments_dir, info, slice_shapes, 2, False)
+    assert fallback_names == {param_name}
+
+    consolidate_autoep_zero12_expert_states(fragments_dir,
+                                            output_dir,
+                                            info,
+                                            slice_shapes,
+                                            2,
+                                            1,
+                                            False,
+                                            fp32_fallback_dir=fallback_dir)
+
+    expected = model_tensor.clone()
+    expected[[2, 0, 3]] = master_tensor[[2, 0, 3]]
+    assert torch.equal(_load_consolidated(output_dir, param_name)[PARAM], expected)
+
+
+def test_expert_file_consolidation_can_skip_fp32_output(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoint"
+    output_dir = tmp_path / "output"
+    checkpoint_dir.mkdir()
+    for expert_id in range(2):
+        state = {
+            f"layer.experts.{weight}.{expert_id}": torch.full((2, 2), expert_id, dtype=torch.float32)
+            for weight in ("w1", "w2", "w3")
+        }
+        torch.save(state, checkpoint_dir / f"layer_0_expert_{expert_id}_mp_rank_00_model_states.pt")
+
+    consolidate_autoep_expert_files(
+        str(checkpoint_dir),
+        str(output_dir),
+        [{
+            "moe_layer_id": 0,
+            "num_experts": 2,
+            "expert_key_prefix": "layer.experts"
+        }],
+        fp32_fallback_param_names=set(),
+    )
+
+    assert not (output_dir / "zero" / "layer.experts.w1" / "fp32.pt").exists()
 
 
 def test_zero12_affine_consolidation_validates_replicated_experts(tmp_path):
