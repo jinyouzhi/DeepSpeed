@@ -1214,7 +1214,11 @@ def main(args):
         zero_output_folder = os.path.join(args.output_folder, "zero")
         for model_file in ds_checkpoint.mp_rank_files:
             model_state = torch.load(model_file, map_location="cpu", weights_only=False)
-            for name, tensor in model_state.get("module", {}).items():
+            module_state = model_state.get("module")
+            if module_state is None:
+                # Pipeline checkpoints store model weights in separate layer files.
+                continue
+            for name, tensor in module_state.items():
                 param_dir = os.path.join(zero_output_folder, name)
                 fp32_path = os.path.join(param_dir, "fp32.pt")
                 if os.path.isfile(fp32_path):
