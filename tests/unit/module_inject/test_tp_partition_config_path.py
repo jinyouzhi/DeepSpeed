@@ -212,10 +212,11 @@ def _build_legacy_lm_head_autotp(model, training_mode=False):
     return autotp
 
 
-def _build_row_output_head_autotp(model, head="lm_head", training_mode=False, mp_size=1):
-    config = AutoTPConfig(layer_specs=[
-        TPLayerSpec(patterns=[rf".*{head}\.weight$"], partition_type=PartitionType.ROW),
-    ])
+def _build_row_output_head_autotp(model, head="lm_head", training_mode=False, mp_size=1, embedding_spec=False):
+    layer_specs = [TPLayerSpec(patterns=[rf".*{head}\.weight$"], partition_type=PartitionType.ROW)]
+    if embedding_spec:
+        layer_specs.append(TPLayerSpec(patterns=[r".*embed_tokens\.weight$"], partition_type=PartitionType.ROW))
+    config = AutoTPConfig(layer_specs=layer_specs)
     autotp = AutoTP(
         module=model,
         all_reduce_linears=(),
@@ -580,6 +581,16 @@ def test_explicit_row_parallel_lm_head_training_rejects_tied_weight():
         _build_row_output_head_autotp(model, training_mode=True, mp_size=2)._replace_module(model)
     assert model.lm_head.weight is weight
     assert model.embed_tokens.weight is weight
+
+
+def test_explicit_row_parallel_lm_head_training_rejects_tie_after_embedding_is_sliced():
+    # The embedding is visited and sliced before lm_head, so the tie must still be rejected
+    # rather than leaving the embedding and head on separate, silently untied weights.
+    model = OutputModel(tied=True)
+    autotp = _build_row_output_head_autotp(model, training_mode=True, mp_size=2, embedding_spec=True)
+
+    with pytest.raises(NotImplementedError, match="cannot shard a tied weight"):
+        autotp._replace_module(model)
 
 
 @pytest.mark.parametrize("head", ["lm_head", "embed_out"])

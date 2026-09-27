@@ -244,6 +244,10 @@ class AutoTP():
                     continue
                 for tied_embedding in embedding_modules_by_weight_id.get(id(module.weight), []):
                     self._tied_vocab_parallel_embedding_ids.add(id(tied_embedding))
+        # Snapshot weight ties from the original model: once an earlier sibling such as a tied
+        # embedding is sliced, its new Parameter no longer aliases the head's weight, so a check
+        # made during the replacement walk would miss the tie and silently break it.
+        self._tied_weight_module_ids = self._find_tied_weight_module_ids()
         self._gathered_column_tie_fallbacks_configured = False
         self._tied_gathered_column_module_names = set()
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
@@ -495,9 +499,7 @@ class AutoTP():
             if spec.shape is not None or spec.get_partition_dim() != 1:
                 raise NotImplementedError(
                     "Row-parallel output-head training requires an unreshaped input-dimension shard.")
-            tied = any(weight is module.weight for other in self.module.modules() if other is not module
-                       for name, weight in other.named_parameters(recurse=False) if name == 'weight')
-            if self.mp_size > 1 and tied:
+            if self.mp_size > 1 and id(module) in self._tied_weight_module_ids:
                 raise NotImplementedError(
                     "Row-parallel output-head training cannot shard a tied weight. "
                     "Keep the tied embedding and output head replicated until coupled embedding sharding is supported."
@@ -539,6 +541,18 @@ class AutoTP():
                 tp_meta=self.tp_meta,
             )
         return LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output, tp_meta=self.tp_meta)
+
+    def _find_tied_weight_module_ids(self):
+        modules_by_weight_id = {}
+        for module in self.module.modules():
+            weight = module._parameters.get("weight")
+            if weight is not None:
+                modules_by_weight_id.setdefault(id(weight), []).append(module)
+        tied_module_ids = set()
+        for modules in modules_by_weight_id.values():
+            if len(modules) > 1:
+                tied_module_ids.update(id(module) for module in modules)
+        return tied_module_ids
 
     @staticmethod
     def _default_lm_head_patterns():
