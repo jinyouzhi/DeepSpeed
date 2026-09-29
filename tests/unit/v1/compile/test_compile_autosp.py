@@ -102,8 +102,8 @@ class TestAutoSPMeshRegistry(DistributedTest):
         assert dist.get_world_size(group) == 2
 
 
-# Plain pytest classes — no distributed runtime needed because these functions
-# perform pure IR-level graph rewrites; sp_size and get_rank are mocked.
+# Plain pytest classes — distributed state is mocked where needed, and the remaining
+# tests perform pure IR-level graph rewrites.
 
 
 class TestAutoSPMeshValidation:
@@ -133,6 +133,17 @@ class TestAutoSPMeshValidation:
         monkeypatch.setattr(sp_dp_registry.dist, "new_group", fail_new_group)
 
         with pytest.raises(ValueError, match="must cover"):
+            sp_dp_registry.populate_registry(sp_size, dp_size)
+        assert not sp_dp_registry.is_setup()
+
+    @pytest.mark.parametrize("sp_size, dp_size", [(0, 4), (-2, -2)])
+    def test_rejects_non_positive_mesh_dimensions(self, monkeypatch, sp_size, dp_size):
+        from deepspeed.compile.custom_ops import sp_dp_registry
+
+        monkeypatch.setattr(sp_dp_registry, "GROUP_REGISTRY", {})
+        monkeypatch.setattr(sp_dp_registry.dist, "get_world_size", lambda *args, **kwargs: 4)
+
+        with pytest.raises(ValueError, match="must be positive"):
             sp_dp_registry.populate_registry(sp_size, dp_size)
         assert not sp_dp_registry.is_setup()
 

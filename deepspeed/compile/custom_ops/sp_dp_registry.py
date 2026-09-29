@@ -50,6 +50,9 @@ def dp_size():
 def populate_registry(SP_SIZE, DP_SIZE):
     """ Populate rank to SP/DP mesh index.  """
 
+    if SP_SIZE <= 0 or DP_SIZE <= 0:
+        raise ValueError(f"AutoSP mesh dimensions must be positive (sp={SP_SIZE}, dp={DP_SIZE})")
+
     world_size = dist.get_world_size()
     if SP_SIZE * DP_SIZE != world_size:
         raise ValueError(f"AutoSP mesh (sp={SP_SIZE} x dp={DP_SIZE}) must cover the distributed world size "
