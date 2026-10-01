@@ -575,12 +575,19 @@ def test_explicit_row_parallel_lm_head_is_not_overridden_by_its_name():
     assert not isinstance(model.lm_head, LmHeadLinearAllreduce)
 
 
+@pytest.mark.parametrize("head_first", [False, True])
 @pytest.mark.parametrize("embedding_spec", [False, True])
-def test_explicit_row_parallel_lm_head_training_shares_tied_weight_with_embedding(embedding_spec):
-    # With embedding_spec the embedding is visited before lm_head and matches a spec of its own;
-    # it must still end up on the head's Parameter rather than a separately sliced copy.
+def test_explicit_row_parallel_lm_head_training_shares_tied_weight_with_embedding(embedding_spec, head_first):
+    # With embedding_spec the embedding matches a spec of its own; it must still end up on the head's
+    # Parameter rather than a separately sliced copy, and must not be re-wrapped when the walk reaches
+    # it after the head has already replaced it.
     model = OutputModel(tied=True)
     weight = model.embed_tokens.weight
+    if head_first:
+        embed_tokens = model.embed_tokens
+        del model.embed_tokens
+        model.embed_tokens = embed_tokens
+        assert list(model._modules) == ["lm_head", "embed_tokens"]
     _build_row_output_head_autotp(model, training_mode=True, mp_size=2,
                                   embedding_spec=embedding_spec)._replace_module(model)
 
