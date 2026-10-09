@@ -113,3 +113,39 @@ def all_gather_sequence_fake(input: torch.Tensor, dim: int):
     output_shape = list(input.shape)
     output_shape[dim] = maybe_restore_sharded_dim(output_shape[dim], sp_size())
     return input.new_empty(output_shape)
+
+
+@torch.library.custom_op("autosp::reduce_scatter_sequence", mutates_args=())
+def reduce_scatter_sequence(input: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sum `input` over the SP group and keep this rank's shard along `dim`; the adjoint of all_gather_sequence."""
+    assert is_setup(), 'Incorrect initialization of SP/DP mesh.'
+    group = get_group(dist.get_rank() // sp_size())
+
+    dim = dim % input.dim()
+    input = input.movedim(dim, 0).contiguous()
+    output = input.new_empty((input.shape[0] // sp_size(), ) + tuple(input.shape[1:]))
+    dist.reduce_scatter_tensor(output, input, group=group)
+    return output.movedim(0, dim).contiguous()
+
+
+@torch.library.register_fake("autosp::reduce_scatter_sequence")
+def reduce_scatter_sequence_fake(input: torch.Tensor, dim: int):
+    output_shape = list(input.shape)
+    output_shape[dim] = output_shape[dim] // sp_size()
+    return input.new_empty(output_shape)
+
+
+def _all_gather_sequence_backward_setup(ctx, inputs, output):
+    _, dim = inputs
+    ctx.dim = dim
+
+
+def _all_gather_sequence_backward(ctx, grad):
+    # Every rank consumes the whole gathered tensor, so the gradient of a local shard is the sum of
+    # the matching slice over the SP group.
+    return reduce_scatter_sequence(grad, ctx.dim), None
+
+
+torch.library.register_autograd("autosp::all_gather_sequence",
+                                _all_gather_sequence_backward,
+                                setup_context=_all_gather_sequence_backward_setup)

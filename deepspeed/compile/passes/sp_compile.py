@@ -162,22 +162,45 @@ def set_sdpa_attn_mask(attn_node: Node, attn_mask, as_kwarg: bool):
 
 def gather_attn_mask_queries(gm: GraphModule, attn_mask: Node, q: Node, k: Node) -> Node:
     """
-    After the Q/K/V all-to-all, SDPA attends over the full sequence. A mask computed from the
-    local sequence shard only holds this rank's query rows, so gather them across the SP group.
+    Rewrite an SDPA mask for the layout after the Q/K/V all-to-all, where each rank attends with
+    the full query sequence and its own block of heads.
+
+    A mask computed from the local sequence shard only holds this rank's query rows, so the rows
+    are gathered across the SP group. A mask with a full head dimension must also be reduced to
+    this rank's heads.
     """
     mask_meta = get_node_shape_meta(attn_mask)
     if mask_meta is None or mask_meta.ndim < 2:
         return attn_mask
 
-    local_seq_len = str(get_node_shape_meta(q).shape[2])
-    if str(mask_meta.shape[-1]) == str(get_node_shape_meta(k).shape[2]):
+    q_meta = get_node_shape_meta(q)
+    mask_keys = mask_meta.shape[-1]
+    # A key dimension of 1 is broadcast by SDPA, not sharded.
+    if mask_keys != 1 and str(mask_keys) == str(get_node_shape_meta(k).shape[2]):
         # The other ranks' key columns were never computed here, so they cannot be gathered.
         raise RuntimeError("AutoSP cannot rebuild an attention mask whose key dimension is sharded along the "
                            f"sequence (mask shape {tuple(mask_meta.shape)}). Build the mask from the full, "
                            "unsharded sequence length instead, for example from the 2D padding attention_mask.")
-    if str(mask_meta.shape[-2]) != local_seq_len:
-        return attn_mask
+    query_sharded = str(mask_meta.shape[-2]) == str(q_meta.shape[2])
+    per_head = mask_meta.ndim == 4 and mask_meta.shape[1] != 1
 
+    if per_head:
+        if str(mask_meta.shape[1]) != str(q_meta.shape[1]):
+            raise RuntimeError(f"AutoSP expects the head dimension of the attention mask {tuple(mask_meta.shape)} "
+                               f"to be 1 or the number of query heads ({q_meta.shape[1]})")
+        if query_sharded:
+            # Same redistribution as the query: [B, N, S/P, S] -> [B, N/P, S, S].
+            with gm.graph.inserting_after(attn_mask):
+                return gm.graph.call_function(torch.ops.autosp.all_to_all.default, args=(attn_mask, 1, 2, "attn_mask"))
+        # The query all-to-all hands rank r the r-th contiguous block of heads.
+        sp_size = sp_dp_registry.sp_size()
+        local_heads = q_meta.shape[1] // sp_size
+        sp_rank = dist.get_rank() % sp_size
+        with gm.graph.inserting_after(attn_mask):
+            return gm.graph.call_function(torch.narrow, args=(attn_mask, 1, sp_rank * local_heads, local_heads))
+
+    if not query_sharded:
+        return attn_mask
     with gm.graph.inserting_after(attn_mask):
         return gm.graph.call_function(torch.ops.autosp.all_gather_sequence.default, args=(attn_mask, -2))
 

@@ -203,14 +203,32 @@ class _MaskedAttentionModel(torch.nn.Module):
     mask, so under AutoSP each rank sees a [B, 1, S/P, S] mask.
     """
 
-    def __init__(self, vocab_size=64, hidden=32, num_heads=2):
+    def __init__(self, vocab_size=64, hidden=32, num_heads=2, bias=None):
         super().__init__()
         self.num_heads = num_heads
+        # Optional learnable distance bias added to the mask: shared by all heads, per head on the
+        # local query rows, or per head over the full query sequence.
+        self.bias = bias
         self.embed = torch.nn.Embedding(vocab_size, hidden)
         self.pos_embed = torch.nn.Embedding(1024, hidden)
         self.qkv = torch.nn.Linear(hidden, 3 * hidden)
         self.out = torch.nn.Linear(hidden, hidden)
         self.head = torch.nn.Linear(hidden, vocab_size)
+        if bias is not None:
+            bias_heads = 1 if bias == "shared" else num_heads
+            self.slopes = torch.nn.Parameter(torch.linspace(-0.5, -0.1, bias_heads))
+
+    def biased_mask(self, position_ids, attention_mask):
+        batch = position_ids.shape[0]
+        key_positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+        if self.bias == "full_query_per_head":
+            query_positions = key_positions[None, :].expand(batch, -1)
+        else:
+            query_positions = position_ids
+        allowed = (query_positions[:, :, None] >= key_positions[None, None, :]) & attention_mask[:, None, :].bool()
+        distance = (query_positions[:, :, None] - key_positions[None, None, :]).float()
+        bias = self.slopes.view(1, -1, 1, 1) * distance[:, None]
+        return bias.masked_fill(~allowed[:, None], float("-inf"))
 
     def forward(self, input_ids, labels, position_ids, attention_mask, mask_as_kwarg=True, local_keys=False):
         batch, seq_len = input_ids.shape
@@ -220,7 +238,9 @@ class _MaskedAttentionModel(torch.nn.Module):
         def to_heads(t):
             return t.view(batch, seq_len, self.num_heads, -1).transpose(1, 2)
 
-        if local_keys:
+        if self.bias is not None:
+            mask = self.biased_mask(position_ids, attention_mask)
+        elif local_keys:
             # Keys taken from the sharded position ids only cover this rank's own shard.
             mask = (position_ids[:, :, None] >= position_ids[:, None, :])[:, None]
         else:
@@ -294,6 +314,75 @@ class TestAutoSPAttentionMask(DistributedTest):
             dist.all_reduce(global_loss)
             global_loss /= sp_size
             torch.testing.assert_close(global_loss, reference_loss, rtol=1e-4, atol=1e-5)
+
+        engine.destroy()
+
+    @pytest.mark.sequential
+    @pytest.mark.parametrize("bias", ["shared", "per_head", "full_query_per_head"])
+    def test_learnable_mask_matches_full_sequence_gradients(self, bias):
+        import copy
+        import deepspeed
+        import deepspeed.comm as dist
+        from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
+
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("CPU does not support this test yet")
+
+        sp_size = self.world_size
+        seq_len, batch, vocab_size = 16, 2, 64
+        device = get_accelerator().current_device_name()
+
+        torch.manual_seed(0)
+        reference = _MaskedAttentionModel(vocab_size=vocab_size, bias=bias).to(device)
+        config = {
+            "train_micro_batch_size_per_gpu": batch,
+            "train_batch_size": batch,
+            "zero_optimization": {
+                "stage": 0
+            },
+            "compile": {
+                "deepcompile": True,
+                "passes": ["autosp"]
+            },
+            "sequence_parallel_size": sp_size,
+        }
+        model = copy.deepcopy(reference)
+        engine, _, _, _ = deepspeed.initialize(config=config,
+                                               model=model,
+                                               optimizer=torch.optim.SGD(model.parameters(), lr=0.1))
+        engine.compile()
+
+        torch.manual_seed(100)
+        input_ids = torch.randint(0, vocab_size, (batch, seq_len), device=device)
+        labels = torch.randint(0, vocab_size, (batch, seq_len), device=device)
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch, seq_len).contiguous()
+        attention_mask = torch.ones(batch, seq_len, dtype=torch.long, device=device)
+        attention_mask[0, seq_len - 3:] = 0
+
+        reference_loss = reference(input_ids, labels, position_ids, attention_mask)
+        reference_loss.backward()
+
+        autosp_inputs = prepare_autosp_inputs(input_ids.clone(), labels.clone(), position_ids.clone(),
+                                              attention_mask.clone())
+        loss = engine(*autosp_inputs)
+        # Keep the local gradients and reduce them by hand below, so the check does not depend on
+        # how the engine reduces gradients across the SP group.
+        with engine.no_sync():
+            engine.backward(loss)
+
+        # Every rank holds the mean over an equally sized sequence shard, so the full-sequence loss
+        # and its gradients are the averages over the SP group (the whole world here).
+        global_loss = loss.detach().clone()
+        dist.all_reduce(global_loss)
+        torch.testing.assert_close(global_loss / sp_size, reference_loss.detach(), rtol=1e-4, atol=1e-5)
+        for (name, param), expected in zip(engine.module.named_parameters(), reference.parameters()):
+            grad = param.grad.clone()
+            dist.all_reduce(grad)
+            torch.testing.assert_close(grad / sp_size,
+                                       expected.grad,
+                                       rtol=1e-4,
+                                       atol=1e-5,
+                                       msg=lambda m, name=name: f"{name}: {m}")
 
         engine.destroy()
 
