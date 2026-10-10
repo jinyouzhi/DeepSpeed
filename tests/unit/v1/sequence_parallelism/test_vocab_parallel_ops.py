@@ -303,6 +303,47 @@ def test_ignored_fully_masked_row_gets_zero_gradient(top_k):
     assert torch.isfinite(logits.grad).all()
 
 
+@pytest.mark.parametrize("op", ["logprobs", "entropy", "forward_kl", "reverse_kl"])
+def test_masked_undefined_row_gets_zero_gradient(op):
+    # A fully -inf padding row has no distribution. Once the caller masks its output, it must not
+    # inject NaN gradients, and the valid row must still match its own unpadded computation.
+    torch.manual_seed(7)
+    valid_logits, valid_other = torch.randn(1, 5), torch.randn(1, 5)
+    padding = torch.full((1, 5), float("-inf"))
+    index = torch.tensor([3, 1])
+    padded_logits, unpadded_logits = leaf(torch.cat([valid_logits, padding])), leaf(valid_logits)
+    padded_other = leaf(torch.cat([valid_other, padding]))
+
+    actual = _all_ops(padded_logits, padded_other, index)[op](padded_logits)
+    expected = _all_ops(unpadded_logits, valid_other, index[:1])[op](unpadded_logits)
+    assert torch.isnan(actual[1])
+    actual.masked_fill(torch.tensor([False, True]), 0.0).sum().backward()
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual[:1], expected)
+    torch.testing.assert_close(padded_logits.grad[:1], unpadded_logits.grad)
+    torch.testing.assert_close(padded_logits.grad[1], torch.zeros(5))
+    if op.endswith("kl"):
+        torch.testing.assert_close(padded_other.grad[1], torch.zeros(5))
+        assert torch.isfinite(padded_other.grad).all()
+
+
+def test_logprobs_trusted_vocab_size_matches_validated_path():
+    torch.manual_seed(8)
+    logits = torch.randn(2, 3, 11)
+    index = torch.randint(0, 11, (2, 3))
+
+    trusted = vocab_parallel_logprobs(logits, index, vocab_start_index=0, vocab_end_index=11, global_vocab_size=11)
+
+    torch.testing.assert_close(trusted, vocab_parallel_logprobs(logits, index))
+    with pytest.raises(ValueError, match="out of range"):
+        vocab_parallel_logprobs(logits,
+                                torch.full((2, 3), 11),
+                                vocab_start_index=0,
+                                vocab_end_index=11,
+                                global_vocab_size=11)
+
+
 def test_validates_inputs():
     logits = torch.randn(2, 3, 11)
     with pytest.raises(ValueError, match="non-vocabulary dimensions"):
@@ -313,6 +354,8 @@ def test_validates_inputs():
         vocab_parallel_logprobs(logits, torch.zeros(2, 3, dtype=torch.long), vocab_start_index=0)
     with pytest.raises(ValueError, match="same shape"):
         vocab_parallel_kl_div(logits, torch.randn(2, 3, 12))
+    with pytest.raises(ValueError, match="requires explicit"):
+        vocab_parallel_logprobs(logits, torch.zeros(2, 3, dtype=torch.long), global_vocab_size=11)
 
 
 class TestVocabParallelOpsTP(DistributedTest):
@@ -351,3 +394,41 @@ class TestVocabParallelOpsTP(DistributedTest):
         (expected * weight).sum().backward()
         torch.testing.assert_close(local_student.grad, full_student.grad[..., start:end])
         torch.testing.assert_close(local_teacher.grad, full_teacher.grad[..., start:end])
+
+    def test_empty_shard_does_not_desynchronize_ranks(self):
+        # Rank 0 owns no vocabulary. Entropy and KL need no shard bounds, so they must still match
+        # the full vocabulary instead of failing on one rank while the other waits in a collective;
+        # logprobs must reject the layout on both ranks together.
+        device = torch.device(get_accelerator().current_device_name())
+        rank = dist.get_rank()
+        tp_group = dist.get_world_group()
+        vocab_size = 3
+        start, end = (0, 0) if rank == 0 else (0, vocab_size)
+
+        torch.manual_seed(9)
+        student = torch.randn(2, 4, vocab_size, device=device)
+        teacher = torch.randn(2, 4, vocab_size, device=device)
+        weight = torch.randn(2, 4, device=device)
+        full_student, full_teacher = leaf(student), leaf(teacher)
+        local_student = leaf(student[..., start:end])
+        local_teacher = leaf(teacher[..., start:end])
+
+        actual = (vocab_parallel_entropy(local_student, tp_group=tp_group) +
+                  vocab_parallel_kl_div(local_student, local_teacher, tp_group=tp_group) +
+                  vocab_parallel_kl_div(local_student, local_teacher, reverse=True, tp_group=tp_group))
+        expected = (reference_entropy(full_student) + reference_kl(full_student, full_teacher, False) +
+                    reference_kl(full_student, full_teacher, True))
+
+        torch.testing.assert_close(actual, expected)
+        (actual * weight).sum().backward()
+        (expected * weight).sum().backward()
+        torch.testing.assert_close(local_student.grad, full_student.grad[..., start:end])
+        torch.testing.assert_close(local_teacher.grad, full_teacher.grad[..., start:end])
+
+        index = torch.zeros(2, 4, dtype=torch.long, device=device)
+        with pytest.raises(ValueError, match="empty vocabulary shard"):
+            vocab_parallel_logprobs(local_student,
+                                    index,
+                                    tp_group=tp_group,
+                                    vocab_start_index=start,
+                                    vocab_end_index=end)

@@ -14,6 +14,9 @@ gradient of each local logit be computed without communication.
 
 Teacher and student logits passed to the KL op must be sharded identically: same
 tensor-parallel group and same vocabulary range on every rank.
+
+A row whose logits are all ``-inf`` has no defined distribution: entropy and KL return NaN for
+it, but its logits get zero gradient so that callers can mask such rows (e.g. padding) out.
 """
 
 import torch
@@ -54,6 +57,11 @@ def _softmax_stats(logits_2d_list, tp_group):
     device = logits_2d_list[0].device
     global_max = torch.empty(len(logits_2d_list), num_rows, dtype=torch.float32, device=device)
     for i, logits in enumerate(logits_2d_list):
+        # An empty local shard still joins both collectives, contributing -inf and 0, so no TP
+        # rank is left waiting; amax itself rejects an empty dimension.
+        if logits.shape[-1] == 0:
+            global_max[i].fill_(float("-inf"))
+            continue
         for rows in _row_chunks(logits):
             global_max[i, rows] = logits[rows].amax(dim=-1).float()
     _all_reduce(global_max, dist.ReduceOp.MAX, tp_group)
@@ -87,8 +95,15 @@ def _kl_terms(a_log_probs, b_log_probs):
     return terms.masked_fill_(support_mismatch, float("inf"))
 
 
+def _undefined_rows(global_max):
+    # A fully -inf row has no softmax; its gradient is zeroed instead of propagating NaN.
+    return (global_max == float("-inf")).unsqueeze(-1)
+
+
 def _flatten(vocab_parallel_logits):
-    return vocab_parallel_logits.reshape(-1, vocab_parallel_logits.shape[-1])
+    # reshape(-1, 0) is ambiguous for an empty local shard, so the row count is given explicitly.
+    num_rows = vocab_parallel_logits.shape[:-1].numel()
+    return vocab_parallel_logits.reshape(num_rows, vocab_parallel_logits.shape[-1])
 
 
 class _VocabParallelLogProbs(torch.autograd.Function):
@@ -125,13 +140,13 @@ class _VocabParallelLogProbs(torch.autograd.Function):
         grad_sum = grad_output.sum(dim=-1, keepdim=True)
         # A row whose indices are all ignored has a constant output, so its gradient is exactly 0.
         # Multiplying its softmax by 0 is not enough: a fully masked row's softmax is NaN.
-        ignored_row = ~valid_index.any(dim=-1, keepdim=True)
+        zero_grad_row = ~valid_index.any(dim=-1, keepdim=True) | _undefined_rows(global_max)
 
         # d logp(i) / d z_j = onehot(i)_j - softmax(z)_j, summed over the requested indices.
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
             grad_chunk = torch.exp(_log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])) * -grad_sum[rows]
-            grad_chunk.masked_fill_(ignored_row[rows], 0.0)
+            grad_chunk.masked_fill_(zero_grad_row[rows], 0.0)
             grad_chunk.scatter_add_(-1, local_index[rows], index_grad[rows])
             grad_logits[rows] = grad_chunk
         return grad_logits.view_as(vocab_parallel_logits), None, None, None, None
@@ -159,13 +174,14 @@ class _VocabParallelEntropy(torch.autograd.Function):
         vocab_parallel_logits, global_max, log_sum_exp, entropy = ctx.saved_tensors
         logits = _flatten(vocab_parallel_logits)
         grad_output = grad_output.reshape(-1, 1).float()
+        undefined_row = _undefined_rows(global_max)
 
         # dH / dz_j = -p_j * (log p_j + H)
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
             log_probs = _log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])
             grad_chunk = _weighted_by_probs(log_probs, log_probs + entropy[rows].unsqueeze(-1))
-            grad_logits[rows] = grad_chunk * -grad_output[rows]
+            grad_logits[rows] = grad_chunk.mul_(-grad_output[rows]).masked_fill_(undefined_row[rows], 0.0)
         return grad_logits.view_as(vocab_parallel_logits), None
 
 
@@ -208,6 +224,8 @@ class _VocabParallelKLDiv(torch.autograd.Function):
         grad_student = torch.empty_like(student) if need_student_grad else None
         grad_teacher = torch.empty_like(teacher) if need_teacher_grad else None
         a_grad, b_grad = _order_kl_arguments(grad_student, grad_teacher, ctx.reverse)
+        # KL is undefined when either distribution is; both sides then get zero gradient.
+        undefined_row = _undefined_rows(global_max).any(dim=0)
 
         for rows in _row_chunks(student):
             student_log_probs = _log_softmax(student[rows], global_max[0, rows], log_sum_exp[0, rows])
@@ -217,9 +235,11 @@ class _VocabParallelKLDiv(torch.autograd.Function):
             # For KL(A || B): dKL/dz_A = p_A * (log p_A - log p_B - KL) and dKL/dz_B = p_B - p_A.
             if a_grad is not None:
                 log_ratio = a_log_probs - b_log_probs - kl[rows].unsqueeze(-1)
-                a_grad[rows] = _weighted_by_probs(a_log_probs, log_ratio, a_probs) * grad_output[rows]
+                a_grad_chunk = _weighted_by_probs(a_log_probs, log_ratio, a_probs).mul_(grad_output[rows])
+                a_grad[rows] = a_grad_chunk.masked_fill_(undefined_row[rows], 0.0)
             if b_grad is not None:
-                b_grad[rows] = (torch.exp(b_log_probs) - a_probs) * grad_output[rows]
+                b_grad_chunk = (torch.exp(b_log_probs) - a_probs).mul_(grad_output[rows])
+                b_grad[rows] = b_grad_chunk.masked_fill_(undefined_row[rows], 0.0)
 
         if grad_student is not None:
             grad_student = grad_student.view_as(student_logits)
@@ -233,6 +253,7 @@ def vocab_parallel_logprobs(vocab_parallel_logits,
                             tp_group=None,
                             vocab_start_index=None,
                             vocab_end_index=None,
+                            global_vocab_size=None,
                             ignore_index=-100):
     """Log-probabilities of the requested token ids under vocabulary-sharded logits.
 
@@ -241,6 +262,11 @@ def vocab_parallel_logprobs(vocab_parallel_logits,
     teacher's top-k token ids for sparse distillation). Ids equal to ``ignore_index`` yield 0.
     ``index`` must be identical on every tensor-parallel rank. The result has the same shape as
     ``index`` and is in fp32.
+
+    Each call collectively validates the vocabulary shard layout. A caller that calls this
+    repeatedly for a fixed shard can validate it once and pass the resulting ``global_vocab_size``
+    with explicit shard bounds to skip that collective; the value is trusted as-is, as in
+    ``vocab_parallel_cross_entropy``. ``index`` is still range-checked on every call.
     """
     single_index = index.shape == vocab_parallel_logits.shape[:-1]
     if not single_index and index.shape[:-1] != vocab_parallel_logits.shape[:-1]:
@@ -249,9 +275,13 @@ def vocab_parallel_logprobs(vocab_parallel_logits,
     if (vocab_start_index is None) != (vocab_end_index is None):
         raise ValueError("vocab_start_index and vocab_end_index must be provided together")
 
-    vocab_start_index, _, global_vocab_size = _resolve_vocab_metadata(vocab_parallel_logits.shape[-1],
-                                                                      vocab_start_index, vocab_end_index, tp_group,
-                                                                      vocab_parallel_logits.device)
+    if global_vocab_size is not None:
+        if vocab_start_index is None:
+            raise ValueError("global_vocab_size requires explicit vocab_start_index and vocab_end_index")
+    else:
+        vocab_start_index, _, global_vocab_size = _resolve_vocab_metadata(vocab_parallel_logits.shape[-1],
+                                                                          vocab_start_index, vocab_end_index, tp_group,
+                                                                          vocab_parallel_logits.device)
     index = index.to(dtype=torch.long)
     invalid_index = (index != ignore_index) & ((index < 0) | (index >= global_vocab_size))
     if invalid_index.any().item():
