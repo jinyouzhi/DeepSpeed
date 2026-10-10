@@ -22,26 +22,62 @@ def _tp_active(tp_group):
     return tp_group is not None and dist.get_world_size(tp_group) > 1
 
 
-def _default_chunk_rows(num_tokens, local_vocab_size, hidden_size):
+def _default_chunk_rows(num_tokens, global_vocab_size, tp_world_size, hidden_size):
     # Keep each fp32 logits block about the size of the hidden states, which bounds the
-    # extra peak memory independently of the vocabulary size.
-    num_chunks = max(1, math.ceil(local_vocab_size / hidden_size))
+    # extra peak memory independently of the vocabulary size. Derived from the global shard
+    # layout rather than the local shard so that every TP rank issues the same collectives
+    # even when the vocabulary is split unevenly.
+    max_local_vocab_size = math.ceil(global_vocab_size / tp_world_size)
+    num_chunks = max(1, math.ceil(max_local_vocab_size / hidden_size))
     return max(1, math.ceil(num_tokens / num_chunks))
+
+
+_MIXED_ADDMM_UNSUPPORTED = set()
+
+
+def _accumulate_matmul(accumulator, mat1, mat2):
+    """``accumulator += mat1 @ mat2`` with ``accumulator`` kept in its own (fp32) dtype.
+
+    Accumulating chunk gradients in a low-precision buffer drops later contributions once the
+    sum grows, so the gradient would depend on the chunk size.
+    """
+    if mat1.dtype == accumulator.dtype:
+        accumulator.addmm_(mat1, mat2)
+        return
+    device_type = accumulator.device.type
+    if device_type not in _MIXED_ADDMM_UNSUPPORTED:
+        try:
+            torch.addmm(accumulator, mat1, mat2, out_dtype=accumulator.dtype, out=accumulator)
+            return
+        except (RuntimeError, TypeError, NotImplementedError):
+            # Older PyTorch or backends without a mixed-precision GEMM (e.g. CPU).
+            _MIXED_ADDMM_UNSUPPORTED.add(device_type)
+    accumulator.add_(torch.mm(mat1, mat2))
 
 
 class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden, weight, bias, target, tp_group, vocab_start_index, vocab_end_index, ignore_index,
-                grad_scale, chunk_rows):
+                grad_scale, chunk_rows, compute_dtype):
         num_tokens = hidden.shape[0]
         local_vocab_size = weight.shape[0]
         tp_active = _tp_active(tp_group)
+        ctx.input_dtypes = (hidden.dtype, weight.dtype, None if bias is None else bias.dtype)
+
+        # Mirror what autocast would do for ``F.linear``: run the GEMMs in one compute dtype even
+        # when activations and parameters differ (e.g. bf16 activations with fp32 weights).
+        weight_requires_grad = weight.requires_grad
+        bias_requires_grad = bias is not None and bias.requires_grad
+        hidden = hidden.to(compute_dtype)
+        weight = weight.to(compute_dtype)
+        bias = None if bias is None else bias.to(compute_dtype)
 
         loss = torch.zeros(num_tokens, dtype=torch.float32, device=hidden.device)
         grad_hidden = torch.empty_like(hidden)
-        grad_weight = torch.zeros_like(weight) if weight.requires_grad else None
-        grad_bias = torch.zeros_like(bias) if bias is not None and bias.requires_grad else None
+        # Parameter gradients sum over every chunk, so they are accumulated in fp32.
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32) if weight_requires_grad else None
+        grad_bias = torch.zeros_like(bias, dtype=torch.float32) if bias_requires_grad else None
 
         for start in range(0, num_tokens, chunk_rows):
             end = min(start + chunk_rows, num_tokens)
@@ -78,13 +114,13 @@ class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
             grad_logits = probs.mul_(row_scale.unsqueeze(-1))
             grad_logits.scatter_add_(-1, local_target.unsqueeze(-1),
                                      -(in_shard.to(probs.dtype) * grad_scale).unsqueeze(-1))
-            grad_logits = grad_logits.to(hidden.dtype)
+            if grad_bias is not None:
+                grad_bias.add_(grad_logits.sum(dim=0))
+            grad_logits = grad_logits.to(compute_dtype)
 
             torch.matmul(grad_logits, weight, out=grad_hidden[start:end])
             if grad_weight is not None:
-                grad_weight.addmm_(grad_logits.t(), hidden_chunk)
-            if grad_bias is not None:
-                grad_bias.add_(grad_logits.sum(dim=0).to(grad_bias.dtype))
+                _accumulate_matmul(grad_weight, grad_logits.t(), hidden_chunk)
 
         ctx.save_for_backward(grad_hidden, grad_weight, grad_bias)
         ctx.tp_group = tp_group
@@ -94,17 +130,27 @@ class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_output):
         grad_hidden, grad_weight, grad_bias = ctx.saved_tensors
-        # The precomputed gradients assume a unit upstream gradient; rescale only when needed
-        # so the common ``loss.backward()`` path does not allocate another copy.
-        if not torch.equal(grad_output, torch.ones_like(grad_output)):
-            grad_hidden = grad_hidden * grad_output.to(grad_hidden.dtype)
-            grad_weight = grad_weight * grad_output.to(grad_weight.dtype) if grad_weight is not None else None
-            grad_bias = grad_bias * grad_output.to(grad_bias.dtype) if grad_bias is not None else None
+        hidden_dtype, weight_dtype, bias_dtype = ctx.input_dtypes
+        # The precomputed gradients assume a unit upstream gradient. Rescale in fp32 so that a
+        # large loss scale (e.g. 65536 with fp16) does not overflow before it is applied.
+        scale = grad_output.float()
+        unit_scale = torch.equal(scale, torch.ones_like(scale))
+
+        def finalize(grad, dtype):
+            if grad is None:
+                return None
+            if unit_scale:
+                return grad.to(dtype)
+            return (grad.float() * scale).to(dtype)
+
+        grad_hidden = finalize(grad_hidden, hidden_dtype)
+        grad_weight = finalize(grad_weight, weight_dtype)
+        grad_bias = finalize(grad_bias, bias_dtype)
         # Each rank only saw its vocabulary shard, so the input gradient is a partial sum, the
         # same reduction the column-parallel LM head performs in its own backward.
         if _tp_active(ctx.tp_group):
             dist.all_reduce(grad_hidden, op=dist.ReduceOp.SUM, group=ctx.tp_group)
-        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None, None, None
+        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
 
 def vocab_parallel_linear_cross_entropy(hidden,
@@ -158,8 +204,16 @@ def vocab_parallel_linear_cross_entropy(hidden,
     else:
         grad_scale = 1.0
     if chunk_size is None:
-        chunk_size = _default_chunk_rows(num_tokens, weight.shape[0], hidden.shape[1])
+        tp_world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        chunk_size = _default_chunk_rows(num_tokens, global_vocab_size, tp_world_size, hidden.shape[1])
+    device_type = hidden.device.type
+    if torch.is_autocast_enabled(device_type):
+        compute_dtype = torch.get_autocast_dtype(device_type)
+    else:
+        compute_dtype = torch.promote_types(hidden.dtype, weight.dtype)
 
-    loss = _VocabParallelLinearCrossEntropy.apply(hidden, weight, bias, target, tp_group, vocab_start_index,
-                                                  vocab_end_index, ignore_index, grad_scale, chunk_size)
+    with torch.autocast(device_type, enabled=False):
+        loss = _VocabParallelLinearCrossEntropy.apply(hidden, weight, bias, target, tp_group, vocab_start_index,
+                                                      vocab_end_index, ignore_index, grad_scale, chunk_size,
+                                                      compute_dtype)
     return _global_sp_sum(loss, sp_group)

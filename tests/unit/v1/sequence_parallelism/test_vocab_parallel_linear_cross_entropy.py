@@ -79,6 +79,56 @@ def test_frozen_weight_only_produces_hidden_grad():
     assert weight.grad is None
 
 
+def test_fp16_loss_scale_does_not_overflow():
+    # A loss scale of 65536 is not representable in fp16, but the scaled gradients are.
+    hidden = _leaf(torch.ones(4, 1, dtype=torch.float16))
+    weight = _leaf(torch.zeros(2, 1, dtype=torch.float16))
+    bias = _leaf(torch.zeros(2, dtype=torch.float16))
+    target = torch.zeros(4, dtype=torch.long)
+    reference = [_leaf(hidden), _leaf(weight), _leaf(bias)]
+
+    (vocab_parallel_linear_cross_entropy(hidden, weight, target, bias=bias) * 65536).backward()
+    (_reference(*reference, target, "mean") * 65536).backward()
+
+    for got, want in zip((hidden, weight, bias), reference):
+        torch.testing.assert_close(got.grad, want.grad)
+
+
+def test_many_low_precision_chunks_accumulate_parameter_gradients_exactly():
+    # Summing 1024 per-chunk contributions in a bf16 buffer drops most of them, which would make
+    # the gradient depend on chunk_size.
+    hidden = torch.ones(1024, 1, dtype=torch.bfloat16)
+    weight = _leaf(torch.zeros(2, 1, dtype=torch.bfloat16))
+    bias = _leaf(torch.zeros(2, dtype=torch.bfloat16))
+    target = torch.zeros(1024, dtype=torch.long)
+    reference = [_leaf(weight), _leaf(bias)]
+
+    vocab_parallel_linear_cross_entropy(hidden, weight, target, bias=bias, chunk_size=1).backward()
+    _reference(hidden, *reference, target, "mean").backward()
+
+    torch.testing.assert_close(weight.grad, reference[0].grad)
+    torch.testing.assert_close(bias.grad, reference[1].grad)
+
+
+def test_autocast_low_precision_activations_with_fp32_parameters():
+    hidden, weight, bias, target = _inputs()
+    hidden = _leaf(hidden.bfloat16())
+    weight, bias = _leaf(weight), _leaf(bias)
+    reference = [_leaf(hidden), _leaf(weight), _leaf(bias)]
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = vocab_parallel_linear_cross_entropy(hidden, weight, target, bias=bias)
+        logits = F.linear(*reference)
+    expected = F.cross_entropy(logits.float().view(-1, weight.shape[0]), target.view(-1))
+    actual.backward()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    for got, want in zip((hidden, weight, bias), reference):
+        assert got.grad.dtype == want.dtype
+        torch.testing.assert_close(got.grad, want.grad, atol=2e-2, rtol=2e-2)
+
+
 def test_validates_inputs():
     hidden, weight, _, target = _inputs(bias=False)
     with pytest.raises(ValueError, match="Unsupported reduction"):
@@ -96,8 +146,11 @@ def test_validates_inputs():
 class TestVocabParallelLinearCrossEntropyTP(DistributedTest):
     world_size = 2
 
+    # chunk_size=None checks that ranks with different shard sizes still agree on the chunking,
+    # since every chunk issues collectives.
+    @pytest.mark.parametrize("chunk_size", [None, 3])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_uneven_vocab_matches_full_vocab(self, dtype):
+    def test_uneven_vocab_matches_full_vocab(self, dtype, chunk_size):
         device = torch.device(get_accelerator().current_device_name())
         rank = dist.get_rank()
         vocab_size = 17
@@ -117,7 +170,7 @@ class TestVocabParallelLinearCrossEntropyTP(DistributedTest):
                                                      tp_group=dist.get_world_group(),
                                                      vocab_start_index=start,
                                                      vocab_end_index=end,
-                                                     chunk_size=3)
+                                                     chunk_size=chunk_size)
         actual.backward()
         expected.backward()
 
