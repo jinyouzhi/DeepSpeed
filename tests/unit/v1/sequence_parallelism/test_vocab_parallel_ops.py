@@ -185,16 +185,99 @@ def test_detached_teacher_gets_no_gradient():
     assert teacher.grad is None
 
 
-def test_bf16_inputs_return_bf16_gradients():
+def test_bf16_inputs_match_fp32_reference():
     torch.manual_seed(4)
     student = torch.randn(2, 3, 13, dtype=torch.bfloat16, requires_grad=True)
     teacher = torch.randn(2, 3, 13, dtype=torch.bfloat16)
+    reference_student = leaf(student.float())
+    weight = torch.randn(2, 3)
 
     loss = vocab_parallel_kl_div(student, teacher)
-    loss.sum().backward()
+    expected = reference_kl(reference_student, teacher.float(), reverse=False)
+    (loss * weight).sum().backward()
+    (expected * weight).sum().backward()
 
     assert loss.dtype == torch.float32
     assert student.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(student.grad.float(), reference_student.grad, atol=1e-2, rtol=1e-2)
+
+
+def _all_ops(logits, other_logits, index):
+    return {
+        "logprobs": lambda z: vocab_parallel_logprobs(z, index),
+        "entropy": vocab_parallel_entropy,
+        "forward_kl": lambda z: vocab_parallel_kl_div(z, other_logits),
+        "reverse_kl": lambda z: vocab_parallel_kl_div(z, other_logits, reverse=True),
+    }
+
+
+@pytest.mark.parametrize("op", ["logprobs", "entropy", "forward_kl", "reverse_kl"])
+def test_large_common_offset_is_exact(op):
+    # Softmax is shift-invariant, so an offset large enough to swallow the log-normalizer in
+    # fp32 must still reproduce the unshifted result. Logits are multiples of 8 so that adding
+    # 1e8 is exact in fp32.
+    torch.manual_seed(5)
+    base = torch.randint(-2, 3, (2, 3, 7)).float() * 8
+    other = torch.randn(2, 3, 7)
+    index = torch.randint(0, 7, (2, 3))
+    shifted_logits, base_logits = leaf(base + 1e8), leaf(base)
+    weight = torch.randn(2, 3)
+
+    actual = _all_ops(shifted_logits, other, index)[op](shifted_logits)
+    expected = _all_ops(base_logits, other, index)[op](base_logits)
+    (actual * weight).sum().backward()
+    (expected * weight).sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(shifted_logits.grad, base_logits.grad)
+
+
+@pytest.mark.parametrize("op", ["logprobs", "entropy", "forward_kl", "reverse_kl"])
+def test_partially_masked_vocabulary_matches_unmasked_subset(op):
+    # Masking tokens to -inf is the same distribution as dropping them from the vocabulary, so
+    # the reduced vocabulary is an independent oracle for both values and gradients.
+    torch.manual_seed(6)
+    keep = torch.tensor([True, False, True, True, False, True, False])
+    logits = torch.randn(2, 3, 7)
+    other = torch.randn(2, 3, 7)
+    logits[..., ~keep] = float("-inf")
+    other[..., ~keep] = float("-inf")
+    kept_ids = keep.nonzero().squeeze(-1)
+    subset_index = torch.randint(0, len(kept_ids), (2, 3))
+    masked_logits, subset_logits = leaf(logits), leaf(logits[..., keep])
+    weight = torch.randn(2, 3)
+
+    actual = _all_ops(masked_logits, other, kept_ids[subset_index])[op](masked_logits)
+    expected = _all_ops(subset_logits, other[..., keep], subset_index)[op](subset_logits)
+    (actual * weight).sum().backward()
+    (expected * weight).sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(masked_logits.grad[..., keep], subset_logits.grad)
+    torch.testing.assert_close(masked_logits.grad[..., ~keep], torch.zeros_like(masked_logits.grad[..., ~keep]))
+
+
+def test_deterministic_distribution_has_zero_entropy_and_kl():
+    logits = leaf(torch.tensor([[0.0, float("-inf")]]))
+
+    entropy = vocab_parallel_entropy(logits)
+    kl = vocab_parallel_kl_div(logits, logits.detach())
+    (entropy + kl).sum().backward()
+
+    torch.testing.assert_close(entropy, torch.zeros(1))
+    torch.testing.assert_close(kl, torch.zeros(1))
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
+def test_kl_is_infinite_where_target_mass_is_masked():
+    # Forward KL(teacher || student) is genuinely infinite when the teacher puts mass on a token
+    # the student masked out; the zero-probability handling must not hide that.
+    student = torch.tensor([[0.0, float("-inf")]])
+    teacher = torch.tensor([[0.0, 0.0]])
+
+    assert torch.isinf(vocab_parallel_kl_div(student, teacher)).all()
+    torch.testing.assert_close(vocab_parallel_kl_div(student, teacher, reverse=True), torch.tensor([0.6931472]))
 
 
 def test_validates_inputs():

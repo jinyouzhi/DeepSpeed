@@ -43,11 +43,12 @@ def _row_chunks(logits_2d):
         yield slice(start, start + rows_per_chunk)
 
 
-def _logsumexp(logits_2d_list, tp_group):
-    """Global fp32 logsumexp over the sharded vocabulary of each ``[rows, local_vocab]`` tensor.
+def _softmax_stats(logits_2d_list, tp_group):
+    """Global fp32 softmax statistics over the sharded vocabulary of each ``[rows, local_vocab]`` tensor.
 
-    All tensors share one MAX and one SUM all-reduce. Returns a ``[len(logits_2d_list), rows]``
-    tensor.
+    All tensors share one MAX and one SUM all-reduce. Returns ``(global_max, log_sum_exp)``, each
+    ``[len(logits_2d_list), rows]``. They are kept separate rather than summed into a single
+    logsumexp because adding a small normalizer to a large max rounds it away in fp32.
     """
     num_rows = logits_2d_list[0].shape[0]
     device = logits_2d_list[0].device
@@ -62,11 +63,17 @@ def _logsumexp(logits_2d_list, tp_group):
         for rows in _row_chunks(logits):
             sum_exp[i, rows] = torch.exp(logits[rows].float() - global_max[i, rows].unsqueeze(-1)).sum(dim=-1)
     _all_reduce(sum_exp, dist.ReduceOp.SUM, tp_group)
-    return global_max + torch.log(sum_exp)
+    return global_max, torch.log(sum_exp)
 
 
-def _log_softmax(logits, lse):
-    return logits.float() - lse.unsqueeze(-1)
+def _log_softmax(logits, global_max, log_sum_exp):
+    return torch.sub(logits.float(), global_max.unsqueeze(-1)).sub_(log_sum_exp.unsqueeze(-1))
+
+
+def _weighted_by_probs(probs, values):
+    # Tokens with zero probability (e.g. masked to -inf) contribute nothing, even where
+    # ``values`` is infinite; without this, ``0 * -inf`` turns the whole row into NaN.
+    return (probs * values).masked_fill_(probs == 0, 0.0)
 
 
 def _flatten(vocab_parallel_logits):
@@ -80,26 +87,27 @@ class _VocabParallelLogProbs(torch.autograd.Function):
         logits = _flatten(vocab_parallel_logits)
         index = index.reshape(logits.shape[0], index.shape[-1])
         local_vocab_size = logits.shape[-1]
-        lse = _logsumexp([logits], tp_group)[0]
+        global_max, log_sum_exp = (stat[0] for stat in _softmax_stats([logits], tp_group))
 
         valid_index = index != ignore_index
         local_index = index - vocab_start_index
         index_in_partition = valid_index & (local_index >= 0) & (local_index < local_vocab_size)
         local_index = local_index.clamp(min=0, max=local_vocab_size - 1)
-        index_logits = logits.gather(-1, local_index).float()
-        index_logits = torch.where(index_in_partition, index_logits, torch.zeros_like(index_logits))
-        _all_reduce(index_logits, dist.ReduceOp.SUM, tp_group)
+        shifted_logits = logits.gather(-1, local_index).float() - global_max.unsqueeze(-1)
+        shifted_logits = torch.where(index_in_partition, shifted_logits, torch.zeros_like(shifted_logits))
+        _all_reduce(shifted_logits, dist.ReduceOp.SUM, tp_group)
 
-        logprobs = index_logits - lse.unsqueeze(-1)
+        logprobs = shifted_logits - log_sum_exp.unsqueeze(-1)
         logprobs = torch.where(valid_index, logprobs, torch.zeros_like(logprobs))
 
-        ctx.save_for_backward(vocab_parallel_logits, lse, local_index, index_in_partition, valid_index)
+        ctx.save_for_backward(vocab_parallel_logits, global_max, log_sum_exp, local_index, index_in_partition,
+                              valid_index)
         return logprobs
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        vocab_parallel_logits, lse, local_index, index_in_partition, valid_index = ctx.saved_tensors
+        vocab_parallel_logits, global_max, log_sum_exp, local_index, index_in_partition, valid_index = ctx.saved_tensors
         logits = _flatten(vocab_parallel_logits)
         grad_output = grad_output.reshape(valid_index.shape).float() * valid_index
         index_grad = grad_output * index_in_partition
@@ -108,7 +116,7 @@ class _VocabParallelLogProbs(torch.autograd.Function):
         # d logp(i) / d z_j = onehot(i)_j - softmax(z)_j, summed over the requested indices.
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
-            grad_chunk = torch.exp(_log_softmax(logits[rows], lse[rows])) * -grad_sum[rows]
+            grad_chunk = torch.exp(_log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])) * -grad_sum[rows]
             grad_chunk.scatter_add_(-1, local_index[rows], index_grad[rows])
             grad_logits[rows] = grad_chunk
         return grad_logits.view_as(vocab_parallel_logits), None, None, None, None
@@ -119,29 +127,29 @@ class _VocabParallelEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits, tp_group):
         logits = _flatten(vocab_parallel_logits)
-        lse = _logsumexp([logits], tp_group)[0]
-        entropy = torch.empty_like(lse)
+        global_max, log_sum_exp = (stat[0] for stat in _softmax_stats([logits], tp_group))
+        entropy = torch.empty_like(global_max)
         for rows in _row_chunks(logits):
-            log_probs = _log_softmax(logits[rows], lse[rows])
-            entropy[rows] = -(torch.exp(log_probs) * log_probs).sum(dim=-1)
+            log_probs = _log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])
+            entropy[rows] = -_weighted_by_probs(torch.exp(log_probs), log_probs).sum(dim=-1)
         _all_reduce(entropy, dist.ReduceOp.SUM, tp_group)
 
-        ctx.save_for_backward(vocab_parallel_logits, lse, entropy)
+        ctx.save_for_backward(vocab_parallel_logits, global_max, log_sum_exp, entropy)
         # Callers may mask the result in place, so it must not alias the saved entropy.
         return entropy.clone()
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        vocab_parallel_logits, lse, entropy = ctx.saved_tensors
+        vocab_parallel_logits, global_max, log_sum_exp, entropy = ctx.saved_tensors
         logits = _flatten(vocab_parallel_logits)
         grad_output = grad_output.reshape(-1, 1).float()
 
         # dH / dz_j = -p_j * (log p_j + H)
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
-            log_probs = _log_softmax(logits[rows], lse[rows])
-            grad_chunk = torch.exp(log_probs) * (log_probs + entropy[rows].unsqueeze(-1))
+            log_probs = _log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])
+            grad_chunk = _weighted_by_probs(torch.exp(log_probs), log_probs + entropy[rows].unsqueeze(-1))
             grad_logits[rows] = grad_chunk * -grad_output[rows]
         return grad_logits.view_as(vocab_parallel_logits), None
 
@@ -159,25 +167,25 @@ class _VocabParallelKLDiv(torch.autograd.Function):
     def forward(ctx, student_logits, teacher_logits, reverse, tp_group):
         student = _flatten(student_logits)
         teacher = _flatten(teacher_logits)
-        lse = _logsumexp([student, teacher], tp_group)
+        global_max, log_sum_exp = _softmax_stats([student, teacher], tp_group)
 
-        kl = torch.empty_like(lse[0])
+        kl = torch.empty_like(global_max[0])
         for rows in _row_chunks(student):
-            student_log_probs = _log_softmax(student[rows], lse[0, rows])
-            teacher_log_probs = _log_softmax(teacher[rows], lse[1, rows])
+            student_log_probs = _log_softmax(student[rows], global_max[0, rows], log_sum_exp[0, rows])
+            teacher_log_probs = _log_softmax(teacher[rows], global_max[1, rows], log_sum_exp[1, rows])
             a_log_probs, b_log_probs = _order_kl_arguments(student_log_probs, teacher_log_probs, reverse)
-            kl[rows] = (torch.exp(a_log_probs) * (a_log_probs - b_log_probs)).sum(dim=-1)
+            kl[rows] = _weighted_by_probs(torch.exp(a_log_probs), a_log_probs - b_log_probs).sum(dim=-1)
         _all_reduce(kl, dist.ReduceOp.SUM, tp_group)
 
         ctx.reverse = reverse
-        ctx.save_for_backward(student_logits, teacher_logits, lse, kl)
+        ctx.save_for_backward(student_logits, teacher_logits, global_max, log_sum_exp, kl)
         # Callers may mask the result in place, so it must not alias the saved KL.
         return kl.clone()
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        student_logits, teacher_logits, lse, kl = ctx.saved_tensors
+        student_logits, teacher_logits, global_max, log_sum_exp, kl = ctx.saved_tensors
         student = _flatten(student_logits)
         teacher = _flatten(teacher_logits)
         grad_output = grad_output.reshape(-1, 1).float()
@@ -187,13 +195,14 @@ class _VocabParallelKLDiv(torch.autograd.Function):
         a_grad, b_grad = _order_kl_arguments(grad_student, grad_teacher, ctx.reverse)
 
         for rows in _row_chunks(student):
-            student_log_probs = _log_softmax(student[rows], lse[0, rows])
-            teacher_log_probs = _log_softmax(teacher[rows], lse[1, rows])
+            student_log_probs = _log_softmax(student[rows], global_max[0, rows], log_sum_exp[0, rows])
+            teacher_log_probs = _log_softmax(teacher[rows], global_max[1, rows], log_sum_exp[1, rows])
             a_log_probs, b_log_probs = _order_kl_arguments(student_log_probs, teacher_log_probs, ctx.reverse)
             a_probs = torch.exp(a_log_probs)
             # For KL(A || B): dKL/dz_A = p_A * (log p_A - log p_B - KL) and dKL/dz_B = p_B - p_A.
             if a_grad is not None:
-                a_grad[rows] = a_probs * (a_log_probs - b_log_probs - kl[rows].unsqueeze(-1)) * grad_output[rows]
+                log_ratio = a_log_probs - b_log_probs - kl[rows].unsqueeze(-1)
+                a_grad[rows] = _weighted_by_probs(a_probs, log_ratio) * grad_output[rows]
             if b_grad is not None:
                 b_grad[rows] = (torch.exp(b_log_probs) - a_probs) * grad_output[rows]
 
