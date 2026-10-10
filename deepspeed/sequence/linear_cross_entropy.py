@@ -22,6 +22,11 @@ def _tp_active(tp_group):
     return tp_group is not None and dist.get_world_size(tp_group) > 1
 
 
+# Every chunk reads and writes the whole fp32 weight-gradient buffer. Below about this many
+# rows per chunk, that traffic outweighs the chunk's GEMMs and the loss becomes bandwidth-bound.
+_MIN_CHUNK_ROWS = 1024
+
+
 def _default_chunk_rows(num_tokens, global_vocab_size, tp_world_size, hidden_size):
     # Keep each fp32 logits block about the size of the hidden states, which bounds the
     # extra peak memory independently of the vocabulary size. Derived from the global shard
@@ -29,7 +34,8 @@ def _default_chunk_rows(num_tokens, global_vocab_size, tp_world_size, hidden_siz
     # even when the vocabulary is split unevenly.
     max_local_vocab_size = math.ceil(global_vocab_size / tp_world_size)
     num_chunks = max(1, math.ceil(max_local_vocab_size / hidden_size))
-    return max(1, math.ceil(num_tokens / num_chunks))
+    chunk_rows = max(math.ceil(num_tokens / num_chunks), _MIN_CHUNK_ROWS)
+    return max(1, min(chunk_rows, num_tokens))
 
 
 _MIXED_ADDMM_UNSUPPORTED = set()
@@ -172,7 +178,7 @@ def vocab_parallel_linear_cross_entropy(hidden,
 
     Gradients are computed during forward, so only a single first-order backward is
     supported. ``chunk_size`` sets the number of tokens per chunk; by default each fp32
-    logits chunk is about as large as ``hidden``.
+    logits chunk is about as large as ``hidden``, with at least 1024 tokens per chunk.
     """
     if reduction not in ("sum", "mean"):
         raise ValueError(f"Unsupported reduction: {reduction}")

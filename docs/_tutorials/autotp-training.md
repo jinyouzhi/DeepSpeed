@@ -297,7 +297,8 @@ gradient over the TP group in backward, as the column-parallel head would. It
 supports `sum` and `mean` reductions and computes gradients during forward, so
 it allows only first-order backward. `chunk_size` (tokens per chunk) trades
 peak memory for speed; by default each FP32 logits chunk is about the size of
-the hidden states. This API is not yet wired into the HuggingFace forward or
+the hidden states, with at least 1024 tokens per chunk to amortize the FP32
+weight-gradient accumulation. This API is not yet wired into the HuggingFace forward or
 the `vocab_parallel_lm_head` configuration.
 
 
