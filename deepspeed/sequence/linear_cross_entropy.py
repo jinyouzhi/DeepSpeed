@@ -56,8 +56,8 @@ def _accumulate_matmul(accumulator, mat1, mat2):
     accumulator.add_(torch.mm(mat1, mat2))
 
 
-def _fp32_logits(hidden, weight, offset=None):
-    """``hidden @ weight.T + offset`` in fp32, with ``offset`` broadcast over the logits.
+def _fp32_logits(hidden, weight, bias=None, row_offset=None):
+    """``hidden @ weight.T + bias + row_offset`` in fp32; ``row_offset`` has shape ``[tokens, 1]``.
 
     Producing fp32 straight from the GEMM, with the offset applied in its epilogue, saves
     separate upcast and add passes over the ``[tokens, vocab]`` block.
@@ -65,15 +65,19 @@ def _fp32_logits(hidden, weight, offset=None):
     device_type = hidden.device.type
     if hidden.dtype != torch.float32 and device_type not in _MIXED_GEMM_UNSUPPORTED:
         try:
-            if offset is None:
+            if bias is not None:
+                logits = torch.addmm(bias.float(), hidden, weight.t(), out_dtype=torch.float32)
+            elif row_offset is not None:
+                return torch.addmm(row_offset, hidden, weight.t(), out_dtype=torch.float32)
+            else:
                 return torch.mm(hidden, weight.t(), out_dtype=torch.float32)
-            return torch.addmm(offset, hidden, weight.t(), out_dtype=torch.float32)
+            return logits if row_offset is None else logits.add_(row_offset)
         except _MIXED_GEMM_ERRORS:
             _MIXED_GEMM_UNSUPPORTED.add(device_type)
-    logits = (hidden @ weight.t()).float()
-    if offset is not None:
-        logits.add_(offset)
-    return logits
+    # Add the bias inside the GEMM as F.linear does, so a large product that the bias cancels
+    # does not overflow a low-precision output first.
+    logits = torch.nn.functional.linear(hidden, weight, bias).float()
+    return logits if row_offset is None else logits.add_(row_offset)
 
 
 class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
@@ -88,7 +92,7 @@ class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
         # when activations and parameters differ (e.g. bf16 activations with fp32 weights).
         hidden_compute = hidden.to(compute_dtype)
         weight_compute = weight.to(compute_dtype)
-        bias_fp32 = None if bias is None else bias.float()
+        bias_compute = None if bias is None else bias.to(compute_dtype)
 
         valid = target != ignore_index
         in_shard = valid & (target >= vocab_start_index) & (target < vocab_end_index)
@@ -99,7 +103,7 @@ class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
         row_sum_exp = torch.empty_like(loss)
         for start in range(0, num_tokens, chunk_rows):
             end = min(start + chunk_rows, num_tokens)
-            logits = _fp32_logits(hidden_compute[start:end], weight_compute, bias_fp32)
+            logits = _fp32_logits(hidden_compute[start:end], weight_compute, bias_compute)
 
             chunk_max = logits.amax(dim=-1)
             if tp_active:
@@ -149,10 +153,8 @@ class _VocabParallelLinearCrossEntropy(torch.autograd.Function):
         for start in range(0, local_vocab_size, ctx.block_cols):
             end = min(start + ctx.block_cols, local_vocab_size)
             weight_block = weight[start:end].to(compute_dtype)
-            if bias is None:
-                logits = _fp32_logits(hidden_compute, weight_block, neg_row_max)
-            else:
-                logits = _fp32_logits(hidden_compute, weight_block, bias[start:end].float()).add_(neg_row_max)
+            bias_block = None if bias is None else bias[start:end].to(compute_dtype)
+            logits = _fp32_logits(hidden_compute, weight_block, bias_block, neg_row_max)
 
             # d(loss) / d(logits) = (softmax - onehot) * upstream gradient, one block at a time.
             grad_logits = logits.exp_().mul_(prob_scale)

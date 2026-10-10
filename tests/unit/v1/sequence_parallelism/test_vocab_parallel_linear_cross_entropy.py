@@ -96,6 +96,24 @@ def test_fp16_loss_scale_does_not_overflow():
         torch.testing.assert_close(got.grad, want.grad)
 
 
+def test_fp16_product_cancelled_by_bias_stays_finite():
+    # The product 256 * 256 overflows fp16 but the bias brings the logits back to 32, as in F.linear.
+    hidden = _leaf(torch.tensor([[256.0]], dtype=torch.float16))
+    weight = _leaf(torch.tensor([[256.0], [256.0]], dtype=torch.float16))
+    bias = _leaf(torch.tensor([-65504.0, -65504.0], dtype=torch.float16))
+    target = torch.tensor([0])
+    args = [_leaf(hidden), _leaf(weight), _leaf(bias)]
+
+    actual = vocab_parallel_linear_cross_entropy(*args[:2], target, bias=args[2])
+    expected = F.cross_entropy(F.linear(hidden, weight, bias).float(), target)
+    actual.backward()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected)
+    for got, want in zip(args, (hidden, weight, bias)):
+        torch.testing.assert_close(got.grad, want.grad)
+
+
 def test_many_low_precision_chunks_accumulate_parameter_gradients_exactly():
     # The weight gradient sums 1024 per-token contributions; it must not depend on chunk_size.
     hidden = torch.ones(1024, 1, dtype=torch.bfloat16)
