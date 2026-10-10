@@ -280,6 +280,16 @@ def test_kl_is_infinite_where_target_mass_is_masked():
     torch.testing.assert_close(vocab_parallel_kl_div(student, teacher, reverse=True), torch.tensor([0.6931472]))
 
 
+def test_kl_stays_infinite_when_target_probability_underflows():
+    # exp(-200) underflows to 0 in fp32, but the teacher still has support on a token the
+    # student masked out, so KL(teacher || student) must remain infinite rather than 0 or NaN.
+    student = torch.tensor([[0.0, float("-inf")]])
+    teacher = torch.tensor([[0.0, -200.0]])
+
+    assert torch.isposinf(vocab_parallel_kl_div(student, teacher)).all()
+    assert torch.isposinf(vocab_parallel_kl_div(teacher, student, reverse=True)).all()
+
+
 def test_validates_inputs():
     logits = torch.randn(2, 3, 11)
     with pytest.raises(ValueError, match="non-vocabulary dimensions"):

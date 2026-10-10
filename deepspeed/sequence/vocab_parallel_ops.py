@@ -70,10 +70,21 @@ def _log_softmax(logits, global_max, log_sum_exp):
     return torch.sub(logits.float(), global_max.unsqueeze(-1)).sub_(log_sum_exp.unsqueeze(-1))
 
 
-def _weighted_by_probs(probs, values):
-    # Tokens with zero probability (e.g. masked to -inf) contribute nothing, even where
-    # ``values`` is infinite; without this, ``0 * -inf`` turns the whole row into NaN.
-    return (probs * values).masked_fill_(probs == 0, 0.0)
+def _weighted_by_probs(log_probs, values, probs=None):
+    # Tokens masked to -inf contribute nothing, even where ``values`` is infinite; without this,
+    # ``0 * -inf`` turns the whole row into NaN. The test is on the log-probability, not the
+    # probability, because a finite log-probability may still underflow to 0 after ``exp``.
+    if probs is None:
+        probs = torch.exp(log_probs)
+    return (probs * values).masked_fill_(log_probs == float("-inf"), 0.0)
+
+
+def _kl_terms(a_log_probs, b_log_probs):
+    terms = _weighted_by_probs(a_log_probs, a_log_probs - b_log_probs)
+    # Where A has support that B masks out, KL(A || B) is infinite even if p_A underflowed to 0,
+    # which would otherwise give 0 * inf = NaN.
+    support_mismatch = (b_log_probs == float("-inf")) & (a_log_probs != float("-inf"))
+    return terms.masked_fill_(support_mismatch, float("inf"))
 
 
 def _flatten(vocab_parallel_logits):
@@ -131,7 +142,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         entropy = torch.empty_like(global_max)
         for rows in _row_chunks(logits):
             log_probs = _log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])
-            entropy[rows] = -_weighted_by_probs(torch.exp(log_probs), log_probs).sum(dim=-1)
+            entropy[rows] = -_weighted_by_probs(log_probs, log_probs).sum(dim=-1)
         _all_reduce(entropy, dist.ReduceOp.SUM, tp_group)
 
         ctx.save_for_backward(vocab_parallel_logits, global_max, log_sum_exp, entropy)
@@ -149,7 +160,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
             log_probs = _log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])
-            grad_chunk = _weighted_by_probs(torch.exp(log_probs), log_probs + entropy[rows].unsqueeze(-1))
+            grad_chunk = _weighted_by_probs(log_probs, log_probs + entropy[rows].unsqueeze(-1))
             grad_logits[rows] = grad_chunk * -grad_output[rows]
         return grad_logits.view_as(vocab_parallel_logits), None
 
@@ -174,7 +185,7 @@ class _VocabParallelKLDiv(torch.autograd.Function):
             student_log_probs = _log_softmax(student[rows], global_max[0, rows], log_sum_exp[0, rows])
             teacher_log_probs = _log_softmax(teacher[rows], global_max[1, rows], log_sum_exp[1, rows])
             a_log_probs, b_log_probs = _order_kl_arguments(student_log_probs, teacher_log_probs, reverse)
-            kl[rows] = _weighted_by_probs(torch.exp(a_log_probs), a_log_probs - b_log_probs).sum(dim=-1)
+            kl[rows] = _kl_terms(a_log_probs, b_log_probs).sum(dim=-1)
         _all_reduce(kl, dist.ReduceOp.SUM, tp_group)
 
         ctx.reverse = reverse
@@ -202,7 +213,7 @@ class _VocabParallelKLDiv(torch.autograd.Function):
             # For KL(A || B): dKL/dz_A = p_A * (log p_A - log p_B - KL) and dKL/dz_B = p_B - p_A.
             if a_grad is not None:
                 log_ratio = a_log_probs - b_log_probs - kl[rows].unsqueeze(-1)
-                a_grad[rows] = _weighted_by_probs(a_probs, log_ratio) * grad_output[rows]
+                a_grad[rows] = _weighted_by_probs(a_log_probs, log_ratio, a_probs) * grad_output[rows]
             if b_grad is not None:
                 b_grad[rows] = (torch.exp(b_log_probs) - a_probs) * grad_output[rows]
 
