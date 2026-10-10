@@ -275,8 +275,9 @@ this loss is the sole aggregation over a manually constructed TP x SP mesh.
 
 The vocabulary-parallel loss above still materializes `[tokens, vocab / tp]`
 logits on every rank. `vocab_parallel_linear_cross_entropy` fuses the LM-head
-projection into the loss and processes tokens in chunks, so only one
-`[chunk, vocab / tp]` block is alive at a time:
+projection into the loss. Forward processes tokens in chunks and keeps only
+per-token softmax statistics; backward recomputes the logits one vocabulary block
+at a time. Only one block of logits is alive at a time:
 
 ```python
 from deepspeed.sequence.linear_cross_entropy import vocab_parallel_linear_cross_entropy
@@ -294,11 +295,10 @@ loss = vocab_parallel_linear_cross_entropy(hidden,
 
 The call replaces both `head(hidden)` and the loss: it all-reduces the hidden
 gradient over the TP group in backward, as the column-parallel head would. It
-supports `sum` and `mean` reductions and computes gradients during forward, so
-it allows only first-order backward. `chunk_size` (tokens per chunk) trades
-peak memory for speed; by default each FP32 logits chunk is about the size of
-the hidden states, with at least 1024 tokens per chunk to amortize the FP32
-weight-gradient accumulation. This API is not yet wired into the HuggingFace forward or
+supports `none`, `sum` and `mean` reductions. `chunk_size` (tokens per forward
+chunk; backward uses vocabulary blocks of the same size) trades peak memory for
+speed; by default each FP32 logits block is about the size of the hidden states.
+This API is not yet wired into the HuggingFace forward or
 the `vocab_parallel_lm_head` configuration.
 
 

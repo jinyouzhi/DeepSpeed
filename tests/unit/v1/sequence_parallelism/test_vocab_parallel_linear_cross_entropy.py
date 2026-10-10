@@ -32,7 +32,7 @@ def _reference(hidden, weight, bias, target, reduction):
     return F.cross_entropy(logits.view(-1, weight.shape[0]), target.view(-1), reduction=reduction)
 
 
-@pytest.mark.parametrize("reduction", ["sum", "mean"])
+@pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
 @pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.parametrize("chunk_size", [None, 1, 3])
 def test_matches_linear_then_cross_entropy(reduction, use_bias, chunk_size):
@@ -41,6 +41,8 @@ def test_matches_linear_then_cross_entropy(reduction, use_bias, chunk_size):
     args = [_leaf(hidden), _leaf(weight), _leaf(bias)]
 
     expected = _reference(*ref_args, target, reduction)
+    if reduction == "none":
+        expected = expected.view_as(target)
     actual = vocab_parallel_linear_cross_entropy(args[0],
                                                  args[1],
                                                  target,
@@ -49,9 +51,9 @@ def test_matches_linear_then_cross_entropy(reduction, use_bias, chunk_size):
                                                  chunk_size=chunk_size)
     torch.testing.assert_close(actual, expected)
 
-    # A non-unit upstream gradient must rescale the gradients precomputed in forward.
-    (actual * 3).backward()
-    (expected * 3).backward()
+    upstream = torch.rand_like(expected) + 0.5
+    actual.backward(upstream)
+    expected.backward(upstream)
     for got, want in zip(args, ref_args):
         if want is not None:
             torch.testing.assert_close(got.grad, want.grad)
@@ -95,8 +97,7 @@ def test_fp16_loss_scale_does_not_overflow():
 
 
 def test_many_low_precision_chunks_accumulate_parameter_gradients_exactly():
-    # Summing 1024 per-chunk contributions in a bf16 buffer drops most of them, which would make
-    # the gradient depend on chunk_size.
+    # The weight gradient sums 1024 per-token contributions; it must not depend on chunk_size.
     hidden = torch.ones(1024, 1, dtype=torch.bfloat16)
     weight = _leaf(torch.zeros(2, 1, dtype=torch.bfloat16))
     bias = _leaf(torch.zeros(2, dtype=torch.bfloat16))
@@ -108,6 +109,21 @@ def test_many_low_precision_chunks_accumulate_parameter_gradients_exactly():
 
     torch.testing.assert_close(weight.grad, reference[0].grad)
     torch.testing.assert_close(bias.grad, reference[1].grad)
+
+
+def test_hidden_gradient_sums_many_vocab_entries_exactly():
+    # Each token's hidden gradient sums 1023 contributions of 1/1024. A bf16 running sum stalls
+    # near 0.5, so the result must not depend on how the vocabulary is split into blocks.
+    hidden = torch.zeros(1024, 1, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.ones(1024, 1, dtype=torch.bfloat16)
+    weight[0] = 0
+    target = torch.zeros(1024, dtype=torch.long)
+    reference = _leaf(hidden)
+
+    vocab_parallel_linear_cross_entropy(hidden, weight, target, reduction="sum", chunk_size=1).backward()
+    _reference(reference, weight, None, target, "sum").backward()
+
+    torch.testing.assert_close(hidden.grad, reference.grad)
 
 
 def test_autocast_low_precision_activations_with_fp32_parameters():
@@ -132,7 +148,7 @@ def test_autocast_low_precision_activations_with_fp32_parameters():
 def test_validates_inputs():
     hidden, weight, _, target = _inputs(bias=False)
     with pytest.raises(ValueError, match="Unsupported reduction"):
-        vocab_parallel_linear_cross_entropy(hidden, weight, target, reduction="none")
+        vocab_parallel_linear_cross_entropy(hidden, weight, target, reduction="avg")
     with pytest.raises(ValueError, match="matching non-hidden dimensions"):
         vocab_parallel_linear_cross_entropy(hidden, weight, target[:, :-1])
     with pytest.raises(ValueError, match="local_vocab, hidden"):
