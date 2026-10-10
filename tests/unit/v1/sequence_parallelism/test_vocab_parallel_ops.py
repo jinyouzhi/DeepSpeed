@@ -290,6 +290,19 @@ def test_kl_stays_infinite_when_target_probability_underflows():
     assert torch.isposinf(vocab_parallel_kl_div(teacher, student, reverse=True)).all()
 
 
+@pytest.mark.parametrize("top_k", [None, 2])
+def test_ignored_fully_masked_row_gets_zero_gradient(top_k):
+    # Padding rows are often fully masked and ignored; their constant 0 output must not
+    # inject NaN gradients into the shared logits tensor.
+    logits = leaf(torch.tensor([[1.0, 2.0, 0.5], [float("-inf")] * 3]))
+    index = torch.tensor([0, -100]) if top_k is None else torch.tensor([[0, 2], [-100, -100]])
+
+    vocab_parallel_logprobs(logits, index).sum().backward()
+
+    torch.testing.assert_close(logits.grad[1], torch.zeros(3))
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_validates_inputs():
     logits = torch.randn(2, 3, 11)
     with pytest.raises(ValueError, match="non-vocabulary dimensions"):

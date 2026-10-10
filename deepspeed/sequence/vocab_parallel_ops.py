@@ -123,11 +123,15 @@ class _VocabParallelLogProbs(torch.autograd.Function):
         grad_output = grad_output.reshape(valid_index.shape).float() * valid_index
         index_grad = grad_output * index_in_partition
         grad_sum = grad_output.sum(dim=-1, keepdim=True)
+        # A row whose indices are all ignored has a constant output, so its gradient is exactly 0.
+        # Multiplying its softmax by 0 is not enough: a fully masked row's softmax is NaN.
+        ignored_row = ~valid_index.any(dim=-1, keepdim=True)
 
         # d logp(i) / d z_j = onehot(i)_j - softmax(z)_j, summed over the requested indices.
         grad_logits = torch.empty_like(logits)
         for rows in _row_chunks(logits):
             grad_chunk = torch.exp(_log_softmax(logits[rows], global_max[rows], log_sum_exp[rows])) * -grad_sum[rows]
+            grad_chunk.masked_fill_(ignored_row[rows], 0.0)
             grad_chunk.scatter_add_(-1, local_index[rows], index_grad[rows])
             grad_logits[rows] = grad_chunk
         return grad_logits.view_as(vocab_parallel_logits), None, None, None, None
@@ -235,7 +239,8 @@ def vocab_parallel_logprobs(vocab_parallel_logits,
     ``index`` either matches ``vocab_parallel_logits.shape[:-1]`` (one token per position, e.g.
     sampled tokens for policy-gradient losses) or adds a trailing ``k`` dimension (e.g. a
     teacher's top-k token ids for sparse distillation). Ids equal to ``ignore_index`` yield 0.
-    The result has the same shape as ``index`` and is in fp32.
+    ``index`` must be identical on every tensor-parallel rank. The result has the same shape as
+    ``index`` and is in fp32.
     """
     single_index = index.shape == vocab_parallel_logits.shape[:-1]
     if not single_index and index.shape[:-1] != vocab_parallel_logits.shape[:-1]:
@@ -270,7 +275,9 @@ def vocab_parallel_kl_div(student_logits, teacher_logits, reverse=False, tp_grou
     Returns the forward ``KL(teacher || student)`` by default, or the reverse
     ``KL(student || teacher)`` (mode-seeking, the usual on-policy distillation objective) when
     ``reverse=True``. Apply any temperature to both logits first. Gradients flow to the teacher
-    logits too unless they are detached.
+    logits too unless they are detached. As with ``torch.nn.functional.kl_div`` in fp32, terms whose
+    probability underflows to 0 contribute nothing unless the other distribution masks that token
+    to ``-inf``, in which case the KL is ``+inf``.
     """
     if student_logits.shape != teacher_logits.shape:
         raise ValueError("student_logits and teacher_logits must have the same shape and vocabulary sharding")
