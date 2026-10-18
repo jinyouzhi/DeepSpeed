@@ -427,13 +427,30 @@ def execute_transfers(requests: Sequence[TransferRequest],
                 payload = arena[:count]
             sent += count * element_size
             p2p.append(('send', payload, peer))
+        # oneCCL (xccl) hangs on a group call whose first operation is a receive; send-first works everywhere.
+        p2p.sort(key=lambda entry: entry[0] != 'send')
         operations = [
             dist.P2POp(dist.irecv if direction == 'recv' else dist.isend,
                        buffer,
                        dist.get_global_rank(group, peer) if group is not None else peer,
                        group=group) for direction, buffer, peer in p2p
         ]
-        if operations:
+        if operations and device.type not in ('cuda', 'cpu'):
+            # oneCCL group calls drop stream dependencies and can corrupt data when one group spans many
+            # peers. Exchange with one peer distance at a time (send to rank + d, receive from rank - d) so
+            # every group call has at most one send and one receive, with the device idle around it.
+            get_accelerator().current_stream().synchronize()
+            for distance in range(1, world_size):
+                pair = [
+                    operation for operation, (direction, _, peer) in zip(operations, p2p)
+                    if (peer - rank) % world_size == (distance if direction == 'send' else world_size - distance)
+                ]
+                if not pair:
+                    continue
+                for handle in dist.batch_isend_irecv(pair):
+                    handle.wait()
+                get_accelerator().synchronize()
+        elif operations:
             for handle in dist.batch_isend_irecv(operations):
                 block_stream = getattr(handle, 'block_current_stream', None)
                 if device.type == 'cuda' and callable(block_stream):
