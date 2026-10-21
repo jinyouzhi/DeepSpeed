@@ -614,6 +614,18 @@ them with a target descriptor through `plan_transfer` into shard-to-shard copies
 ranks are EP-local ranks of the respective placements; the plan is not executed, and ZeRO
 and EDP storage must still be normalized before its offsets apply.
 
+`deepspeed/checkpoint/zero_affine.py` takes the first step for live training storage. It
+describes, in global ranks, where ZeRO keeps each element of a parameter: the low-precision
+copy (`zero_param_storage_affine_map`: replicas under ZeRO-0/1/2, `ds_tensor` partitions
+under ZeRO-3, padding excluded), and the fp32 master copy with its optimizer states
+(`zero_optimizer_storage_affine_maps`: ZeRO-1/2 fragments gathered from each rank's
+`_hp_mapping`, which may cut a parameter mid-row, and the ZeRO-3 fp32 partition). The
+matching `*_storage_shard` accessors return the flat views of ZeRO's own buffers, so a
+plan's writes land in the optimizer. Offloaded states, MiCS and hpZ have no map yet.
+Both parameter storage accessors reject quantized ZeRO-3 storage (`ds_quant_scale`):
+its encoded values and separate quantization scales cannot be treated as ordinary
+parameter elements.
+
 ---
 
 ## 9. Staging
