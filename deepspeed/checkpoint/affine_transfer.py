@@ -25,6 +25,7 @@ called: it walks every element of the parameter by design. Coverage is argued ov
 and ``_covers_exactly`` states what that argument does and does not buy.
 """
 
+import bisect
 import json
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -219,6 +220,53 @@ def _product(shape: Sequence[int]) -> int:
     return count
 
 
+class _BoxIndex:
+    """Find which of a fixed list of boxes overlap a query without testing every one of them.
+
+    Validation compares pieces pairwise, and a live map holds hundreds of pieces per side, so testing
+    every pair dominated planning. A stored box overlaps the query only if, on the first axis, it
+    starts before the query ends and ends after the query starts. No stored box is longer on that axis
+    than the longest one, so it also starts at most that length before the query. A bisect on the
+    sorted first coordinates narrows the list, and the exact intersection decides.
+
+    Results are positions into the list, in increasing order, so callers see overlaps in the same
+    order as a full scan and report the same first failure.
+    """
+
+    def __init__(self, boxes: Sequence[LogicalBox]):
+        self._boxes = list(boxes)
+        self._scalar = not boxes or not boxes[0].origin
+        if self._scalar:
+            return
+        self._order = sorted(range(len(boxes)), key=lambda position: boxes[position].origin[0])
+        self._starts = [boxes[position].origin[0] for position in self._order]
+        self._reach = max(box.extent[0] for box in boxes)
+
+    def _near(self, query: LogicalBox) -> List[int]:
+        if self._scalar:
+            return list(range(len(self._boxes)))
+        low = bisect.bisect_left(self._starts, query.origin[0] - self._reach + 1)
+        high = bisect.bisect_left(self._starts, query.origin[0] + query.extent[0])
+        return sorted(self._order[low:high])
+
+    def overlaps(self, query: LogicalBox) -> List[Tuple[int, LogicalBox]]:
+        """Each stored box that shares elements with ``query``: its position and the shared box."""
+        found = []
+        for position in self._near(query):
+            shared = query.intersection(self._boxes[position])
+            if not shared.is_empty:
+                found.append((position, shared))
+        return found
+
+    def first_overlapping_pair(self) -> Optional[Tuple[int, int]]:
+        """The first two stored boxes that overlap, in full-scan order, or None if all are disjoint."""
+        for index, box in enumerate(self._boxes):
+            for position in self._near(box):
+                if position > index and not box.intersection(self._boxes[position]).is_empty:
+                    return index, position
+        return None
+
+
 def _row_major_strides(shape: Sequence[int]) -> Tuple[int, ...]:
     strides = [1] * len(shape)
     for axis in range(len(shape) - 2, -1, -1):
@@ -349,13 +397,12 @@ def _shards_tile(frames: List[_Frame], side: str, limits: PlanBudget) -> None:
         if len(held)**2 > limits.max_pair_checks:
             raise AffineTransferError(f'{side}: rank {rank} holds {len(held)} pieces, over the budget for '
                                       'address checks')
-        volume = 0
-        for index, frame in enumerate(held):
-            volume += frame.local.volume
-            for other in held[index + 1:]:
-                if not frame.local.intersection(other.local).is_empty:
-                    raise InvalidMapError(f'{side}: rank {rank} pieces {frame.box!r} and {other.box!r} both '
-                                          'occupy part of the same shard addresses')
+        overlap = _BoxIndex([frame.local for frame in held]).first_overlapping_pair()
+        if overlap is not None:
+            frame, other = held[overlap[0]], held[overlap[1]]
+            raise InvalidMapError(f'{side}: rank {rank} pieces {frame.box!r} and {other.box!r} both '
+                                  'occupy part of the same shard addresses')
+        volume = sum(frame.local.volume for frame in held)
         if volume != held[0].shard_numel:
             raise InvalidMapError(f'{side}: rank {rank} pieces account for {volume} of its {held[0].shard_numel} '
                                   'shard elements')
@@ -369,16 +416,15 @@ def _validate_holders(frames: List[_Frame], side: str, limits: PlanBudget) -> No
     for frame in frames:
         by_rank.setdefault(frame.rank, []).append(frame)
 
-    for rank, held in by_rank.items():
-        for index, frame in enumerate(held):
-            for other in held[index + 1:]:
-                if not frame.box.intersection(other.box).is_empty:
-                    raise InvalidMapError(f'{side}: rank {rank} holds overlapping logical pieces')
+    index_by_rank = {rank: _BoxIndex([frame.box for frame in held]) for rank, held in by_rank.items()}
+    for rank, index in index_by_rank.items():
+        if index.first_overlapping_pair() is not None:
+            raise InvalidMapError(f'{side}: rank {rank} holds overlapping logical pieces')
 
     for frame in frames:
         actual = set()
-        for rank, held in by_rank.items():
-            covered = sum(frame.box.intersection(other.box).volume for other in held)
+        for rank, index in index_by_rank.items():
+            covered = sum(shared.volume for _, shared in index.overlaps(frame.box))
             if covered:
                 actual.add(rank)
             if rank in frame.locations and covered != frame.box.volume:
@@ -408,13 +454,14 @@ def _sources(frames: List[_Frame], limits: PlanBudget) -> List[Tuple[LogicalBox,
     if len(regions)**2 > limits.max_pair_checks:
         raise AffineTransferError(f'{len(regions)} source regions would take {len(regions)**2} checks, over '
                                   f'max_pair_checks {limits.max_pair_checks}')
+    overlap = _BoxIndex(regions).first_overlapping_pair()
+    if overlap is not None:
+        box, other = regions[overlap[0]], regions[overlap[1]]
+        raise UnsupportedLayoutError(f'source: replicas of {box!r} and {other!r} have different '
+                                     'piece boundaries')
     grouped = []
-    for index, box in enumerate(regions):
+    for box in regions:
         holders = by_box[box]
-        for other in regions[index + 1:]:
-            if not box.intersection(other).is_empty:
-                raise UnsupportedLayoutError(f'source: replicas of {box!r} and {other!r} have different '
-                                             'piece boundaries')
         grouped.append((box, tuple(sorted(holders, key=lambda frame: frame.rank))))
     return grouped
 
@@ -506,13 +553,12 @@ def plan_transfer(target_map: ParamAffineMap,
         raise AffineTransferError(f'{pair_checks} candidate pairs exceeds max_pair_checks '
                                   f'{budget.max_pair_checks}')
 
+    index_of_sources = _BoxIndex([box for box, _ in sources])
     pending: List[Tuple[_Frame, LogicalBox, Tuple[_Frame, ...]]] = []
     for frame in sorted(targets, key=lambda frame: (frame.rank, frame.box.origin, frame.box.extent)):
         filled: List[LogicalBox] = []
-        for box, holders in sources:
-            shared = frame.box.intersection(box)
-            if shared.is_empty:
-                continue
+        for position, shared in index_of_sources.overlaps(frame.box):
+            holders = sources[position][1]
             filled.append(shared)
             pending.append((frame, shared, holders))
         if not _covers_exactly(frame.box, filled):
