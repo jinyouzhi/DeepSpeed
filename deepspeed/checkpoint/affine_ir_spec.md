@@ -613,6 +613,8 @@ expert parameters, and `AutoEPMoELayer.plan_expert_transfer(target_placement)` c
 them with a target descriptor through `plan_transfer` into shard-to-shard copies. Plan
 ranks are EP-local ranks of the respective placements; the plan is not executed, and ZeRO
 and EDP storage must still be normalized before its offsets apply.
+`AutoEPMoELayer.expert_storage_affine_maps()` removes that step by describing the storage
+itself (§10).
 
 `deepspeed/checkpoint/zero_affine.py` takes the first step for live training storage. It
 describes, in global ranks, where ZeRO keeps each element of a parameter: the low-precision
