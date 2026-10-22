@@ -7,10 +7,13 @@ module measures how long those paths take on the machine at hand. Spec-sheet ban
 usable substitute: what a transfer sees depends on the communication library, on how many links
 share a switch or root port, and on fixed per-message costs, none of which a datasheet states.
 
-Only raw samples are recorded. Fitting latency and bandwidth, modeling contention, and choosing
-plans from the result belong to the planner's policy layer.
+``calibrate_links`` records raw samples; ``fit_links`` summarizes them per path as a fixed cost
+plus a bandwidth, with the fit error alongside so a consumer can see where that form does not
+hold. Modeling contention beyond the measured patterns, and choosing plans, belong to the
+planner's policy layer.
 """
 
+import statistics
 import time
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -21,7 +24,7 @@ from deepspeed.accelerator import get_accelerator
 
 from .affine_transfer_analysis import LOCAL, default_path_of
 
-__all__ = ['CALIBRATION_SCHEMA', 'DEFAULT_SIZES', 'calibrate_links']
+__all__ = ['CALIBRATION_SCHEMA', 'DEFAULT_SIZES', 'calibrate_links', 'fit_links']
 
 CALIBRATION_SCHEMA = 1
 
@@ -154,4 +157,72 @@ def calibrate_links(sizes: Sequence[int] = DEFAULT_SIZES,
         'local': local,
         'peer': peer,
         'concurrent': concurrent,
+    }
+
+
+def _fit(points: List[tuple]) -> Dict:
+    """Fit ``seconds = alpha + bytes / bandwidth`` to (bytes, seconds) points.
+
+    Residuals are weighted by 1/seconds, so the fit minimizes relative error. Unweighted least
+    squares would let the largest messages decide everything and leave alpha meaningless.
+    """
+    weights = [1.0 / (seconds * seconds) for _, seconds in points]
+    total = sum(weights)
+    mean_x = sum(w * x for w, (x, _) in zip(weights, points)) / total
+    mean_y = sum(w * y for w, (_, y) in zip(weights, points)) / total
+    spread = sum(w * (x - mean_x)**2 for w, (x, _) in zip(weights, points))
+    if spread == 0:
+        raise ValueError('a fit needs at least two distinct message sizes')
+    slope = sum(w * (x - mean_x) * (y - mean_y) for w, (x, y) in zip(weights, points)) / spread
+    alpha = mean_y - slope * mean_x
+    predicted = [alpha + slope * x for x, _ in points]
+    return {
+        'alpha_seconds': alpha,
+        # A non-positive slope means time did not grow with size, so no bandwidth is implied.
+        'bytes_per_second': 1.0 / slope if slope > 0 else None,
+        'max_relative_error': max(abs(p - y) / y for p, (_, y) in zip(predicted, points)),
+        'sizes': sorted({x
+                         for x, _ in points}),
+    }
+
+
+def _fit_groups(groups: Dict[str, Dict[int, List[float]]]) -> Dict[str, Dict]:
+    fits = {}
+    for path, seconds_by_size in groups.items():
+        points = [(size, statistics.median(seconds)) for size, seconds in sorted(seconds_by_size.items())]
+        fits[path] = _fit(points)
+    return fits
+
+
+def fit_links(calibration: Dict) -> Dict:
+    """Summarize a ``calibrate_links`` result as ``alpha + bytes / bandwidth`` per path.
+
+    Samples are pooled by path label and by size, and the median at each size is fitted, so a
+    single slow repeat does not move the line. Returns ``{'schema', 'local', 'peer',
+    'concurrent'}``; each of the last three maps a path label to ``alpha_seconds``,
+    ``bytes_per_second``, ``max_relative_error`` and the ``sizes`` fitted. ``concurrent`` is
+    fitted from what each process saw while every process was sending, i.e. per-link cost under
+    the all-to-all-shift sharing pattern, not in isolation.
+    """
+    if calibration.get('schema') != CALIBRATION_SCHEMA:
+        raise ValueError(f'unsupported calibration schema {calibration.get("schema")!r}')
+
+    local: Dict[str, Dict[int, List[float]]] = {}
+    for sample in calibration['local']:
+        local.setdefault(sample['path'], {}).setdefault(sample['bytes'], []).extend(sample['seconds'])
+
+    peer: Dict[str, Dict[int, List[float]]] = {}
+    for sample in calibration['peer']:
+        peer.setdefault(sample['path'], {}).setdefault(sample['bytes'], []).extend(sample['seconds'])
+
+    concurrent: Dict[str, Dict[int, List[float]]] = {}
+    for sample in calibration['concurrent']:
+        for path, seconds in zip(sample['paths'], sample['seconds_by_process']):
+            concurrent.setdefault(path, {}).setdefault(sample['bytes'], []).extend(seconds)
+
+    return {
+        'schema': CALIBRATION_SCHEMA,
+        'local': _fit_groups(local),
+        'peer': _fit_groups(peer),
+        'concurrent': _fit_groups(concurrent),
     }
