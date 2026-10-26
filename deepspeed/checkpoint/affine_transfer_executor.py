@@ -316,8 +316,13 @@ def execute_transfers(requests: Sequence[TransferRequest],
     import deepspeed.comm as dist
 
     initialized = dist.is_initialized()
-    rank = dist.get_rank(group=group) if initialized else 0
-    world_size = dist.get_world_size(group=group) if initialized else 1
+    if initialized and group is not None and callable(getattr(group, 'rank', None)):
+        # Ask the group itself: a weight-update group built outside the default world (as trainer <-> engine
+        # groups are) maps every member's default-world rank 0 to group rank 0 in torch's bookkeeping.
+        rank, world_size = group.rank(), group.size()
+    else:
+        rank = dist.get_rank(group=group) if initialized else 0
+        world_size = dist.get_world_size(group=group) if initialized else 1
     device = torch.device(get_accelerator().current_device_name()) if initialized else torch.device('cpu')
     # Without a process group every buffer is on the host, whatever the accelerator is.
     stream_ordered = initialized and not get_accelerator().is_synchronized_device()
