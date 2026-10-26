@@ -423,6 +423,64 @@ def test_a_flat_shard_holds_a_dense_box_of_a_matrix():
         assert torch.equal(shard, target.extract(full, rank))
 
 
+def _zero_cut_mid_row():
+    # ZeRO cuts the flattened (4, 8) parameter at element 13, inside row 1.
+    return ParamAffineMap(logical_shape=(4, 8),
+                          shard_shapes={
+                              0: (13, ),
+                              1: (19, )
+                          },
+                          pieces_by_rank={
+                              0: [
+                                  AffinePiece((1, 8), 0, (8, 1), 0, (8, 1), [0]),
+                                  AffinePiece((1, 5), 8, (8, 1), 8, (5, 1), [0]),
+                              ],
+                              1: [
+                                  AffinePiece((1, 3), 13, (8, 1), 0, (3, 1), [1]),
+                                  AffinePiece((2, 8), 16, (8, 1), 3, (8, 1), [1]),
+                              ],
+                          }), {
+                              0: lambda full: full.reshape(-1)[:13],
+                              1: lambda full: full.reshape(-1)[13:]
+                          }
+
+
+def _flat_and_matrix_shards():
+    # One rank keeps rows [0, 2) flat while the other keeps rows [2, 4) as a matrix.
+    return ParamAffineMap(logical_shape=(4, 8),
+                          shard_shapes={
+                              0: (16, ),
+                              1: (2, 8)
+                          },
+                          pieces_by_rank={
+                              0: [AffinePiece((2, 8), 0, (8, 1), 0, (8, 1), [0])],
+                              1: [AffinePiece((2, 8), 16, (8, 1), 0, (8, 1), [1])],
+                          }), {
+                              0: lambda full: full[:2].reshape(-1),
+                              1: lambda full: full[2:]
+                          }
+
+
+@pytest.mark.parametrize('make_target', [_zero_cut_mid_row, _flat_and_matrix_shards],
+                         ids=['flat_target_cut_mid_row', 'flat_and_matrix_shards'])
+def test_flat_storage_is_written_as_well_as_read(make_target):
+    """Restoring into ZeRO storage writes flat shards; one map may also mix flat and matrix shards."""
+    full = torch.arange(32.).reshape(4, 8)
+    source = contiguous_split_map((4, 8), [3, 5], 1)
+    target, expected = make_target()
+
+    plan = plan_transfer(target, source)
+
+    written = {rank: torch.full(shape, float('nan')) for rank, shape in target.shard_shapes.items()}
+    for segment in plan.segments:
+        read = torch.as_strided(source.extract(full, segment.source_rank), segment.shape, segment.source_strides,
+                                segment.source_offset)
+        torch.as_strided(written[segment.target_rank], segment.shape, segment.target_strides,
+                         segment.target_offset).copy_(read)
+    for rank, shard in written.items():
+        assert torch.equal(shard, expected[rank](full))
+
+
 @pytest.mark.parametrize('shard_shape, dest_strides', [((32, ), (8, 1)), ((2, 2, 4), (4, 1))],
                          ids=['flat_but_not_dense', 'other_rank'])
 def test_a_shard_without_axis_correspondence_is_refused(shard_shape, dest_strides):

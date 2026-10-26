@@ -366,7 +366,8 @@ class ThreeLinears(torch.nn.Module):
 
 def _all_shards(shard):
     gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, shard.detach().cpu())
+    # .clone() drops the view's offset into the flat buffer; on CPU .cpu() alone would pickle it.
+    dist.all_gather_object(gathered, shard.detach().cpu().clone())
     return dict(enumerate(gathered))
 
 
