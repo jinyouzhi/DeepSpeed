@@ -800,7 +800,10 @@ When this field is omitted or `null`, an HF `embedding_rowwise` plan may enable 
 vocabulary sharding automatically, returning rank-local rather than full-vocabulary
 logits. Set it to `false` to opt out. Unsupported implicit sharding, including the
 DeepCompile `autotp` pass, keeps the tied embedding/head replicated and logs a warning.
-Explicit `true` requests fail instead of silently downgrading. See
+Explicit `true` requests fail instead of silently downgrading. Under the pass a
+vocabulary-parallel head is rejected as well, because the distributed loss it
+installs has host-side checks that cannot run under `fullgraph=True` (see
+[AutoTP options](#autotp-options)). See
 [Vocabulary-parallel LM Loss](/tutorials/autotp-training/#vocabulary-parallel-lm-loss)
 for supported embedding semantics and compiler limitations.
 
@@ -1734,6 +1737,22 @@ and the pass reuses the same tensor-parallel group.
     }
 }
 ```
+
+The pass rewrites only layers whose collective the injected module already performs:
+
+| Injected layer | Handled |
+| --- | --- |
+| `LinearLayer`, `SubParamLinearLayer` (column parallel) | yes |
+| `LinearAllreduce`, `SubParamLinearAllreduce` (row parallel) | yes |
+| column-parallel head with `gather_output` | yes; the gather stays inline because it changes the activation width |
+| `LmHeadLinearAllreduce` | no; inference-only path, rejected |
+| `VocabParallelLinear` (vocabulary-parallel head) | no; its distributed loss is not graph-capturable |
+| `VocabParallelEmbedding`, `HiddenParallelEmbedding` | no; no graph-level collective position |
+| any layer with `tp_overlap_comm: true` | no |
+
+A rejected layer aborts `engine.compile()` with an error naming the module and the config knob
+to turn off, and leaves every layer's module-level collectives untouched, so running eagerly
+after catching the error is safe.
 
 <i>**passes**</i>: [array of strings]
 

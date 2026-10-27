@@ -236,8 +236,13 @@ With `compile.deepcompile: true` and `"autotp"` in `compile.passes`, automatic
 sharding from `embedding_rowwise` is disabled: the tied embedding and output
 head remain replicated with gathered logits, while the other supported layers
 are still tensor-parallel. An explicit `vocab_parallel_lm_head: true` request
-is not downgraded; vocabulary-parallel embeddings are not supported by the
-AutoTP compile pass.
+is not downgraded. The pass has no graph-level collective position for a
+vocabulary-parallel embedding, and the vocabulary-parallel head installs a
+distributed causal-LM loss whose host-side checks cannot run under
+`fullgraph=True`, so `engine.compile()` fails with an error naming
+`tensor_parallel.vocab_parallel_lm_head`. Set the option to `false` (gathered
+logits) to keep the `autotp` pass; the module-level collectives are left
+untouched, so catching that error and running eagerly is safe.
 
 This option requires a model with a writable `loss_function` hook. The head's
 vocabulary must also produce a nonempty shard on every TP rank; smaller

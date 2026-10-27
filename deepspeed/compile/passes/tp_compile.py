@@ -10,8 +10,9 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 import torch
 from torch.fx import Graph, GraphModule, Node
 
-from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, LmHeadLinearAllreduce,
-                                            SubParamLinearAllreduce, SubParamLinearLayer, TensorParallel_Layer)
+from deepspeed.module_inject.layers import (HiddenParallelEmbedding, LinearAllreduce, LinearLayer,
+                                            LmHeadLinearAllreduce, SubParamLinearAllreduce, SubParamLinearLayer,
+                                            TensorParallel_Layer, VocabParallelEmbedding, VocabParallelLinear)
 
 from ..custom_ops import tp_collectives  # noqa: F401
 
@@ -26,7 +27,37 @@ COLUMN_PARALLEL_LAYERS = (LinearLayer, SubParamLinearLayer)
 ROW_PARALLEL_LAYERS = (LinearAllreduce, SubParamLinearAllreduce)
 # LmHeadLinearAllreduce subclasses LinearAllreduce but slices its own input and reduces with
 # inference_all_reduce rather than going through RowParallel, so the pass cannot stand in for it.
-UNSUPPORTED_LAYERS = (LmHeadLinearAllreduce, )
+# VocabParallelLinear subclasses LinearLayer and its own input scatter could be re-emitted, but it
+# returns vocabulary-sharded logits that feed the model's distributed cross entropy, whose host-side
+# checks and Python-level backend selection cannot be captured under fullgraph=True.
+UNSUPPORTED_LAYERS = (LmHeadLinearAllreduce, VocabParallelLinear)
+
+# Keyed by the injected layer type so the failure names the config knob that produced it instead of
+# only the module. A layer without an entry keeps the generic advice.
+_UNSUPPORTED_LAYER_HINTS = {
+    LmHeadLinearAllreduce:
+    ("It slices its own input and reduces with inference_all_reduce instead of RowParallel. Remove "
+     "'autotp' from compile.passes."),
+    VocabParallelLinear:
+    ("Its vocabulary-sharded logits need the distributed causal-LM loss, which is not graph-capturable. "
+     "Set tensor_parallel.vocab_parallel_lm_head to false (gathered logits), or remove 'autotp' from "
+     "compile.passes."),
+    VocabParallelEmbedding:
+    ("Vocabulary-parallel embeddings have no graph-level collective position the pass can use. Set "
+     "tensor_parallel.vocab_parallel_lm_head to false, or remove 'autotp' from compile.passes."),
+    HiddenParallelEmbedding:
+    ("An embedding that shares a row-parallel output head's shard cannot be rewritten as a graph "
+     "collective. Use a colwise_gather_output head, or remove 'autotp' from compile.passes."),
+}
+
+
+def _unsupported_layer_error(name: str, layer_type: type) -> NotImplementedError:
+    """Explain why a TP layer cannot be rewritten, naming the config knob that produced it."""
+    hint = _UNSUPPORTED_LAYER_HINTS.get(layer_type, "Drop 'autotp' from the DeepCompile passes for this model.")
+    return NotImplementedError(
+        f"AutoTP compile pass cannot rewrite '{name}' ({layer_type.__name__}), and leaving it on the "
+        f"module-level path under a full graph would silently drop its backward collective. {hint}")
+
 
 _MATMUL_TARGETS = {
     torch.matmul,
@@ -65,10 +96,7 @@ def defer_collectives_to_compiler(model) -> None:
         layer_type = type(module)
         is_column_parallel = _is_column_parallel(layer_type)
         if not (is_column_parallel or _is_row_parallel(layer_type)):
-            raise NotImplementedError(
-                f"AutoTP compile pass cannot rewrite '{name}' ({layer_type.__name__}), and leaving it on the "
-                "module-level path under a full graph would silently drop its backward collective. Drop "
-                "'autotp' from the DeepCompile passes for this model.")
+            raise _unsupported_layer_error(name, layer_type)
         if layer_type.tp_overlap_comm:
             raise NotImplementedError("AutoTP compile pass does not support tp_overlap_comm. Set "
                                       "'tp_overlap_comm': false to emit the collectives into the graph.")

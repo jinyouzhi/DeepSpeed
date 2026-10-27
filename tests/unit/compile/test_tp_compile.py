@@ -81,6 +81,23 @@ class TiedEmbeddingMLPModel(torch.nn.Module):
         return self.lm_head(hidden)
 
 
+class UntiedVocabHeadModel(torch.nn.Module):
+    """Vocabulary-parallel output head with no tied embedding, so only the head is sharded."""
+
+    def __init__(self, vocab_size=37):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(vocab_size, HIDDEN_DIM)
+        self.layers = torch.nn.ModuleList([MLPBlock()])
+        self.lm_head = torch.nn.Linear(HIDDEN_DIM, vocab_size, bias=False)
+        self.loss_function = torch.nn.functional.cross_entropy
+
+    def forward(self, input_ids):
+        hidden = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return self.lm_head(hidden)
+
+
 def build_config(tp_size, use_compile_pass, gather_output_head=False):
     head_spec = {
         "patterns": ["(.*\\.)?head\\.weight$"],
@@ -542,6 +559,27 @@ def _make_tp_layer(cls):
     return layer
 
 
+@pytest.mark.parametrize("layer_name, expected_hint", [
+    ("VocabParallelLinear", "vocab_parallel_lm_head"),
+    ("VocabParallelEmbedding", "vocab_parallel_lm_head"),
+    ("HiddenParallelEmbedding", "colwise_gather_output"),
+])
+def test_rejected_layer_error_names_the_config_knob(layer_name, expected_hint):
+    """A rejected TP layer must report the config knob that produced it, not only its class name."""
+    from deepspeed.compile.passes.tp_compile import defer_collectives_to_compiler
+    import deepspeed.module_inject.layers as layers
+
+    model = torch.nn.Module()
+    model.column = _make_tp_layer(layers.LinearLayer)
+    model.rejected = _make_tp_layer(getattr(layers, layer_name))
+
+    with pytest.raises(NotImplementedError, match=expected_hint):
+        defer_collectives_to_compiler(model)
+
+    # The rejection is all-or-nothing, so the supported layer ahead of it must not stay deferred.
+    assert not model.column.defer_collectives_to_compiler
+
+
 def test_defer_collectives_is_all_or_nothing():
     """A rejected layer must leave every other layer's collectives untouched.
 
@@ -601,6 +639,21 @@ class TestAutoTPCompileRejectsUnsupportedCombinations(DistributedTest):
         config["compile"]["passes"] = ["autotp", "z1"]
         engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
         with pytest.raises(NotImplementedError, match="cannot yet be combined"):
+            engine.compile()
+
+    @pytest.mark.world_size(2)
+    def test_vocab_parallel_head_raises_before_dynamo(self):
+        """The untied vocabulary-parallel head is rejected at compile, not by a Dynamo graph break.
+
+        Its forward installs a distributed causal-LM loss whose host-side checks cannot run under
+        fullgraph=True. Without the rejection the head passes the layer filter and the failure
+        surfaces as an opaque Dynamo error from inside the loss.
+        """
+        model = UntiedVocabHeadModel()
+        config = build_config(tp_size=2, use_compile_pass=True)
+        config["tensor_parallel"]["vocab_parallel_lm_head"] = True
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+        with pytest.raises(NotImplementedError, match="vocab_parallel_lm_head"):
             engine.compile()
 
 
