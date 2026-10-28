@@ -21,6 +21,7 @@ from deepspeed.accelerator import get_accelerator
 
 
 def _worker(rank, port, tmp):
+    # Using torch.distributed directly is intended: RL frameworks build this group outside deepspeed.comm.
     import torch.distributed as tdist
     from torch.distributed.distributed_c10d import PrefixStore, _new_process_group_helper, _world
 
