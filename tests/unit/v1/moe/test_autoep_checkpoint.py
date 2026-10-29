@@ -692,6 +692,20 @@ class TestAutoEPExpertStorageMaps(DistributedTest):
             autotp_maps = autotp_storage_affine_maps(engine.module)
             with pytest.raises(NotImplementedError, match="AutoEP expert optimizer states"):
                 autotp_storage_affine_maps(engine.module, optimizer_states=True)
+            if zero_stage == 3:
+                # Only rank 0 refuses its expert storage; its tensor-parallel peers must raise too
+                # instead of waiting for it in the collective, and other groups are unaffected.
+                from deepspeed.utils import groups
+                storage = _autoep_modules(engine)[0][1].experts.w2.ds_tensor
+                if rank == 0:
+                    storage.ds_quant_scale = torch.ones(1)
+                if 0 in dist.get_all_ranks_from_group(groups.get_tensor_model_parallel_group()):
+                    with pytest.raises((NotImplementedError, RuntimeError), match="storage"):
+                        autotp_storage_affine_maps(engine.module)
+                else:
+                    autotp_storage_affine_maps(engine.module)
+                if rank == 0:
+                    del storage.ds_quant_scale
 
         for index, (module_name, module) in enumerate(_autoep_modules(engine)):
             storage_maps = module.expert_storage_affine_maps()

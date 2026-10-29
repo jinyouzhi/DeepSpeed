@@ -291,27 +291,43 @@ def autotp_storage_affine_maps(model, optimizer_states=False, tp_group=None):
     # different experts, so a replicated layout would describe one EP rank's packed tensor as the
     # whole parameter. The AutoEP layer knows its placement and describes their storage instead.
     from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+    autoep_layers = [module for module in model.modules() if isinstance(module, AutoEPMoELayer)]
+    if optimizer_states and autoep_layers:
+        raise NotImplementedError('AutoEP expert optimizer states have no affine storage map.')
+
+    # Each EP rank holds different experts, so one rank may refuse its expert storage (for example
+    # a quantized partition) while its tensor-parallel peers accept theirs. The refusal travels with
+    # the all-gather so that every peer raises instead of waiting in it.
+    local_error = None
     expert_maps = {}
-    for module in model.modules():
-        if not isinstance(module, AutoEPMoELayer):
-            continue
-        if optimizer_states:
-            raise NotImplementedError('AutoEP expert optimizer states have no affine storage map.')
-        for weight_name, storage_map in module.expert_storage_affine_maps().items():
-            expert_maps[id(getattr(module.experts, weight_name))] = storage_map
+    try:
+        for module in autoep_layers:
+            for weight_name, storage_map in module.expert_storage_affine_maps().items():
+                expert_maps[id(getattr(module.experts, weight_name))] = storage_map
+    except (NotImplementedError, ValueError, RuntimeError) as error:
+        local_error = error
 
     named_params = []
     for name, param in model.named_parameters():
         if id(param) not in expert_maps:
             named_params.append((name, param))
     params = [param for _, param in named_params]
-    if optimizer_states:
-        storage_maps = zero_optimizer_storage_affine_maps(params)
+    if local_error is not None:
+        local = {'error': f'{type(local_error).__name__}: {local_error}'}
     else:
-        storage_maps = [zero_param_storage_affine_map(param) for param in params]
-    local = [None if storage_map is None else storage_map.to_dict() for storage_map in storage_maps]
+        if optimizer_states:
+            storage_maps = zero_optimizer_storage_affine_maps(params)
+        else:
+            storage_maps = [zero_param_storage_affine_map(param) for param in params]
+        local = [None if storage_map is None else storage_map.to_dict() for storage_map in storage_maps]
     gathered = [None] * tp_world_size
     dist.all_gather_object(gathered, local, group=tp_group)
+    if local_error is not None:
+        raise local_error
+    for tp_rank, rank_maps in enumerate(gathered):
+        if isinstance(rank_maps, dict):
+            raise RuntimeError(f"Tensor-parallel rank {tp_rank} cannot describe its AutoEP expert storage: "
+                               f"{rank_maps['error']}")
 
     maps = {}
     for position, (name, param) in enumerate(named_params):
