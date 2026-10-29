@@ -823,7 +823,8 @@ class AutoEPMoELayer(nn.Module):
         Map ranks are global ranks and the logical shape is the parameter's own shape. Each shard is
         a rank's flat storage: the packed ``[local_experts, ...]`` tensor under ZeRO-0/1/2, where all
         expert-data-parallel replicas are listed as holders, or the rank's ZeRO-3 partition
-        ``ds_tensor`` without its trailing padding. Optimizer state is not described.
+        ``ds_tensor`` without its trailing padding. Optimizer state is not described. Quantized and
+        NVMe-offloaded ZeRO-3 storage is not supported.
         """
         if self.folding_group_handles is not None and self.folding_group_handles.spec.etp_size > 1:
             raise NotImplementedError("Expert storage maps do not describe expert tensor-parallel shards yet.")
@@ -833,6 +834,10 @@ class AutoEPMoELayer(nn.Module):
             self._live_expert_affine_map(name, placement)
         storage_group = self._expert_storage_group(params)
         partitioned = hasattr(params["w1"], "ds_id")
+        if partitioned:
+            from deepspeed.checkpoint.zero_affine import _check_zero3_param_storage
+            for param in params.values():
+                _check_zero3_param_storage(param)
 
         # The EDP group of each EP rank's global rank holds that EP rank's packed tensor. Every rank
         # built all EDP groups, so the table answers this without assuming a rank layout.

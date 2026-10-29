@@ -727,6 +727,25 @@ class TestAutoEPExpertStorageMaps(DistributedTest):
                     torch.testing.assert_close(targets[ep_rank], full[experts].reshape(-1), rtol=0, atol=0)
         engine.destroy()
 
+    @pytest.mark.parametrize("encoding", ["quantized", "nvme"])
+    def test_zero3_storage_maps_refuse_storage_without_plain_elements(self, encoding):
+        from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+        config = make_autoep_integration_config(zero_stage=3, ep_size=2)
+        config["optimizer"]["params"]["torch_adam"] = True
+        engine, _, _, _ = deepspeed.initialize(model=MockMoETransformer(), config=config)
+        _, module = next(iter(_autoep_modules(engine)))
+        # Stand in for the runtime markers: an encoded partition carries a scale, and a partition
+        # swapped out to NVMe is only a placeholder, so element offsets into either are meaningless.
+        storage = module.experts.w2.ds_tensor
+        if encoding == "quantized":
+            storage.ds_quant_scale = torch.ones(1)
+        else:
+            storage.final_location = OffloadDeviceEnum.nvme
+        with pytest.raises(NotImplementedError, match="ZeRO-3 parameter storage has no affine storage map"):
+            module.expert_storage_affine_maps()
+        engine.destroy()
+
 
 class TestAutoEPZero3UniversalCheckpoint4GPU(DistributedTest):
     world_size = 4
