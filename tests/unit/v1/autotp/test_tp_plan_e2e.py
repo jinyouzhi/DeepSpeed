@@ -331,6 +331,9 @@ def test_layer_without_explicit_mode_follows_set_autotp_mode(built_by):
         layer = LinearAllreduce(linear, mp_group=None, name="proj", **kwargs).to(device)
         layer.requires_grad_(True)
         set_autotp_mode(training=True)
+        if built_by == "default_autotp":
+            # set_tensor_parallel_config, called after this switch, routes by the AutoTP's mode.
+            assert autotp.training_mode
         layer(torch.randn(2, 8, device=device)).sum().backward()
     finally:
         set_autotp_mode(training=previous_mode)

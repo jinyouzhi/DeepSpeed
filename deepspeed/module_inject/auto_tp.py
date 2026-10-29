@@ -233,17 +233,13 @@ class AutoTP():
         # shards by its own model's kv-head / grain values and keeps its own training mode.
         # None is kept in the layers so they keep following set_autotp_mode, as before.
         self.tp_meta = AutoTPMeta.from_model_config(model_config, tp_grain_size, training=training_mode)
-        # Construction-time routing needs a concrete mode, so None resolves to the current
-        # process-wide AutoTP mode here only.
-        if training_mode is None:
-            training_mode = is_autotp_training_mode()
         self.linear_layer_setting = linear_layer_setting
         self.orig_layer_impl = orig_layer_impl
         self.linear_policies = None
         self.conv_linear_layer = False
         self.partition_config = partition_config
         self.vocab_parallel_lm_head = vocab_parallel_lm_head
-        self.training_mode = training_mode
+        self._training_mode = training_mode
         self._vocab_parallel_lm_head_candidate = None
         # A tied vocab-parallel lm_head shares its embed_tokens/wte weight with a
         # VocabParallelEmbedding built from the same shard, so the generic embedding-slicing
@@ -396,6 +392,14 @@ class AutoTP():
         assert len(policy_list), "AutoTP not supported for model. Please use kernel injection since container policy for model exists." \
         if AutoTP.kernel_supported(module_list) else "Not able to determine model policy automatically. Please provide policy."
         return policy_list
+
+    @property
+    def training_mode(self):
+        # None follows the process-wide AutoTP mode at the time of use, so a set_autotp_mode call
+        # between construction and set_tensor_parallel_config still routes to the training group.
+        if self._training_mode is None:
+            return is_autotp_training_mode()
+        return self._training_mode
 
     def set_tensor_parallel_config(self, mp_size, mp_group):
 
