@@ -735,7 +735,7 @@ stores, so a plan built from it reads directly from runtime storage:
   what a rollout engine consumes. When a training engine is the target, these
   parameters are themselves derived from its fp32 master weights, and its next
   optimizer step overwrites them. The fp32 master weights and optimizer states
-  are not described yet. Expert tensor parallelism
+  are not described. Expert tensor parallelism
   (``expert_tensor_parallel_size > 1``) raises ``NotImplementedError``.
 - ``autotp_storage_affine_maps(model)`` in ``deepspeed.checkpoint.zero_affine``
   describes the experts of an AutoEP layer with this method, so a model-wide

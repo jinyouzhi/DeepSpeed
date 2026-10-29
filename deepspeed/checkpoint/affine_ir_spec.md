@@ -711,13 +711,13 @@ storage that the optimizer step updates and the next forward reads, such as `par
 a ZeRO-3 `ds_tensor`. A write through the map therefore lasts. The runtime also keeps
 *derived* copies that it regenerates from authoritative ones: the gathered copy of a
 persistent ZeRO-3 parameter, ZeRO++ hpZ secondary partitions, fused inference weights.
-A fresh derived copy holds the same values and could serve as a source, but writing it
-alone is lost or leaves the authoritative copy stale, so maps leave it out and shard
-accessors refuse it (`zero_param_storage_shard` on a gathered parameter). Whether a copy is
+Writing a derived copy alone is lost or leaves the authoritative copy stale, so maps leave
+it out and shard accessors refuse it (`zero_param_storage_shard` on a gathered parameter).
+Whether a copy is
 authoritative depends on the side: the low-precision parameters are authoritative for a
 rollout engine, but on a training engine they are derived from the fp32 master weights,
 which the next step casts back over them.
 
 **10.7 Not described.** Offload tiers, MiCS / hpZ, expert tensor parallelism, quantized
-ZeRO-3 storage, non-elementwise transforms, derived copies as sources, and AutoEP expert
-optimizer states.
+ZeRO-3 storage, non-elementwise transforms, derived copies, and AutoEP expert optimizer
+states.
