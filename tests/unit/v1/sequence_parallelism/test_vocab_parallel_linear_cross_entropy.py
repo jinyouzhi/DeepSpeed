@@ -159,21 +159,21 @@ def test_hidden_gradient_sums_many_vocab_entries_exactly():
     torch.testing.assert_close(hidden.grad, reference.grad)
 
 
-def test_ignored_tokens_are_not_projected(monkeypatch):
+def test_ignored_tokens_do_not_affect_loss_or_gradients():
     hidden, weight, _, target = _inputs(bias=False)
-    projected_rows = []
-    fp32_logits = linear_cross_entropy._fp32_logits
+    # Non-finite activations at ignored positions must not reach the loss or any gradient.
+    poisoned = hidden.clone()
+    poisoned[target == -100] = float("nan")
+    args = [_leaf(poisoned), _leaf(weight)]
+    ref_args = [_leaf(hidden), _leaf(weight)]
 
-    def counting_fp32_logits(rows, *args, **kwargs):
-        projected_rows.append(rows.shape[0])
-        return fp32_logits(rows, *args, **kwargs)
-
-    monkeypatch.setattr(linear_cross_entropy, "_fp32_logits", counting_fp32_logits)
-    vocab_parallel_linear_cross_entropy(_leaf(hidden), weight, target, chunk_size=100).backward()
-
-    num_valid = int((target != -100).sum())
-    # One forward chunk and one backward block, each over the valid tokens only.
-    assert projected_rows == [num_valid, num_valid]
+    actual = vocab_parallel_linear_cross_entropy(*args, target, chunk_size=100)
+    expected = _reference(*ref_args, None, target, "mean")
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    for got, want in zip(args, ref_args):
+        torch.testing.assert_close(got.grad, want.grad)
 
 
 def test_many_tokens_low_precision_matches_reference_on_accelerator():

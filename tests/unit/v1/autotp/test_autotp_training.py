@@ -7,6 +7,7 @@ import pytest
 import deepspeed.comm as dist
 import torch
 import math
+import inspect
 import logging
 from copy import deepcopy
 from io import StringIO
@@ -654,6 +655,16 @@ class TestTiedVocabParallelLMHead(DistributedTest):
         assert output.logits.shape == (1, input_ids.shape[1], local_vocab_size)
         torch.testing.assert_close(output.loss, expected.loss)
 
+        # Labels passed positionally arm the fused loss as well.
+        engine.train()
+        parameters = list(inspect.signature(engine.module.forward).parameters)
+        positional = [None] * (parameters.index("labels") + 1)
+        positional[parameters.index("input_ids")] = input_ids
+        positional[-1] = labels
+        output = engine(*positional)
+        assert output.logits.shape == (1, input_ids.shape[1], 0)
+        torch.testing.assert_close(output.loss, reference(input_ids=input_ids, labels=labels).loss)
+
     def test_fused_linear_loss_rejects_unsupported_configurations(self):
         transformers = pytest.importorskip("transformers")
         device = torch.device(get_accelerator().current_device_name())
@@ -666,7 +677,7 @@ class TestTiedVocabParallelLMHead(DistributedTest):
                                                  head_dim=8,
                                                  use_cache=False,
                                                  tie_word_embeddings=False,
-                                                 final_logit_softcapping=30.0)
+                                                 final_logit_softcapping=1.0)
         model_config.base_model_tp_plan = None
         model = transformers.Gemma2ForCausalLM(model_config).to(device)
         with pytest.raises(ValueError, match="final_logit_softcapping"):

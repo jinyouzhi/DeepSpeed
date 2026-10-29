@@ -10,6 +10,7 @@ at a time, so each weight-gradient block comes from a single GEMM over all token
 """
 
 import functools
+import inspect
 import math
 
 import torch
@@ -297,10 +298,12 @@ def vocab_parallel_linear_cross_entropy(hidden,
     return _global_sp_sum(loss, sp_group)
 
 
-# Config attributes of HuggingFace models whose causal-LM forward rescales or soft-caps the
+# Config attributes of HuggingFace models whose causal-LM forward soft-caps or rescales the
 # logits between the head and the loss. The fused loss never sees those logits, so it would
-# silently train against different ones.
-_LOGIT_POSTPROCESSING_ATTRS = ("final_logit_softcapping", "logit_scale", "logits_scaling")
+# silently train against different ones. Soft-capping changes the logits for any cap, while a
+# scale of one is the identity.
+_LOGIT_SOFTCAP_ATTRS = ("final_logit_softcapping", )
+_LOGIT_SCALE_ATTRS = ("logit_scale", "logits_scaling")
 
 
 def _reject_logit_postprocessing(model):
@@ -311,9 +314,9 @@ def _reject_logit_postprocessing(model):
     if hasattr(config, "get_text_config"):
         configs.append(config.get_text_config())
     for model_config in configs:
-        for name in _LOGIT_POSTPROCESSING_ATTRS:
+        for name in _LOGIT_SOFTCAP_ATTRS + _LOGIT_SCALE_ATTRS:
             value = getattr(model_config, name, None)
-            if value is not None and value != 1:
+            if value is not None and (name in _LOGIT_SOFTCAP_ATTRS or value != 1):
                 raise ValueError(f"vocab_parallel_ce_backend='fused_linear' cannot apply the model's {name}={value} "
                                  "to logits it never materializes; use the 'torch' backend for this model")
 
@@ -417,12 +420,17 @@ def configure_fused_linear_vocab_parallel_loss(model, vocab_parallel_head, sp_gr
                                               sp_group=sp_group,
                                               ignore_index=ignore_index)
     original_loss_function = _set_vocab_parallel_loss(model, loss_fn)
+    forward_signature = inspect.signature(model.forward)
 
     def arm_capture(module, args, kwargs):
         capture.reset()
+        try:
+            labels = forward_signature.bind_partial(*args, **kwargs).arguments.get("labels")
+        except TypeError:
+            labels = kwargs.get("labels")
         # HuggingFace only calls the loss when ``labels`` are given; without them the caller
         # asked for the logits themselves.
-        capture.armed = module.training and kwargs.get("labels") is not None
+        capture.armed = module.training and labels is not None
 
     def disarm_capture(module, args, output):
         # Drop a capture the forward never consumed, so neither a stale activation nor a later
