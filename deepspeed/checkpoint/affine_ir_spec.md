@@ -613,8 +613,8 @@ expert parameters, and `AutoEPMoELayer.plan_expert_transfer(target_placement)` c
 them with a target descriptor through `plan_transfer` into shard-to-shard copies. Plan
 ranks are EP-local ranks of the respective placements; the plan is not executed, and ZeRO
 and EDP storage must still be normalized before its offsets apply.
-`AutoEPMoELayer.expert_storage_affine_maps()` removes that step by describing the storage
-itself (§10).
+`AutoEPMoELayer.expert_storage_affine_maps()` describes that storage in global ranks
+(§10).
 
 `deepspeed/checkpoint/zero_affine.py` takes the first step for live training storage. It
 describes, in global ranks, where ZeRO keeps each element of a parameter: the low-precision
@@ -692,8 +692,8 @@ cannot be merged across those rows and keeps one piece per row. Callers:
   with the storage of every TP shard. A parameter AutoTP leaves whole in a model built under
   `zero.Init` stays partitioned over the whole world, so every TP rank reports the storage of
   one shared copy; that storage describes the parameter on its own, without nesting. The
-  experts of an AutoEP layer are left whole on every TP rank but differ by EP rank, so this
-  takes their maps from the AutoEP layer instead of the TP layout.
+  experts of an AutoEP layer are whole on every TP rank and differ by EP rank; their maps
+  are the layer's `expert_storage_affine_maps()`.
 - AutoEP expert storage nests the placement's layout map with each EP rank's EDP storage.
   It needs no communication: the placement, the EDP group table and the ZeRO-3 even split
   are known to every rank.
@@ -713,10 +713,9 @@ a ZeRO-3 `ds_tensor`. A write through the map therefore lasts. The runtime also 
 persistent ZeRO-3 parameter, ZeRO++ hpZ secondary partitions, fused inference weights.
 Writing a derived copy alone is lost or leaves the authoritative copy stale, so maps leave
 it out and shard accessors refuse it (`zero_param_storage_shard` on a gathered parameter).
-Whether a copy is
-authoritative depends on the side: the low-precision parameters are authoritative for a
-rollout engine, but on a training engine they are derived from the fp32 master weights,
-which the next step casts back over them.
+Whether a copy is authoritative depends on the side: the low-precision parameters are
+authoritative for a rollout engine, but on a training engine they are derived from the fp32
+master weights, which the next step casts back over them.
 
 **10.7 Not described.** Offload tiers, MiCS / hpZ, expert tensor parallelism, quantized
 ZeRO-3 storage, non-elementwise transforms, derived copies, and AutoEP expert optimizer
