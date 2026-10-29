@@ -737,10 +737,6 @@ stores, so a plan built from it reads directly from runtime storage:
   optimizer step overwrites them. The fp32 master weights and optimizer states
   are not described yet. Expert tensor parallelism
   (``expert_tensor_parallel_size > 1``) raises ``NotImplementedError``.
-- Every rank computes the maps from the layer's placement descriptor. Build
-  them, and any plan from them, again whenever the placement changes, for
-  example after expert load balancing moves experts, and only once every rank
-  has switched to the new placement.
 - ``autotp_storage_affine_maps(model)`` in ``deepspeed.checkpoint.zero_affine``
   describes the experts of an AutoEP layer with this method, so a model-wide
   description under AutoTP and AutoEP is consistent.

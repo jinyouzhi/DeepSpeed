@@ -704,10 +704,7 @@ and the planner's default or a `replica_selector` picks one.
 **10.5 Plan lifetime.** Maps and plans depend only on layout and partitioning, not on values.
 A caller builds them once and executes the plan for every sync, until either side's
 placement, parallel sizes or ZeRO partitioning changes. A parameter whose buffer is
-reallocated keeps its plan; only the shard views must be fetched again. A map computed
-locally from a placement is only consistent if every rank uses the same placement, so a
-runtime that changes placement, such as expert load balancing, must rebuild maps and plans
-after every rank has switched.
+reallocated keeps its plan; only the shard views must be fetched again.
 
 **10.6 Authoritative and derived copies.** A storage map lists only *authoritative* copies:
 storage that the optimizer step updates and the next forward reads, such as `param.data` or
