@@ -651,10 +651,11 @@ class TestAutoEPZero3UniversalCheckpoint(DistributedTest):
 class TestAutoEPExpertStorageMaps(DistributedTest):
     world_size = 4
 
-    @pytest.mark.parametrize("zero_stage, autotp_size", [(2, 1), (3, 1), (3, 2)])
+    @pytest.mark.parametrize("zero_stage, autotp_size", [(2, 1), (3, 1), (2, 2), (3, 2)])
     def test_storage_maps_match_runtime_ownership_and_plan_into_a_new_placement(self, zero_stage, autotp_size):
         from deepspeed.checkpoint.affine_transfer import plan_transfer
         from deepspeed.checkpoint.autoep_affine import autoep_storage_affine_map, make_autoep_placement_descriptor
+        from deepspeed.checkpoint.zero_affine import autotp_storage_affine_maps, zero_param_storage_shard
 
         seed_everything(8800 + zero_stage)
         config = make_autoep_integration_config(zero_stage=zero_stage, ep_size=2)
@@ -685,7 +686,14 @@ class TestAutoEPExpertStorageMaps(DistributedTest):
             solo_maps = [module.expert_storage_affine_maps() for _, module in _autoep_modules(engine)]
         dist.barrier()
 
-        for index, (_, module) in enumerate(_autoep_modules(engine)):
+        autotp_maps = None
+        if autotp_size > 1:
+            # A model-wide AutoTP description must describe the experts as their AutoEP layer does.
+            autotp_maps = autotp_storage_affine_maps(engine.module)
+            with pytest.raises(NotImplementedError, match="AutoEP expert optimizer states"):
+                autotp_storage_affine_maps(engine.module, optimizer_states=True)
+
+        for index, (module_name, module) in enumerate(_autoep_modules(engine)):
             storage_maps = module.expert_storage_affine_maps()
             if solo_maps is not None:
                 for name in EXPERT_WEIGHT_NAMES:
@@ -694,8 +702,13 @@ class TestAutoEPExpertStorageMaps(DistributedTest):
             for name in EXPERT_WEIGHT_NAMES:
                 param = getattr(module.experts, name)
                 affine_map = storage_maps[name]
-                stored = (param.ds_tensor if zero_stage == 3 else param.data).detach().reshape(-1)
-                stored = stored[:affine_map.shard_shapes[rank][0]].float().cpu()
+                if autotp_maps is not None:
+                    autotp_map = autotp_maps[f"{module_name}.experts.{name}"]
+                    assert autotp_map.logical_shape == affine_map.logical_shape
+                    assert autotp_map.shard_shapes == affine_map.shard_shapes
+                    assert autotp_map.pieces_by_rank == affine_map.pieces_by_rank
+                stored = zero_param_storage_shard(param).detach().float().cpu()
+                assert stored.numel() == affine_map.shard_shapes[rank][0]
                 with deepspeed.zero.GatheredParameters([param], enabled=zero_stage == 3):
                     packed = param.detach().float().cpu()
 

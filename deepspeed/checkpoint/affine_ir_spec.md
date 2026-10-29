@@ -691,8 +691,12 @@ cannot be merged across those rows and keeps one piece per row. Callers:
 - `autotp_storage_affine_maps(model)` nests each parameter's published AutoTP layout map
   with the storage of every TP shard. A parameter AutoTP leaves whole in a model built under
   `zero.Init` stays partitioned over the whole world, so every TP rank reports the storage of
-  one shared copy; that storage describes the parameter on its own, without nesting.
+  one shared copy; that storage describes the parameter on its own, without nesting. The
+  experts of an AutoEP layer are left whole on every TP rank but differ by EP rank, so this
+  takes their maps from the AutoEP layer instead of the TP layout.
 - AutoEP expert storage nests the placement's layout map with each EP rank's EDP storage.
+  It needs no communication: the placement, the EDP group table and the ZeRO-3 even split
+  are known to every rank.
 
 **10.4 Replica choice** stays with the planner (§2.4): every holder appears in `locations`,
 and the planner's default or a `replica_selector` picks one.
@@ -700,7 +704,23 @@ and the planner's default or a `replica_selector` picks one.
 **10.5 Plan lifetime.** Maps and plans depend only on layout and partitioning, not on values.
 A caller builds them once and executes the plan for every sync, until either side's
 placement, parallel sizes or ZeRO partitioning changes. A parameter whose buffer is
-reallocated keeps its plan; only the shard views must be fetched again.
+reallocated keeps its plan; only the shard views must be fetched again. A map computed
+locally from a placement is only consistent if every rank uses the same placement, so a
+runtime that changes placement, such as expert load balancing, must rebuild maps and plans
+after every rank has switched.
 
-**10.6 Not described.** Offload tiers, MiCS / hpZ, expert tensor parallelism, quantized
-ZeRO-3 storage, non-elementwise transforms.
+**10.6 Authoritative and derived copies.** A storage map lists only *authoritative* copies:
+storage that the optimizer step updates and the next forward reads, such as `param.data` or
+a ZeRO-3 `ds_tensor`. A write through the map therefore lasts. The runtime also keeps
+*derived* copies that it regenerates from authoritative ones: the gathered copy of a
+persistent ZeRO-3 parameter, ZeRO++ hpZ secondary partitions, fused inference weights.
+A fresh derived copy holds the same values and could serve as a source, but writing it
+alone is lost or leaves the authoritative copy stale, so maps leave it out and shard
+accessors refuse it (`zero_param_storage_shard` on a gathered parameter). Whether a copy is
+authoritative depends on the side: the low-precision parameters are authoritative for a
+rollout engine, but on a training engine they are derived from the fp32 master weights,
+which the next step casts back over them.
+
+**10.7 Not described.** Offload tiers, MiCS / hpZ, expert tensor parallelism, quantized
+ZeRO-3 storage, non-elementwise transforms, derived copies as sources, and AutoEP expert
+optimizer states.

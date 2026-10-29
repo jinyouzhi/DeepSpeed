@@ -268,7 +268,8 @@ def autotp_storage_affine_maps(model, optimizer_states=False, tp_group=None):
     master copy and optimizer states instead, matching ``zero_optimizer_storage_shard``, and a
     parameter without them maps to ``None``. A parameter AutoTP did not partition is replicated
     over the tensor-parallel group, unless it kept the partition over the whole world that
-    ``zero.Init`` gave it, which describes it on its own.
+    ``zero.Init`` gave it, which describes it on its own. The experts of an AutoEP layer are
+    described by its ``expert_storage_affine_maps``; their optimizer states are not supported.
 
     Collective: the tensor-parallel ranks exchange their shards' storage maps in one all-gather
     over ``tp_group`` (the AutoTP group by default), and every rank must call this with the same
@@ -286,7 +287,23 @@ def autotp_storage_affine_maps(model, optimizer_states=False, tp_group=None):
         if marker is not None:
             marker()
 
-    named_params = list(model.named_parameters())
+    # AutoTP leaves AutoEP experts whole on every tensor-parallel rank, but each EP rank holds
+    # different experts, so a replicated layout would describe one EP rank's packed tensor as the
+    # whole parameter. The AutoEP layer knows its placement and describes their storage instead.
+    from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+    expert_maps = {}
+    for module in model.modules():
+        if not isinstance(module, AutoEPMoELayer):
+            continue
+        if optimizer_states:
+            raise NotImplementedError('AutoEP expert optimizer states have no affine storage map.')
+        for weight_name, storage_map in module.expert_storage_affine_maps().items():
+            expert_maps[id(getattr(module.experts, weight_name))] = storage_map
+
+    named_params = []
+    for name, param in model.named_parameters():
+        if id(param) not in expert_maps:
+            named_params.append((name, param))
     params = [param for _, param in named_params]
     if optimizer_states:
         storage_maps = zero_optimizer_storage_affine_maps(params)
@@ -314,4 +331,10 @@ def autotp_storage_affine_maps(model, optimizer_states=False, tp_group=None):
             layout = replicated_map(layout.logical_shape, 1)
             inner = {0: inner[0]}
         maps[name] = nest_affine_maps(layout, inner)
-    return maps
+    ordered = {}
+    for name, param in model.named_parameters():
+        if id(param) in expert_maps:
+            ordered[name] = expert_maps[id(param)]
+        else:
+            ordered[name] = maps[name]
+    return ordered
