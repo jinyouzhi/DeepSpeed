@@ -159,6 +159,39 @@ def test_hidden_gradient_sums_many_vocab_entries_exactly():
     torch.testing.assert_close(hidden.grad, reference.grad)
 
 
+def test_ignored_tokens_are_not_projected(monkeypatch):
+    hidden, weight, _, target = _inputs(bias=False)
+    projected_rows = []
+    fp32_logits = linear_cross_entropy._fp32_logits
+
+    def counting_fp32_logits(rows, *args, **kwargs):
+        projected_rows.append(rows.shape[0])
+        return fp32_logits(rows, *args, **kwargs)
+
+    monkeypatch.setattr(linear_cross_entropy, "_fp32_logits", counting_fp32_logits)
+    vocab_parallel_linear_cross_entropy(_leaf(hidden), weight, target, chunk_size=100).backward()
+
+    num_valid = int((target != -100).sum())
+    # One forward chunk and one backward block, each over the valid tokens only.
+    assert projected_rows == [num_valid, num_valid]
+
+
+def test_many_tokens_low_precision_matches_reference_on_accelerator():
+    device = get_accelerator().device_name()
+    torch.manual_seed(0)
+    hidden = torch.randn(4096, 8, device=device).mul_(4).bfloat16()
+    weight = torch.randn(129, 8, device=device).bfloat16()
+    target = torch.randint(0, 129, (4096, ), device=device)
+    args = [_leaf(hidden), _leaf(weight)]
+    reference = [_leaf(hidden.float()), _leaf(weight.float())]
+
+    vocab_parallel_linear_cross_entropy(*args, target, chunk_size=4096).backward()
+    _reference(*reference, None, target, "mean").backward()
+
+    for got, want in zip(args, reference):
+        assert (got.grad.float() - want.grad).norm() <= 1e-2 * want.grad.norm()
+
+
 class _LegacyAutocastTorch:
     """``torch`` as seen by code on PyTorch < 2.4, which has no device-aware autocast getters."""
 
