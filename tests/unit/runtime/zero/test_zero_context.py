@@ -210,6 +210,22 @@ class TestSerialContext(DistributedTest):
             y = torch.LongTensor([3, 3])
             assert y.dtype == torch.long
 
+    def test_explicit_tensor_dtype_is_preserved(self):
+        setup_serial_env()
+
+        with deepspeed.zero.Init(dtype=torch.bfloat16):
+            inv_freq = 1.0 / (10_000.0**(torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+            explicit_tensor_dtype = torch.Tensor(4, dtype=torch.float32)
+            default_tensor_dtype = torch.Tensor(4)
+            default_dtype = torch.zeros(4)
+
+        expected = 1.0 / (10_000.0**(torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+        assert inv_freq.dtype == torch.float32
+        assert torch.equal(inv_freq, expected)
+        assert explicit_tensor_dtype.dtype == torch.float32
+        assert default_tensor_dtype.dtype == torch.bfloat16
+        assert default_dtype.dtype == torch.bfloat16
+
     def test_throughput_calculation(self):
         setup_serial_env()
 
