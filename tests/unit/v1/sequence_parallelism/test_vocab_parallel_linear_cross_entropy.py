@@ -176,7 +176,23 @@ def test_ignored_tokens_do_not_affect_loss_or_gradients():
         torch.testing.assert_close(got.grad, want.grad)
 
 
-def test_many_tokens_low_precision_matches_reference_on_accelerator():
+def test_all_ignored_tokens_give_zero_loss_and_gradients():
+    # A fully masked micro-batch, such as one holding only prompts, has nothing to project.
+    hidden, weight, bias, target = _inputs()
+    target = torch.full_like(target, -100)
+    args = [_leaf(hidden), _leaf(weight), _leaf(bias)]
+
+    per_token = vocab_parallel_linear_cross_entropy(args[0], args[1], target, bias=args[2], reduction="none")
+    assert torch.equal(per_token, torch.zeros_like(per_token, dtype=torch.float32))
+    loss = vocab_parallel_linear_cross_entropy(args[0], args[1], target, bias=args[2])
+    assert loss.item() == 0
+    loss.backward()
+    for arg in args:
+        assert torch.equal(arg.grad, torch.zeros_like(arg))
+
+
+@pytest.mark.parametrize("chunk_size", [None, 4096])
+def test_many_tokens_low_precision_matches_reference_on_accelerator(chunk_size):
     device = get_accelerator().device_name()
     torch.manual_seed(0)
     hidden = torch.randn(4096, 8, device=device).mul_(4).bfloat16()
@@ -185,7 +201,8 @@ def test_many_tokens_low_precision_matches_reference_on_accelerator():
     args = [_leaf(hidden), _leaf(weight)]
     reference = [_leaf(hidden.float()), _leaf(weight.float())]
 
-    vocab_parallel_linear_cross_entropy(*args, target, chunk_size=4096).backward()
+    # The default splits these tokens into several chunks; 4096 projects them in one.
+    vocab_parallel_linear_cross_entropy(*args, target, chunk_size=chunk_size).backward()
     _reference(*reference, None, target, "mean").backward()
 
     for got, want in zip(args, reference):

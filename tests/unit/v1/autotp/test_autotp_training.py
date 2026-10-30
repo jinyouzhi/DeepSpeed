@@ -665,6 +665,18 @@ class TestTiedVocabParallelLMHead(DistributedTest):
         assert output.logits.shape == (1, input_ids.shape[1], 0)
         torch.testing.assert_close(output.loss, reference(input_ids=input_ids, labels=labels).loss)
 
+        # A loss that ignores the capture reads empty logits; the forward names the cause.
+        engine.module.loss_function = lambda logits, labels, **kwargs: logits.sum()
+        log_output = StringIO()
+        handler = logging.StreamHandler(log_output)
+        handler.setLevel(logging.WARNING)
+        ds_logger.addHandler(handler)
+        try:
+            engine(input_ids=input_ids, labels=labels)
+        finally:
+            ds_logger.removeHandler(handler)
+        assert "never consumed the LM-head capture" in log_output.getvalue()
+
     def test_fused_linear_loss_rejects_unsupported_configurations(self):
         transformers = pytest.importorskip("transformers")
         device = torch.device(get_accelerator().current_device_name())

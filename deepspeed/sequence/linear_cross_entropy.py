@@ -433,6 +433,13 @@ def configure_fused_linear_vocab_parallel_loss(model, vocab_parallel_head, sp_gr
         capture.armed = module.training and labels is not None
 
     def disarm_capture(module, args, output):
+        # A conforming forward always hands the capture to the installed loss, so one left here
+        # means the caller computed its own loss from the empty logits; name the cause here
+        # rather than leave a shape error or NaN to surface in the caller's code.
+        if capture.hidden is not None:
+            logger.warning_once("vocab_parallel_ce_backend='fused_linear': labels were passed but the installed "
+                                "loss never consumed the LM-head capture, so outputs.logits is empty (vocabulary "
+                                "dim 0). Compute the loss through model.loss_function or use the 'torch' backend.")
         # Drop a capture the forward never consumed, so neither a stale activation nor a later
         # direct call of the head is affected.
         capture.reset()
