@@ -1243,6 +1243,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if not get_accelerator().on_accelerator(param):
                     param.data = param.data.to(self.local_device)
 
+                # Constructors keep an explicit dtype, but ZeRO-3 flattens parameters into buffers of one dtype.
+                if (self.tensor_overrides and DeepSpeedTensorOverride.dtype in self.tensor_overrides
+                        and param.is_floating_point() and param.dtype != self.dtype):
+                    param.data = param.data.to(self.dtype)
+
                 if name == 'weight' and self.quantized_initialization and type(module) in WEIGHT_QUANTIZATION_LAYERS:
                     _quantize_param(param, self.quantized_initialization)
 

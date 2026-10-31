@@ -226,6 +226,29 @@ class TestSerialContext(DistributedTest):
         assert default_tensor_dtype.dtype == torch.bfloat16
         assert default_dtype.dtype == torch.bfloat16
 
+    def test_explicit_fp32_param_trains(self):
+        setup_serial_env()
+
+        class ExplicitFp32Param(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.scale = torch.nn.Parameter(torch.ones(4, dtype=torch.float32))
+
+            def forward(self, x):
+                return (self.linear(x) * self.scale).pow(2).mean()
+
+        with deepspeed.zero.Init(config_dict_or_path=config):
+            model = ExplicitFp32Param()
+
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        x = torch.randn(1, 4, device=engine.device, dtype=model.linear.weight.dtype)
+        loss = engine(x)
+        engine.backward(loss)
+        engine.step()
+        assert torch.isfinite(loss)
+
     def test_throughput_calculation(self):
         setup_serial_env()
 
