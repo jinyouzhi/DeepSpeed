@@ -219,7 +219,7 @@ class TestSerialContext(DistributedTest):
             default_tensor_dtype = torch.Tensor(4)
             default_dtype = torch.zeros(4)
 
-        expected = 1.0 / (10_000.0**(torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+        expected = (1.0 / (10_000.0**(torch.arange(0, 8, 2, dtype=torch.float32) / 8))).to(inv_freq.device)
         assert inv_freq.dtype == torch.float32
         assert torch.equal(inv_freq, expected)
         assert explicit_tensor_dtype.dtype == torch.float32
