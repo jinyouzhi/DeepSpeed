@@ -46,6 +46,15 @@ whose ``run`` only moves data from the buffers' current contents::
 Every process must call ``run`` the same number of times, and buffers must not be
 reallocated while the prepared transfer is in use.
 
+A ``TransferWindow`` whose group spans hosts is registered with NCCL symmetric
+memory, so it must be created before any other symmetric memory in the process.
+An operation between hosts whose source and target are both packed regions of
+window buffers is then one put from the source process; other operations between
+hosts are staged. A put leaves through the source process's own network adapter,
+whereas staged messages may be relayed through other adapters on the host, so a
+process sending to many processes on other hosts is faster with a window that
+excludes those buffers.
+
 Transport and staging
 ---------------------
 

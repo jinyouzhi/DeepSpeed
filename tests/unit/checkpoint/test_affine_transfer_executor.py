@@ -7,6 +7,7 @@
 import math
 import os
 from dataclasses import replace
+from unittest import mock
 
 import pytest
 import torch
@@ -505,3 +506,73 @@ class TestWindowTransfer(DistributedTest):
                 assert moved.tolist() == [0, remote, remote]
             else:
                 assert moved.tolist() == [remote, 0, 0], 'window shards must bypass staged messages'
+
+
+class TestWindowAcrossHosts(DistributedTest):
+    # Hosts are told apart by name, so alternating names make every other process remote: with four
+    # processes one window has both mapped peers and peers reached only by puts.
+    world_size = [2, 4]
+
+    @pytest.mark.parametrize('layout', ['packed', 'strided'])
+    def test_remote_window_shards_are_put_and_strided_ones_staged(self, layout):
+        if get_accelerator().device_name() != 'cuda':
+            pytest.skip('puts across hosts need CUDA')
+        _join_transfer_group()
+        world_size, rank = dist.get_world_size(), dist.get_rank()
+        if layout == 'packed':
+            # Float32 keeps the markers of a long vector distinct; uneven target pieces straddle sources.
+            dtype, n = torch.float32, 128 * world_size
+            half = n // (2 * world_size)
+            source = contiguous_split_map((n, ), [n // world_size] * world_size, 0)
+            target = contiguous_split_map((n, ), [half] + [2 * half] * (world_size - 1) + [half], 0)
+            full = _full(1, n, dtype).reshape(n)
+            target_process = [loc % world_size for loc in range(world_size + 1)]
+            source_of = torch.arange(n) // (n // world_size)
+            bounds = torch.tensor([half + 2 * half * i for i in range(world_size)])
+            target_of = torch.tensor(target_process)[torch.bucketize(torch.arange(n), bounds, right=True)]
+        else:
+            dtype = torch.bfloat16
+            source, target = _row_to_column(world_size)
+            full = _full(16, 16, dtype)
+            target_process = list(range(world_size))
+            source_of = (torch.arange(256) // 16) // 8
+            target_of = (torch.arange(256) % 16) // (16 // world_size)
+        endpoints = TransferEndpoints(source={loc: loc
+                                              for loc in source.shard_shapes},
+                                      target={loc: target_process[loc]
+                                              for loc in target.shard_shapes})
+        with mock.patch('socket.gethostname', return_value=f'node{rank % 2}'):
+            try:
+                window = TransferWindow(1 << 20)
+            except RuntimeError as unsupported:
+                if 'newer torch' not in str(unsupported):
+                    raise
+                pytest.skip(str(unsupported))
+        source_buffers = {
+            loc: window.tensor(source.shard_shapes[loc], dtype)
+            for loc, process in endpoints.source.items() if process == rank
+        }
+        target_buffers = {
+            loc: window.tensor(shape, dtype)
+            for loc, shape in target.shard_shapes.items() if endpoints.target[loc] == rank
+        }
+        request = TransferRequest('weight', plan_transfer(target, source, PlanBudget()), source_buffers,
+                                  target_buffers)
+        prepared = prepare_transfers([request], endpoints, dtype, window=window)
+
+        for values in (full, full.flip(0)):
+            for location, buffer in source_buffers.items():
+                buffer.copy_(source.extract(values, location))
+            for buffer in target_buffers.values():
+                buffer.fill_(UNWRITTEN)
+            stats = prepared.run()
+
+            _assert_matches(target_buffers, target, values)
+            # Packed regions reach any host in place; strided ones between hosts are staged.
+            remote = source_of != target_of
+            across = remote & (source_of % 2 != target_of % 2)
+            staged = 0 if layout == 'packed' else int(across.sum()) * full.element_size()
+            mapped = int(remote.sum()) * full.element_size() - staged
+            moved = torch.tensor([stats.mapped_bytes, stats.sent_bytes, stats.received_bytes], device=_device())
+            dist.all_reduce(moved)
+            assert moved.tolist() == [mapped, staged, staged]
