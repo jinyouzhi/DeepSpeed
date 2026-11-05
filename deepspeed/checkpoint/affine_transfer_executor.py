@@ -41,6 +41,9 @@ to change when such a path lands.
 PCIe, NVLink or Xe Link). Buffers carved from a window are published to the group, and an operation whose
 source or target lies in a window is copied in place by one process -- the target pulls, or the source
 pushes -- with no staging, no peer message and no budget. Everything else keeps the protocol above.
+A window that spans hosts is registered with NCCL, and an operation between hosts whose source and target
+both lie in windows as packed regions is one one-sided put from the source; other operations between hosts
+are staged.
 
 Registration is only worth it when it is reused, and so is the rest of the setup: validation, the digest
 agreement, the exchange of window offsets, arenas and peer views. ``prepare_transfers`` does all of it once
@@ -53,6 +56,7 @@ mover should be perturbing.
 """
 
 import math
+import socket
 import sys
 import zlib
 from dataclasses import dataclass
@@ -109,6 +113,11 @@ class TransferWindow:
     to every call: registration is paid once, not per transfer. ``direction`` decides who copies when both
     the source and the target of an operation lie in a window; which one is faster depends on the
     interconnect, so it is the caller's.
+
+    Processes on one host map each other's windows. A group that spans hosts needs CUDA: the window is
+    then allocated with torch's NCCL symmetric-memory backend, which is process-wide, so it must be
+    created before any other symmetric memory in the process. Processes on different hosts reach each
+    other's windows only with puts, so ``direction`` does not apply between them.
     """
     ALIGNMENT = 512
     READY, DONE = 0, 1
@@ -120,12 +129,31 @@ class TransferWindow:
         self.group = group
         self.direction = direction
         self.nbytes = -(-nbytes // self.ALIGNMENT) * self.ALIGNMENT
-        self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group)
+        if group is not None and callable(getattr(group, 'rank', None)):
+            rank, world_size = group.rank(), group.size()
+        else:
+            rank, world_size = dist.get_rank(group=group), dist.get_world_size(group=group)
+        hosts = [None] * world_size
+        dist.all_gather_object(hosts, socket.gethostname(), group=group)
+        self.nodes = [hosts.index(host) for host in hosts]
+        spans_hosts = len(set(hosts)) > 1
+        if spans_hosts and get_accelerator().device_name() != 'cuda':
+            raise AffineTransferExecutionError('a window across hosts needs CUDA, whose NCCL puts reach them')
+        self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group,
+                                                           'NCCL' if spans_hosts else None)
         self._used = 0
         self._peers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
+        self._remotes: Dict[int, object] = {}
         self._stream = None
         # Stream-ordered peer signals are verified on CUDA and XPU; elsewhere a run fences with group barriers.
         self.signals = self.pool.device.type in ('cuda', 'xpu')
+        # NCCL counts signals per peer on a single channel, so READY and DONE share it.
+        self._counted = spans_hosts
+        if spans_hosts:
+            # NCCL sets up one-sided state on first use, and every process must take part in that.
+            self._handle.put_signal((rank + 1) % world_size, 0)
+            self._handle.wait_signal((rank - 1) % world_size, 0)
+            get_accelerator().current_stream().synchronize()
 
     def tensor(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
         """A new shard inside the window; never freed before the window."""
@@ -168,11 +196,29 @@ class TransferWindow:
 
     def signal(self, process: int, channel: int) -> None:
         """Raise ``channel`` at ``process``, ordered after this process's current stream."""
-        self._handle.put_signal(process, channel)
+        self._handle.put_signal(process, 0 if self._counted else channel)
 
-    def wait(self, process: int, channel: int) -> None:
-        """Hold this process's current stream until ``process`` raises ``channel``, then lower it."""
-        self._handle.wait_signal(process, channel)
+    def wait(self, process: int, channel: int, count: int = 1) -> None:
+        """Hold this process's current stream until ``process`` raises ``channel`` ``count`` times, then lower it."""
+        for _ in range(count):
+            self._handle.wait_signal(process, 0 if self._counted else channel)
+
+    def crosses_hosts(self, process: int, other: int) -> bool:
+        """Whether ``process`` and ``other`` cannot map each other's windows."""
+        return self.nodes[process] != self.nodes[other]
+
+    def remote(self, byte_offset: int):
+        """Where a ``put`` lands: ``byte_offset`` into the destination process's window."""
+        if byte_offset not in self._remotes:
+            import deepspeed.comm as dist
+            self._remotes[byte_offset] = dist.symm_mem_handle_at(self.pool, byte_offset, self.nbytes - byte_offset,
+                                                                 self.group)
+        return self._remotes[byte_offset]
+
+    def put(self, source: torch.Tensor, target, process: int) -> None:
+        """Write packed ``source`` from this window to ``target`` of ``process``, which then counts one signal."""
+        import deepspeed.comm as dist
+        dist.symm_mem_put_signal(source, target, process)
 
 
 def _window_offsets(requests: Sequence['TransferRequest'], window: TransferWindow) -> Dict[Tuple, int]:
@@ -190,15 +236,30 @@ def _window_offsets(requests: Sequence['TransferRequest'], window: TransferWindo
 
 def _mapped_direction(request_key: str, operation: '_Operation', offsets: Mapping[Tuple, int],
                       window: TransferWindow) -> Optional[str]:
-    """``'pull'``, ``'push'`` or None, identically on every process of the group."""
+    """``'pull'``, ``'push'``, ``'put'`` or None, identically on every process of the group."""
     segment = operation.segment
     pull = (request_key, 'source', segment.source_rank) in offsets
     push = (request_key, 'target', segment.target_rank) in offsets
+    if window.crosses_hosts(operation.from_process, operation.to_process):
+        # A put reads a window and writes a window, one packed run on each side; anything else is staged.
+        packed = _packed(operation.chunk_shape, segment.source_strides) and _packed(
+            operation.chunk_shape, segment.target_strides)
+        return 'put' if pull and push and packed else None
     if pull and push:
         return window.direction
     if pull:
         return 'pull'
     return 'push' if push else None
+
+
+def _packed(shape: Tuple[int, ...], strides: Tuple[int, ...]) -> bool:
+    """Whether a region of ``shape`` and ``strides`` is consecutive elements in row-major order."""
+    expected = 1
+    for size, stride in zip(reversed(shape), reversed(strides)):
+        if size > 1 and stride != expected:
+            return False
+        expected *= size
+    return True
 
 
 @dataclass(frozen=True)
@@ -462,7 +523,7 @@ def prepare_transfers(requests: Sequence[TransferRequest],
     recv_direct, send_direct = {}, {}
     digest, rejected = 0, 0
     error = None
-    mapped_copies, mapped_total, copiers = [], 0, set()
+    mapped_copies, mapped_total, copiers, putters = [], 0, {}, set()
     offsets: Dict[Tuple, int] = {}
     if window is not None and world_size > 1:
         # Collective, so it runs before anything that may reject; a bad buffer simply publishes nothing.
@@ -522,7 +583,12 @@ def prepare_transfers(requests: Sequence[TransferRequest],
                 if copier == rank:
                     mapped_copies.append((item, operation, direction))
                 elif operation.from_process == rank or operation.to_process == rank:
-                    copiers.add(copier)
+                    # A copier signals once when it is done; a put signals once per put.
+                    if direction == 'put':
+                        copiers[copier] = copiers.get(copier, 0) + 1
+                        putters.add(copier)
+                    else:
+                        copiers[copier] = 1
             elif operation.to_process == rank:
                 incoming.setdefault(operation.from_process, []).append((item, operation))
             elif operation.from_process == rank:
@@ -575,9 +641,18 @@ def prepare_transfers(requests: Sequence[TransferRequest],
 
     # Agreement reached: offsets are now trusted, so resolve each window copy to a pair of views.
     mapped: Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+    puts: Dict[int, List[Tuple[object, torch.Tensor]]] = {}
     mapped_bytes = 0
     for item, operation, direction in _staggered(mapped_copies, rank):
         request, segment = requests[item], operation.segment
+        if direction == 'put':
+            base = offsets[(request.key, 'target', segment.target_rank)]
+            source = _region(_flat(segment.source_rank, request.source_buffers, dtype), operation.source_offset,
+                             operation.chunk_shape, segment.source_strides)
+            target = window.remote((base + operation.target_offset) * element_size)
+            puts.setdefault(operation.to_process, []).append((target, source.reshape(-1)))
+            mapped_bytes += operation.payload_bytes
+            continue
         if direction == 'pull':
             peer_process = operation.from_process
             peer = window.peer(peer_process, dtype)
@@ -602,7 +677,8 @@ def prepare_transfers(requests: Sequence[TransferRequest],
     prepared._recv_direct, prepared._send_direct = recv_direct, send_direct
     prepared._recv_arenas, prepared._send_arenas = recv_arenas, send_arenas
     prepared._local_copies, prepared._mapped, prepared._mapped_bytes = local_copies, mapped, mapped_bytes
-    prepared._mapped_total, prepared._copiers = mapped_total, sorted(copiers)
+    prepared._puts, prepared._putters = puts, sorted(putters)
+    prepared._mapped_total, prepared._copiers = mapped_total, sorted(copiers.items())
     prepared._segments = sum(len(request.plan.segments) for request in requests)
     prepared._chunks = len(indexed)
     return prepared
@@ -631,13 +707,18 @@ def _run(prepared: PreparedTransfer) -> TransferStats:
         # agreement covered the first one.
         dist.barrier(group=group)
     if signals:
-        for copier in prepared._copiers:
+        for copier, _ in prepared._copiers:
             window.signal(copier, window.READY)
     # Window copies go first, on their own stream, so they overlap the staged rounds below.
-    if prepared._mapped:
+    if prepared._mapped or prepared._puts:
         current = get_accelerator().current_stream()
         window.stream.wait_stream(current)
         with get_accelerator().stream(window.stream):
+            # Puts before copies: the network carries them while the copies use links inside the host.
+            for peer, peer_puts in prepared._puts.items():
+                window.wait(peer, window.READY)
+                for target, source in peer_puts:
+                    window.put(source, target, peer)
             for peer, copies in prepared._mapped.items():
                 if signals:
                     window.wait(peer, window.READY)
@@ -713,12 +794,17 @@ def _run(prepared: PreparedTransfer) -> TransferStats:
             _region(source, operation.source_offset, operation.chunk_shape, operation.segment.source_strides))
         copied += operation.payload_bytes
 
-    if prepared._mapped:
+    if prepared._mapped or prepared._puts:
         current.wait_stream(window.stream)
     if signals:
         # Copiers are done with this process's shards before it may reuse them.
-        for copier in prepared._copiers:
-            window.wait(copier, window.DONE)
+        for copier, count in prepared._copiers:
+            window.wait(copier, window.DONE, count)
+        # A put may still be reading its source after it leaves the stream; only its target knows it landed.
+        for putter in prepared._putters:
+            window.signal(putter, window.DONE)
+        for peer in prepared._puts:
+            window.wait(peer, window.DONE)
     if stream_ordered:
         get_accelerator().current_stream().synchronize()
     if prepared._mapped_total and not signals:
