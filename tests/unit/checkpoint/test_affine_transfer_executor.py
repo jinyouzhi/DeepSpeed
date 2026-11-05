@@ -15,8 +15,8 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine import contiguous_split_map, replicated_map
 from deepspeed.checkpoint.affine_transfer import PlanBudget, plan_transfer
 from deepspeed.checkpoint.affine_transfer_executor import (AffineTransferExecutionError, StagingBudget,
-                                                           TransferEndpoints, TransferRequest, execute_transfer,
-                                                           execute_transfers)
+                                                           TransferEndpoints, TransferRequest, TransferWindow,
+                                                           execute_transfer, execute_transfers)
 from unit.common import DistributedTest
 
 UNWRITTEN = float('nan')
@@ -446,3 +446,57 @@ class TestB2TransferCPU:
             execute_transfer(plan, {0: source}, {0: target}, endpoints, torch.float32, StagingBudget(4))
         assert torch.equal(target_storage, torch.tensor([-9.0, 3.0, -9.0]))
         assert torch.equal(source_storage, torch.tensor([-7.0, 3.0, -7.0]))
+
+
+class TestWindowTransfer(DistributedTest):
+    # With four processes the copiers have several peers each, which exercises the staggered copy order.
+    world_size = [2, 4]
+
+    @pytest.mark.parametrize('placement', ['source', 'target', 'both_pull', 'both_push', 'neither'])
+    def test_window_shards_are_copied_in_place(self, placement):
+        if get_accelerator().device_name() not in ('cuda', 'xpu'):
+            pytest.skip('symmetric memory needs a CUDA or XPU device')
+        _join_transfer_group()
+        dtype = torch.bfloat16
+        world_size = dist.get_world_size()
+        source, target = _row_to_column(world_size)
+        full = _full(16, 16, dtype)
+        endpoints = TransferEndpoints(source={loc: loc
+                                              for loc in source.shard_shapes},
+                                      target={loc: loc
+                                              for loc in target.shard_shapes})
+        rank = dist.get_rank()
+        direction = 'push' if placement == 'both_push' else 'pull'
+        window = TransferWindow(1 << 20, direction=direction)
+        in_source = placement in ('source', 'both_pull', 'both_push')
+        in_target = placement in ('target', 'both_pull', 'both_push')
+        source_buffers = {}
+        for location, process in endpoints.source.items():
+            if process == rank:
+                shard = source.extract(full, location)
+                buffer = window.tensor(shard.shape, dtype) if in_source else torch.empty_like(shard)
+                source_buffers[location] = buffer.copy_(shard)
+        target_buffers = {}
+        for location, shape in target.shard_shapes.items():
+            if endpoints.target[location] == rank:
+                buffer = window.tensor(shape, dtype) if in_target else torch.empty(
+                    shape, dtype=dtype, device=_device())
+                target_buffers[location] = buffer.fill_(UNWRITTEN)
+
+        stats = execute_transfer(plan_transfer(target, source, PlanBudget()),
+                                 source_buffers,
+                                 target_buffers,
+                                 endpoints,
+                                 dtype,
+                                 window=window)
+
+        _assert_matches(target_buffers, target, full)
+        # Processes 0 and 1 hold the source rows; a target block is local only where its process holds them,
+        # which is 1/world_size of the matrix in total.
+        remote = full.numel() * (world_size - 1) // world_size * full.element_size()
+        moved = torch.tensor([stats.mapped_bytes, stats.sent_bytes, stats.received_bytes], device=_device())
+        dist.all_reduce(moved)
+        if placement == 'neither':
+            assert moved.tolist() == [0, remote, remote]
+        else:
+            assert moved.tolist() == [remote, 0, 0], 'window shards must bypass staged messages'
