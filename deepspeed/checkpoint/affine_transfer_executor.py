@@ -37,11 +37,17 @@ as a scatter/gather list over registered memory: that removes the arena copy, bu
 lifetime this API has no place for. Expect the wire contract -- one packed message per peer per round --
 to change when such a path lands.
 
+``TransferWindow`` is that registration for peers that can address each other's memory (one node over
+PCIe, NVLink or Xe Link). Buffers carved from a window are published to the group, and an operation whose
+source or target lies in a window is copied in place by one process -- the target pulls, or the source
+pushes -- with no staging, no peer message and no budget. Everything else keeps the protocol above.
+
 One device per process, with explicit transport-group rank bindings, synchronous on return. No CUDA graphs, no overlap with compute,
 no custom kernels: those all change the schedule, which is the last thing a first version of a data
 mover should be perturbing.
 """
 
+import math
 import sys
 import zlib
 from dataclasses import dataclass
@@ -55,7 +61,7 @@ from .affine_transfer import TransferPlan, TransferSegment
 
 __all__ = [
     'AffineTransferExecutionError', 'TransferEndpoints', 'StagingBudget', 'TransferStats', 'TransferRequest',
-    'plan_digest', 'execute_transfer', 'execute_transfers'
+    'plan_digest', 'execute_transfer', 'execute_transfers', 'TransferWindow'
 ]
 
 
@@ -88,6 +94,83 @@ class TransferStats:
     local_copy_bytes: int
     sent_bytes: int
     received_bytes: int
+    mapped_bytes: int = 0
+
+
+class TransferWindow:
+    """Device memory that every process of the transfer group can address.
+
+    Construction is collective over ``group``. Carve long-lived shards with ``tensor`` and pass the window
+    to every call: registration is paid once, not per transfer. ``direction`` decides who copies when both
+    the source and the target of an operation lie in a window; which one is faster depends on the
+    interconnect, so it is the caller's.
+    """
+    ALIGNMENT = 512
+
+    def __init__(self, nbytes: int, group: Optional[object] = None, direction: str = 'pull'):
+        import deepspeed.comm as dist
+        if direction not in ('pull', 'push'):
+            raise AffineTransferExecutionError("window direction must be 'pull' or 'push'")
+        self.group = group
+        self.direction = direction
+        self.nbytes = -(-nbytes // self.ALIGNMENT) * self.ALIGNMENT
+        self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group)
+        self._used = 0
+        self._peers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
+
+    def tensor(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+        """A new shard inside the window; never freed before the window."""
+        nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        start = self._used
+        if start + nbytes > self.nbytes:
+            raise AffineTransferExecutionError(f'window holds {self.nbytes - start} more bytes, {nbytes} requested')
+        self._used = -(-(start + nbytes) // self.ALIGNMENT) * self.ALIGNMENT
+        return self.pool[start:start + nbytes].view(dtype).view(tuple(shape))
+
+    def offset_of(self, buffer: torch.Tensor) -> Optional[int]:
+        """Element offset of ``buffer`` in this process's window, or None if it lies elsewhere."""
+        if buffer.device != self.pool.device:
+            return None
+        start = buffer.data_ptr() - self.pool.data_ptr()
+        size = buffer.element_size()
+        if start < 0 or start % size or start + buffer.numel() * size > self.nbytes:
+            return None
+        return start // size
+
+    def peer(self, process: int, dtype: torch.dtype) -> torch.Tensor:
+        """``process``'s window as flat elements of ``dtype``, mapped into this process."""
+        key = (process, dtype)
+        if key not in self._peers:
+            import deepspeed.comm as dist
+            numel = self.nbytes // torch.empty((), dtype=dtype).element_size()
+            self._peers[key] = dist.symm_mem_peer_tensor(self._handle, process, numel, dtype)
+        return self._peers[key]
+
+
+def _window_offsets(requests: Sequence['TransferRequest'], window: TransferWindow) -> Dict[Tuple, int]:
+    """This process's shards that lie in the window, keyed so that every process can look them up."""
+    offsets = {}
+    for request in requests:
+        for side, buffers in (('source', request.source_buffers), ('target', request.target_buffers)):
+            for location, buffer in buffers.items():
+                if isinstance(buffer, torch.Tensor) and buffer.is_contiguous():
+                    offset = window.offset_of(buffer)
+                    if offset is not None:
+                        offsets[(request.key, side, location)] = offset
+    return offsets
+
+
+def _mapped_direction(request_key: str, operation: '_Operation', offsets: Mapping[Tuple, int],
+                      window: TransferWindow) -> Optional[str]:
+    """``'pull'``, ``'push'`` or None, identically on every process of the group."""
+    segment = operation.segment
+    pull = (request_key, 'source', segment.source_rank) in offsets
+    push = (request_key, 'target', segment.target_rank) in offsets
+    if pull and push:
+        return window.direction
+    if pull:
+        return 'pull'
+    return 'push' if push else None
 
 
 @dataclass(frozen=True)
@@ -263,7 +346,8 @@ def execute_transfer(plan: TransferPlan,
                      endpoints: TransferEndpoints,
                      dtype: torch.dtype,
                      budget: StagingBudget = StagingBudget(),
-                     group: Optional[object] = None) -> TransferStats:
+                     group: Optional[object] = None,
+                     window: Optional[TransferWindow] = None) -> TransferStats:
     """Execute one plan with the same preflight and completion contract as a batch.
 
     Bindings use transport-group ranks. Buffers must be packed views on the owning process;
@@ -271,7 +355,7 @@ def execute_transfer(plan: TransferPlan,
     Transport failures after payload begins may leave partially written targets.
     """
     request = TransferRequest('parameter', plan, source_buffers, target_buffers)
-    return execute_transfers([request], endpoints, dtype, budget, group)
+    return execute_transfers([request], endpoints, dtype, budget, group, window)
 
 
 def _packed_rounds(indexed_operations: Sequence[Tuple[int, _Operation]], max_elements: int):
@@ -306,12 +390,15 @@ def execute_transfers(requests: Sequence[TransferRequest],
                       endpoints: TransferEndpoints,
                       dtype: torch.dtype,
                       budget: StagingBudget = StagingBudget(),
-                      group: Optional[object] = None) -> TransferStats:
+                      group: Optional[object] = None,
+                      window: Optional[TransferWindow] = None) -> TransferStats:
     """Move a frozen parameter batch with collective preflight and bounded peer messages.
 
     Each direction stages at most ``bytes_per_peer`` per active peer. All requests and staging
     allocations are checked before payload, including read/write aliases between parameters.
     The caller stream's final unpack and local copies complete before this function returns.
+    With a ``window`` (the same one on every process), operations touching window shards are copied
+    in place and the call ends with a group barrier, so no peer reads or writes them after return.
     """
     import deepspeed.comm as dist
 
@@ -331,6 +418,18 @@ def execute_transfers(requests: Sequence[TransferRequest],
     recv_direct, send_direct = {}, {}
     digest, rejected = 0, 0
     error = None
+    mapped_copies, mapped_total = [], 0
+    offsets: Dict[Tuple, int] = {}
+    if window is not None and world_size > 1:
+        # Collective, so it runs before anything that may reject; a bad buffer simply publishes nothing.
+        try:
+            local_offsets = _window_offsets(requests, window)
+        except (AttributeError, RuntimeError, TypeError):
+            local_offsets = {}
+        published = [None] * world_size
+        dist.all_gather_object(published, local_offsets, group=group)
+        for table in published:
+            offsets.update(table)
     try:
         element_size = torch.empty((), dtype=dtype).element_size()
         if (not isinstance(budget.bytes_per_peer, int) or isinstance(budget.bytes_per_peer, bool)
@@ -369,6 +468,15 @@ def execute_transfers(requests: Sequence[TransferRequest],
         for item, operation in indexed:
             if operation.from_process == operation.to_process == rank:
                 local_copies.append((item, operation))
+                continue
+            direction = None
+            if offsets and operation.from_process != operation.to_process:
+                direction = _mapped_direction(requests[item].key, operation, offsets, window)
+            if direction is not None:
+                mapped_total += 1
+                copier = operation.to_process if direction == 'pull' else operation.from_process
+                if copier == rank:
+                    mapped_copies.append((item, operation, direction))
             elif operation.to_process == rank:
                 incoming.setdefault(operation.from_process, []).append((item, operation))
             elif operation.from_process == rank:
@@ -486,10 +594,52 @@ def execute_transfers(requests: Sequence[TransferRequest],
             _region(source, operation.source_offset, operation.chunk_shape, operation.segment.source_strides))
         copied += operation.payload_bytes
 
+    mapped = 0
+    for item, operation, direction in _staggered(mapped_copies, rank):
+        request, segment = requests[item], operation.segment
+        if direction == 'pull':
+            peer = window.peer(operation.from_process, dtype)
+            base = offsets[(request.key, 'source', segment.source_rank)]
+            source = _region(peer, base + operation.source_offset, operation.chunk_shape, segment.source_strides)
+            target = _region(_flat(segment.target_rank, request.target_buffers, dtype), operation.target_offset,
+                             operation.chunk_shape, segment.target_strides)
+        else:
+            peer = window.peer(operation.to_process, dtype)
+            base = offsets[(request.key, 'target', segment.target_rank)]
+            source = _region(_flat(segment.source_rank, request.source_buffers, dtype), operation.source_offset,
+                             operation.chunk_shape, segment.source_strides)
+            target = _region(peer, base + operation.target_offset, operation.chunk_shape, segment.target_strides)
+        target.copy_(source)
+        mapped += operation.payload_bytes
+
     if stream_ordered:
         get_accelerator().current_stream().synchronize()
+    if mapped_total:
+        # A pulled source or pushed target belongs to another process: neither may be reused until every
+        # copier is done. The preflight agreement already ordered all earlier writes before the copies.
+        dist.barrier(group=group)
     return TransferStats(sum(len(request.plan.segments) for request in requests), len(indexed), rounds, copied, sent,
-                         received)
+                         received, mapped)
+
+
+def _staggered(mapped_copies, rank: int):
+    """This process's window copies, starting at a different peer than its neighbours.
+
+    Every copier walking its peers in the same order makes them all read from (or write to) one peer at a
+    time, which serializes on that peer's link while the others idle. Rotating the start by rank spreads
+    the copiers over the peers; within a peer the plan order is kept.
+    """
+
+    def peer_of(entry):
+        _, operation, direction = entry
+        return operation.from_process if direction == 'pull' else operation.to_process
+
+    peers = sorted({peer_of(entry) for entry in mapped_copies})
+    if not peers:
+        return []
+    start = rank % len(peers)
+    position = {peer: (index - start) % len(peers) for index, peer in enumerate(peers)}
+    return sorted(mapped_copies, key=lambda entry: position[peer_of(entry)])
 
 
 def _data_range(buffer: torch.Tensor) -> Tuple[int, int]:
