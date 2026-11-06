@@ -124,8 +124,8 @@ class TransferWindow:
         self._used = 0
         self._peers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
         self._stream = None
-        # Stream-ordered peer signals are only verified on CUDA; elsewhere a run fences with group barriers.
-        self.signals = self.pool.device.type == 'cuda'
+        # Stream-ordered peer signals are verified on CUDA and XPU; elsewhere a run fences with group barriers.
+        self.signals = self.pool.device.type in ('cuda', 'xpu')
 
     def tensor(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
         """A new shard inside the window; never freed before the window."""
