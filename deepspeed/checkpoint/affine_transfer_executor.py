@@ -413,6 +413,29 @@ def _direct_payload(entries, requests, dtype, source):
     return region.view(-1) if region.is_contiguous() else None
 
 
+def _arena_views(rounds, direct, dtype, device, element_size):
+    """Stage every peer of one direction in slices of a single allocation.
+
+    Transports that map peer buffers through IPC handles (oneCCL on XPU) pay per allocation when a
+    released arena is allocated again, so one allocation per direction pays it once instead of per peer.
+    """
+    # 256-byte slice starts keep each peer's messages as aligned as a separate allocation would be.
+    alignment = max(1, 256 // element_size)
+    sizes = {}
+    for peer, peer_rounds in sorted(rounds.items()):
+        staged = [count for index, (_, count) in enumerate(peer_rounds) if direct[peer][index] is None]
+        if staged:
+            sizes[peer] = (max(staged) + alignment - 1) // alignment * alignment
+    if not sizes:
+        return {}
+    flat = torch.empty(sum(sizes.values()), dtype=dtype, device=device)
+    views, offset = {}, 0
+    for peer, size in sizes.items():
+        views[peer] = flat[offset:offset + size]
+        offset += size
+    return views
+
+
 def execute_transfers(requests: Sequence[TransferRequest],
                       endpoints: TransferEndpoints,
                       dtype: torch.dtype,
@@ -538,20 +561,8 @@ def prepare_transfers(requests: Sequence[TransferRequest],
             peer: [_direct_payload(entries, requests, dtype, True) for entries, _ in rounds]
             for peer, rounds in send_rounds.items()
         }
-        recv_arenas = {
-            peer:
-            torch.empty(max(count for index, (_, count) in enumerate(rounds) if recv_direct[peer][index] is None),
-                        dtype=dtype,
-                        device=device)
-            for peer, rounds in recv_rounds.items() if any(payload is None for payload in recv_direct[peer])
-        }
-        send_arenas = {
-            peer:
-            torch.empty(max(count for index, (_, count) in enumerate(rounds) if send_direct[peer][index] is None),
-                        dtype=dtype,
-                        device=device)
-            for peer, rounds in send_rounds.items() if any(payload is None for payload in send_direct[peer])
-        }
+        recv_arenas = _arena_views(recv_rounds, recv_direct, dtype, device, element_size)
+        send_arenas = _arena_views(send_rounds, send_direct, dtype, device, element_size)
     except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, OverflowError, MemoryError) as caught:
         error = caught
         rejected = 1
