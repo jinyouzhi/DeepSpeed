@@ -33,6 +33,25 @@ The budget applies to each peer direction, not total device memory. Weights must
 remain frozen during transfer; optimizer migration and live AutoEP swaps are outside
 this API. Maintenance contact: ``@0z5a``.
 
+A batch moved repeatedly, such as rollout weights refreshed after every training
+step, should be prepared once. ``prepare_transfers`` performs the validation,
+agreement and layout of ``execute_transfers`` and returns a ``PreparedTransfer``
+whose ``run`` only moves data from the buffers' current contents::
+
+    prepared = prepare_transfers(requests, endpoints, dtype, window=window)
+    for step in range(steps):
+        train_step()
+        prepared.run()
+
+Every process must call ``run`` the same number of times, and buffers must not be
+reallocated while the prepared transfer is in use. ZeRO-3 ``offload_states`` /
+``reload_states`` do reallocate them: every weight partition, and a master copy
+that aliases it, moves to new storage. The plans still hold, since they depend
+only on the layout, but a prepared transfer would keep writing into the old
+storage. Passing the batch rebuilt from the live state, ``prepared.run(requests)``,
+checks that every buffer is still where it was prepared; otherwise every process
+raises before data moves, and the batch must be prepared again.
+
 Transport and staging
 ---------------------
 
