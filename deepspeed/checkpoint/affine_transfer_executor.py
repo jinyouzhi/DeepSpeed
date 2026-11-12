@@ -465,7 +465,8 @@ def prepare_transfers(requests: Sequence[TransferRequest],
 
     Collective, with the same preflight and rejection contract as ``execute_transfers``. The result
     keeps the buffers, staging arenas and window offsets it was prepared with: buffers must stay where
-    they are, and every process must call ``run`` the same number of times.
+    they are, and every process must call ``run`` the same number of times. ``run(requests)`` checks
+    that they did.
     """
     import deepspeed.comm as dist
 
@@ -616,6 +617,8 @@ def prepare_transfers(requests: Sequence[TransferRequest],
     prepared._mapped_total, prepared._copiers = mapped_total, sorted(copiers)
     prepared._segments = sum(len(request.plan.segments) for request in requests)
     prepared._chunks = len(indexed)
+    prepared._world_size, prepared._device = world_size, device
+    prepared._layout = _buffer_layout(requests)
     return prepared
 
 
@@ -623,8 +626,19 @@ class PreparedTransfer:
     """A batch validated, agreed and laid out by ``prepare_transfers``; ``run`` only moves data."""
     _runs = 0
 
-    def run(self) -> TransferStats:
-        """Move the batch again from the buffers' current contents. Collective; synchronous on return."""
+    def run(self, requests: Optional[Sequence[TransferRequest]] = None) -> TransferStats:
+        """Move the batch again from the buffers' current contents. Collective; synchronous on return.
+
+        The batch keeps the buffers and peer views it was prepared with, so a buffer moved to new storage
+        since then (as ZeRO-3 ``offload_states`` / ``reload_states`` move every weight partition and an
+        aliased master) would leave this writing into the old storage without error. Pass the batch's
+        requests rebuilt from the live state, such as fresh ``zero_param_storage_shard`` views, to check
+        first that every buffer is where it was prepared. If one moved on any process, every process
+        raises before data moves, and the batch has to be prepared again. The check costs one small
+        all-reduce.
+        """
+        if requests is not None:
+            _check_layout(self, requests)
         return _run(self)
 
 
@@ -738,6 +752,34 @@ def _run(prepared: PreparedTransfer) -> TransferStats:
         dist.barrier(group=group)
     prepared._runs += 1
     return TransferStats(prepared._segments, prepared._chunks, rounds, copied, sent, received, prepared._mapped_bytes)
+
+
+def _buffer_layout(requests: Sequence[TransferRequest]) -> Tuple:
+    """Which memory each request's local buffers occupy, and under which plan."""
+    layout = []
+    for request in requests:
+        for side, buffers in (('source', request.source_buffers), ('target', request.target_buffers)):
+            for location in sorted(buffers):
+                buffer = buffers[location]
+                layout.append((request.key, request.plan, side, location, buffer.data_ptr(), buffer.numel(),
+                               buffer.dtype, buffer.device))
+    return tuple(layout)
+
+
+def _check_layout(prepared: PreparedTransfer, requests: Sequence[TransferRequest]) -> None:
+    import deepspeed.comm as dist
+    try:
+        moved = int(_buffer_layout(requests) != prepared._layout)
+    except (AttributeError, TypeError):
+        moved = 1
+    if prepared._world_size > 1:
+        # One process raising alone would leave its peers waiting in the transfer.
+        flag = torch.tensor([moved], dtype=torch.int64, device=prepared._device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=prepared._group)
+        moved = int(flag.item())
+    if moved:
+        raise AffineTransferExecutionError('a buffer of the prepared transfer moved or changed since '
+                                           'prepare_transfers; prepare the batch again. No data moved.')
 
 
 def _staggered(mapped_copies, rank: int):
