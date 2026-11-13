@@ -1593,6 +1593,38 @@ class HybridEngineRollout(RolloutEngine):
                 attn_patched = 0
                 module._ki_fused_norm_patched = 0
 
+        import os
+        if self.use_segki and attn_patched and os.environ.get("SEGKI_VLLM_ATTN") == "1":
+            from deepspeed.module_inject.segki_vllm_backend import fa3_available
+            if fa3_available():
+                # NHD storage for FA3; the HND keys/values stay as views so
+                # update() and the fallback forwards keep working.
+                block_table = torch.arange(batch_size, device=device, dtype=torch.int32)[:, None]
+                cu_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+                for ds_layer in ds_cache.layers:
+                    if isinstance(ds_layer, DSStaticGDNSlot) or getattr(ds_layer, "keys", None) is None:
+                        continue
+                    k_nhd = ds_layer.keys.permute(0, 2, 1, 3).contiguous()
+                    v_nhd = ds_layer.values.permute(0, 2, 1, 3).contiguous()
+                    ds_layer.keys = k_nhd.permute(0, 2, 1, 3)
+                    ds_layer.values = v_nhd.permute(0, 2, 1, 3)
+                    ds_layer._ki_nhd = (k_nhd, v_nhd, block_table, cu_q)
+        if self.use_segki and os.environ.get("SEGKI_VLLM_GDN") == "1":
+            from deepspeed.module_inject.segki_vllm_backend import gdn_packed_available
+            if gdn_packed_available():
+                # [V, K]-major state with vLLM's null slot 0; HF keeps a
+                # [K, V] view so snapshot/restore and copy_ still alias it.
+                state_idx = torch.arange(1, batch_size + 1, device=device, dtype=torch.int32)
+                for ds_layer in ds_cache.layers:
+                    if not isinstance(ds_layer, DSStaticGDNSlot):
+                        continue
+                    rs = ds_layer.recurrent_states[0]
+                    vk = rs.new_zeros(rs.shape[0] + 1, rs.shape[1], rs.shape[3], rs.shape[2])
+                    vk[1:].copy_(rs.transpose(-1, -2))
+                    ds_layer._slot.recurrent_states[0] = vk[1:].transpose(-1, -2)
+                    ds_layer._ki_vk_full = vk
+                    ds_layer._ki_vk_idx = state_idx
+
         # Snapshot the GDN states right after prefill: the warmup forwards
         # advance conv/recurrent states by extra steps, so they must be
         # restored before capture or every replay starts from corrupted state.

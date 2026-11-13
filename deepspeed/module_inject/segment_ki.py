@@ -402,67 +402,86 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
             mixed_qkv = mixed_qkv[:, :, -seq_len:]
 
     mixed_qkv = mixed_qkv.transpose(1, 2)
-    query, key, value = torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)
-    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-    gdn_op = getattr(self, "_ki_gdn_op", None)
-    from deepspeed.accelerator import get_accelerator
-    # The native gdn_gates op has no autograd registration, so a training
-    # step through this branch would silently cut gradients to the a/b
-    # projections, A_log, and dt_bias. The kernel's win is decode launch
-    # overhead (a no-grad path); training runs the composite ops instead.
-    # It also reads raw BFloat16 pointers only — fp16 models must take the
-    # composite path rather than raise inside the binding.
-    if (seq_len == 1 and gdn_op is not None and get_accelerator().on_accelerator(a) and not torch.is_grad_enabled()
-            and a.dtype is torch.bfloat16):
-        # A_log/dt_bias are static across the rollout — cache the fp32
-        # rank slice once instead of re-casting every decode step
-        hv = self.num_v_heads
-        cached = getattr(self, "_ki_gates_cache", None)
-        if cached is None or cached[0] is not self.A_log:
-            sl = (lambda t: t.detach().reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads]) if hv > num_v_heads \
-                else (lambda t: t.detach())
-            cached = (self.A_log, sl(self.A_log).float().contiguous(), sl(self.dt_bias).float().contiguous())
-            self._ki_gates_cache = cached
-        a_log_f, dt_f = cached[1], cached[2]
-        # gdn_gates accepts row-strided a/b, so the fused-output slices go in
-        # without contiguous copies. Routed through the torch.library op so
-        # inductor fuses the glue around it (route A).
-        beta, g = gdn_op.gdn_gates(a, b, a_log_f, dt_f)
+    vk_state = None
+    if use_precomputed_states and seq_len == 1 and tp_size == 1 and not torch.is_grad_enabled():
+        vk_state = getattr(cache_params.layers[self.layer_idx], "_ki_vk_full", None)
+    if vk_state is not None:
+        # vLLM-aligned path: packed decode kernel fuses gates, GQA indexing
+        # and the recurrence on a [V, K]-major state.
+        from deepspeed.module_inject.segki_vllm_backend import gdn_packed_decode
+        core_attn_out = torch.empty(batch_size,
+                                    1,
+                                    num_v_heads,
+                                    self.head_v_dim,
+                                    dtype=mixed_qkv.dtype,
+                                    device=mixed_qkv.device)
+        gdn_packed_decode(mixed_qkv.reshape(batch_size, -1), a.reshape(batch_size, -1), b.reshape(batch_size, -1),
+                          self.A_log.detach().reshape(-1),
+                          self.dt_bias.detach().reshape(-1), self.head_k_dim**-0.5, vk_state, core_attn_out,
+                          cache_params.layers[self.layer_idx]._ki_vk_idx)
     else:
-        beta = b.sigmoid()
-        hv = self.num_v_heads
-        a_log_l = self.A_log.reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads] if hv > num_v_heads else self.A_log
-        dt_l = self.dt_bias.reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads] if hv > num_v_heads else self.dt_bias
-        g = -a_log_l.float().exp() * F.softplus(a.float() + dt_l)
-    if num_v_heads // num_k_heads > 1:
-        rep_op = getattr(self, "_ki_gdn_op", None)
-        if (rep_op is not None and hasattr(rep_op, "repeat_qk") and not torch.is_grad_enabled()
-                and query.dtype is torch.bfloat16 and query.is_contiguous() and key.is_contiguous()):
-            query, key = rep_op.repeat_qk(query, key, num_v_heads // num_k_heads)
-        else:
-            query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-            key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        query, key, value = torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-    recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
-    # Whitelist the scan inputs: transformers threads unrelated layer kwargs
-    # (use_cache, cache_position, ...) down to every block and the fused
-    # kernel signatures reject unknown names.
-    scan_kwargs = dict(g=g,
-                       beta=beta,
-                       initial_state=recurrent_state,
-                       output_final_state=cache_params is not None,
-                       use_qk_l2norm_in_kernel=True)
-    # The dict.get default avoids truth-value evaluation: `or` on a
-    # multi-element cu-seqlens tensor raises "ambiguous boolean value".
-    cu_seqlens = kwargs.get("cu_seq_lens_q", kwargs.get("cu_seqlens"))
-    if cu_seqlens is not None:
-        scan_kwargs["cu_seqlens"] = cu_seqlens
-    core_attn_out, last_recurrent_state = self._ki_gdn_scan(query, key, value, **scan_kwargs)
-    if cache_params is not None and last_recurrent_state is not None:
-        cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+        gdn_op = getattr(self, "_ki_gdn_op", None)
+        from deepspeed.accelerator import get_accelerator
+        # The native gdn_gates op has no autograd registration, so a training
+        # step through this branch would silently cut gradients to the a/b
+        # projections, A_log, and dt_bias. The kernel's win is decode launch
+        # overhead (a no-grad path); training runs the composite ops instead.
+        # It also reads raw BFloat16 pointers only — fp16 models must take the
+        # composite path rather than raise inside the binding.
+        if (seq_len == 1 and gdn_op is not None and get_accelerator().on_accelerator(a)
+                and not torch.is_grad_enabled() and a.dtype is torch.bfloat16):
+            # A_log/dt_bias are static across the rollout — cache the fp32
+            # rank slice once instead of re-casting every decode step
+            hv = self.num_v_heads
+            cached = getattr(self, "_ki_gates_cache", None)
+            if cached is None or cached[0] is not self.A_log:
+                sl = (lambda t: t.detach().reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads]) if hv > num_v_heads \
+                    else (lambda t: t.detach())
+                cached = (self.A_log, sl(self.A_log).float().contiguous(), sl(self.dt_bias).float().contiguous())
+                self._ki_gates_cache = cached
+            a_log_f, dt_f = cached[1], cached[2]
+            # gdn_gates accepts row-strided a/b, so the fused-output slices go in
+            # without contiguous copies. Routed through the torch.library op so
+            # inductor fuses the glue around it (route A).
+            beta, g = gdn_op.gdn_gates(a, b, a_log_f, dt_f)
+        else:
+            beta = b.sigmoid()
+            hv = self.num_v_heads
+            a_log_l = self.A_log.reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads] if hv > num_v_heads else self.A_log
+            dt_l = self.dt_bias.reshape(-1)[r * num_v_heads:(r + 1) *
+                                            num_v_heads] if hv > num_v_heads else self.dt_bias
+            g = -a_log_l.float().exp() * F.softplus(a.float() + dt_l)
+        if num_v_heads // num_k_heads > 1:
+            rep_op = getattr(self, "_ki_gdn_op", None)
+            if (rep_op is not None and hasattr(rep_op, "repeat_qk") and not torch.is_grad_enabled()
+                    and query.dtype is torch.bfloat16 and query.is_contiguous() and key.is_contiguous()):
+                query, key = rep_op.repeat_qk(query, key, num_v_heads // num_k_heads)
+            else:
+                query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+                key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+
+        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
+        # Whitelist the scan inputs: transformers threads unrelated layer kwargs
+        # (use_cache, cache_position, ...) down to every block and the fused
+        # kernel signatures reject unknown names.
+        scan_kwargs = dict(g=g,
+                           beta=beta,
+                           initial_state=recurrent_state,
+                           output_final_state=cache_params is not None,
+                           use_qk_l2norm_in_kernel=True)
+        # The dict.get default avoids truth-value evaluation: `or` on a
+        # multi-element cu-seqlens tensor raises "ambiguous boolean value".
+        cu_seqlens = kwargs.get("cu_seq_lens_q", kwargs.get("cu_seqlens"))
+        if cu_seqlens is not None:
+            scan_kwargs["cu_seqlens"] = cu_seqlens
+        core_attn_out, last_recurrent_state = self._ki_gdn_scan(query, key, value, **scan_kwargs)
+        if cache_params is not None and last_recurrent_state is not None:
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
     core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
     z = z.reshape(-1, self.head_v_dim)
@@ -889,6 +908,7 @@ def _decode_attn_forward(self,
         # decode_attn needs contiguous k/v; the tiny materialization (B*k_dims
         # bf16) is far cheaper than the two extra GEMM launches it replaces
         q_out = fused[:, :qn]
+        kv_raw = fused[:, qn:]
         k_flat = fused[:, qn:qn + kn].contiguous()
         v_flat = fused[:, qn + kn:].contiguous()
         query_states, gate = torch.chunk(q_out.reshape(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
@@ -914,6 +934,22 @@ def _decode_attn_forward(self,
 
     num_q_heads, num_kv_heads, head_dim = self._ki_num_q_heads, self._ki_num_kv_heads, self.head_dim
     batch = hidden_states.shape[0]
+    nhd = getattr(past_key_values._layers[self.layer_idx], "_ki_nhd", None)
+    if nhd is not None and getattr(self, "_ki_k_norm_w", None) is not None:
+        # vLLM-aligned path: fused q/k norm + rope + NHD cache store, then FA3.
+        from deepspeed.module_inject.segki_vllm_backend import qk_norm_rope_store, fa3_decode
+        k_nhd, v_nhd, block_table, cu_q = nhd
+        if "kv_raw" not in locals():
+            kv_raw = torch.cat([k_flat.reshape(batch, -1), v_flat.reshape(batch, -1)], -1)
+        q_in = query_states[:, 0]
+        q_rot = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+        qk_norm_rope_store(q_in, kv_raw, q_rot, k_nhd, v_nhd, self._ki_write_pos, self._ki_q_norm_w, self._ki_k_norm_w,
+                           self._ki_cos_t, self._ki_sin_t, self.q_norm.eps)
+        out = torch.empty_like(q_rot)
+        seqused = (self._ki_write_pos + 1).to(torch.int32)
+        fa3_decode(q_rot, k_nhd, v_nhd, seqused, cu_q, block_table, self.scaling, out)
+        attn_output = (out * torch.sigmoid(gate[:, 0])).view(*input_shape, -1)
+        return self.o_proj(attn_output), None
     out = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
     fuse_q = getattr(self, "_ki_q_norm_w", None) is not None
     fuse_k = fuse_q and getattr(self, "_ki_k_norm_w", None) is not None
