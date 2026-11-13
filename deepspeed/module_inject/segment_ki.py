@@ -258,7 +258,7 @@ def _dual_weight_glu_forward(self, input):
     if input.numel() == input.shape[-1] and getattr(self, "_ki_dual_op", None) is not None:
         out = DualWeightGluGEMV.apply(input.reshape(-1), self.gate_proj.weight, self.up_proj.weight, self._ki_dual_op)
         return self.down_proj(out.reshape(*input.shape[:-1], -1))
-    if 1 < m <= 32 and getattr(self, "_ki_dual_op", None) is not None:
+    if m > 1 and getattr(self, "_ki_dual_op", None) is not None:
         out = DualWeightGluGEMV.apply(input.reshape(m, -1), self.gate_proj.weight, self.up_proj.weight,
                                       self._ki_dual_op)
         return self.down_proj(out.reshape(*input.shape[:-1], -1))
@@ -361,6 +361,17 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
         fused = GDNInputProj.apply(
             hidden_states.squeeze(0).squeeze(0), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
             self.in_proj_a.weight, gdn_kernel_op).view(1, 1, -1)
+    elif not torch.is_grad_enabled():
+        # b and a have one row per head; one GEMM over both beats two N=num_heads GEMMs.
+        ba_w = getattr(self, "_ki_ba_w", None)
+        if ba_w is None or ba_w[0] is not self.in_proj_b.weight:
+            ba_w = (self.in_proj_b.weight, torch.cat([self.in_proj_b.weight, self.in_proj_a.weight]))
+            self._ki_ba_w = ba_w
+        fused = torch.cat([
+            F.linear(hidden_states, self.in_proj_qkv.weight),
+            F.linear(hidden_states, self.in_proj_z.weight),
+            F.linear(hidden_states, ba_w[1])
+        ], -1)
     else:
         fused = GDNInputProj.apply(hidden_states, self.in_proj_qkv.weight, self.in_proj_z.weight,
                                    self.in_proj_b.weight, self.in_proj_a.weight, gdn_kernel_op)
@@ -1104,7 +1115,9 @@ def _fused_norm_layer_forward(self,
 
     op = self._ki_norm_op
     residual = hidden_states
-    hidden_states = self.input_layernorm(hidden_states)
+    norm = self.input_layernorm
+    hidden_states = F.rms_norm(hidden_states.float(), (hidden_states.shape[-1], ), self._ki_input_scale,
+                               norm.eps).to(hidden_states.dtype)
 
     if self.block_type == "linear_attention":
         hidden_states = self.linear_attn(
@@ -1131,8 +1144,7 @@ def _fused_norm_layer_forward(self,
     # directly. During capture the add becomes part of the graph, so replay
     # reads the parameter's memory and reflects post-training values.
     new_residual = hidden_states
-    postattn_scale = torch.add(1.0, self.post_attention_layernorm.weight.float()).contiguous()
-    mlp_input = op.fused_add_norm(new_residual, residual, postattn_scale, self.post_attention_layernorm.eps)
+    mlp_input = op.fused_add_norm(new_residual, residual, self._ki_postattn_scale, self.post_attention_layernorm.eps)
     hidden_states = self.mlp(mlp_input)
     hidden_states = hidden_states + new_residual
 
@@ -1157,6 +1169,10 @@ def install_fused_norm(model: torch.nn.Module, kernel_op) -> int:
         if getattr(module, "_ki_orig_layer_forward", None) is None:
             module._ki_orig_layer_forward = module.forward
         module._ki_norm_op = kernel_op
+        # The norms scale by 1 + weight; computed once per install, which runs once per rollout.
+        with torch.no_grad():
+            module._ki_input_scale = torch.add(1.0, module.input_layernorm.weight.float()).contiguous()
+            module._ki_postattn_scale = torch.add(1.0, module.post_attention_layernorm.weight.float()).contiguous()
         module.forward = _fused_norm_layer_forward.__get__(module, type(module))
         patched += 1
     return patched
