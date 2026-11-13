@@ -1554,6 +1554,7 @@ class HybridEngineRollout(RolloutEngine):
         static_pos_ids = write_pos.unsqueeze(1)
 
         full_token_buf = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         full_token_buf[:, :prompt_len] = prompt_ids
         full_token_buf[:, prompt_len] = next_token.view(-1)  # first generated token per row
 
@@ -1652,17 +1653,15 @@ class HybridEngineRollout(RolloutEngine):
                     position_ids=static_pos_ids,
                 )
                 static_logits = out.logits
-                # decode_step_graph kernel is b=1 only (single-sequence argmax);
-                # for b>1 the graph captures forward only and Python handles
-                # argmax + buffer updates outside the graph. The kernel also
-                # only accepts CUDA bf16 logits — fp16 models must keep the
-                # PyTorch argmax path instead of failing during capture.
-                is_greedy = sampling is None or sampling.temperature <= 0.0
-                if (graph_op is not None and is_greedy and static_logits.dtype is torch.bfloat16
-                        and get_accelerator().on_accelerator(static_logits)):
-                    graph_op.decode_step_graph(static_logits[:, -1, :].contiguous(), static_token.view(batch_size, 1),
-                                               write_pos, static_attn, full_token_buf)
-                    step_kernel_mounted = True
+                # P0-3: the whole decode step runs in the graph for every batch size.
+                next_in_graph = select_next_tokens(static_logits[:, -1, :])
+                full_token_buf.index_copy_(1, write_pos[:1] + 1, next_in_graph)
+                if eos_token_id is not None:
+                    finished.logical_or_(next_in_graph.view(batch_size) == eos_token_id)
+                static_token.copy_(next_in_graph)
+                write_pos.add_(1)
+                static_attn.index_fill_(-1, write_pos[:1], True)
+                step_kernel_mounted = True
 
             # The capture run advanced the GDN conv/recurrent states (its
             # forward consumed static_token) and mutated write_pos whether
@@ -1677,39 +1676,17 @@ class HybridEngineRollout(RolloutEngine):
             module._forward_hooks.update(saved_post)
 
         # --- Decode loop: full-step graph (b=1) > graph+Python (b>1) > Python loop ---
-        if graph is not None and batch_size > 1:
-            # Graph forward + Python argmax for b>1: the graph eliminates kernel
-            # launch overhead for the forward pass; argmax and buffer updates
-            # stay in Python (PyTorch argmax is batch-native).  The Python
-            # overhead (~50us/step) is a smaller fraction of the larger GPU
-            # workload at higher batch.
-            eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            for step in range(max_new_tokens - 1):
-                if eos_mask.all():
-                    output_ids.append(torch.full((batch_size, 1), pad_token_id, dtype=torch.long, device=device))
-                    continue
-                static_token.copy_(next_token)
-                pos = prompt_len + step
-                write_pos.fill_(pos)
-                # Reveal only the current token's own slot: the pos+1 slot has
-                # not been written yet (warmup/capture leftovers), and SDPA at
-                # b>1 attends every slot the mask reveals.
-                static_attn[:, :, :, pos] = True
-                get_accelerator().replay_graph(graph)
-                next_token = select_next_tokens(static_logits[:, -1, :])
-                output_ids.append(next_token)
-                eos_mask |= (next_token.view(batch_size) == eos_token_id)
-            return torch.cat(output_ids, dim=1)
-
         # Full-step graph requires the step kernel to actually be in the
         # graph: mounting is conditional (b=1, CUDA bf16 logits), and a
         # kernel-less graph replay would read a token buffer nobody wrote.
         if step_kernel_mounted:
             eos_check_every = 16
+            if eos_token_id is not None:
+                finished.copy_(next_token.view(batch_size) == eos_token_id)
             for step in range(max_new_tokens - 1):
                 get_accelerator().replay_graph(graph)
                 if eos_token_id is not None and step % eos_check_every == eos_check_every - 1:
-                    if bool((static_token.view(-1) == eos_token_id).all().item()):
+                    if bool(finished.all().item()):
                         break
             # pad each row's tail after its own first EOS (response region only;
             # a prompt may legitimately contain the EOS id as content)
