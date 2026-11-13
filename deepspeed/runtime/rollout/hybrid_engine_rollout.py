@@ -1579,6 +1579,9 @@ class HybridEngineRollout(RolloutEngine):
                 if rotary is not None:
                     with torch.no_grad():
                         positions = torch.arange(max_len, device=device)[None, :]
+                        if hasattr(rotary, "mrope_section"):
+                            # MRoPE takes [3, batch, len] positions; text-only rows are all equal.
+                            positions = positions[None].expand(3, 1, -1)
                         cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
                         cos_t = cos_t[0].float().contiguous()
                         sin_t = sin_t[0].float().contiguous()
