@@ -671,15 +671,49 @@ class TorchBackend(Backend):
         from torch.distributed._symmetric_memory import enable_symm_mem_for_group
         return enable_symm_mem_for_group(group_name)
 
-    def symm_mem_rendezvous(self, numel, dtype, group=None):
-        """Allocate ``numel`` elements every member of ``group`` can address, and exchange handles."""
+    def symm_mem_rendezvous(self, numel, dtype, group=None, backend=None):
+        """Allocate ``numel`` elements every member of ``group`` can address, and exchange handles.
+
+        ``backend`` selects torch's symmetric-memory backend, which is process-wide and fixed by the first
+        allocation in the process.
+        """
         if not required_torch_version(min_version=2.5):
             raise RuntimeError(f"Torch version must be 2.5 or higher to use symmetric memory. "
                                f"Current version: {torch.__version__}")
         import torch.distributed._symmetric_memory as symm_mem
+        device = get_accelerator().current_device_name()
+        if backend is not None:
+            if backend == 'NCCL' and not hasattr(symm_mem, 'put_signal'):
+                raise RuntimeError(f"NCCL symmetric-memory puts need a newer torch. "
+                                   f"Current version: {torch.__version__}")
+            if symm_mem.get_backend(device) != backend:
+                symm_mem.set_backend(backend)
         group = group if group is not None else torch.distributed.group.WORLD
-        buffer = symm_mem.empty(numel, dtype=dtype, device=get_accelerator().current_device_name())
+        buffer = symm_mem.empty(numel, dtype=dtype, device=device)
         return buffer, symm_mem.rendezvous(buffer, group.group_name)
+
+    def symm_mem_handle_at(self, buffer, byte_offset, nbytes, group=None):
+        """A handle for ``nbytes`` at ``byte_offset`` of a rendezvoused ``buffer``, made by this process alone.
+
+        A put lands at its handle's offset in the peer's buffer. Handles are cached by storage address, so a
+        view would get the buffer's own handle at offset 0; a storage that starts at the offset gets its own.
+        """
+        import torch.distributed._symmetric_memory as symm_mem
+        group = group if group is not None else torch.distributed.group.WORLD
+        storage = torch._C._construct_storage_from_data_pointer(buffer.data_ptr() + byte_offset, buffer.device, nbytes)
+        region = torch.empty(0, dtype=torch.uint8, device=buffer.device).set_(storage, 0, (nbytes, ))
+        return symm_mem.rendezvous(region, group.group_name)
+
+    def symm_mem_put_signal(self, source, handle, peer):
+        """Write ``source``, which lies in a rendezvoused buffer, to ``peer`` at ``handle``'s offset, then
+        raise one signal at ``peer``; ordered on the current stream."""
+        import torch.distributed._symmetric_memory as symm_mem
+        symm_mem.put_signal(source, handle, peer)
+
+    def symm_mem_wait_signal(self, handle, peer):
+        """Hold the current stream until one signal from ``peer`` arrives, and consume it."""
+        import torch.distributed._symmetric_memory as symm_mem
+        symm_mem.wait_signal(handle, peer)
 
     def symm_mem_peer_tensor(self, handle, peer, numel, dtype):
         """``peer``'s symmetric buffer as a tensor on this process's device."""

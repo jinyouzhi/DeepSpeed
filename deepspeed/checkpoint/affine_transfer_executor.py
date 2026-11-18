@@ -41,6 +41,10 @@ to change when such a path lands.
 PCIe, NVLink or Xe Link). Buffers carved from a window are published to the group, and an operation whose
 source or target lies in a window is copied in place by one process -- the target pulls, or the source
 pushes -- with no staging, no peer message and no budget. Everything else keeps the protocol above.
+Processes on different hosts cannot map each other's windows. A window whose group spans hosts is
+registered with NCCL instead: processes on one host still copy in place, and operations between hosts
+are staged -- or, if the window allows puts, an operation whose source and target are both packed
+regions of window shards is a one-sided put from the source, adjacent ones coalesced into one.
 
 One device per process, with explicit transport-group rank bindings, synchronous on return. No CUDA graphs, no overlap with compute,
 and ``copy_`` for every region by default: graphs and overlap change the schedule, which is the last thing
@@ -53,6 +57,7 @@ import contextlib
 import gc
 import hashlib
 import math
+import socket
 import sys
 import zlib
 from dataclasses import dataclass
@@ -111,22 +116,47 @@ class TransferWindow:
     registration is paid once, not per transfer. ``direction`` decides who copies when both the source
     and the target of an operation lie in a window; which one is faster depends on the interconnect, so
     it is the caller's.
+
+    A group whose processes are on more than one host needs CUDA: the window is then allocated with torch's
+    NCCL symmetric-memory backend, which is process-wide, so it must be the first symmetric memory the
+    process allocates. Processes on different hosts cannot map each other's windows, so ``direction`` does
+    not apply between them: their operations are staged, unless ``puts`` lets the source put packed regions
+    straight into the target's window. Each put is a separate NCCL operation, so puts pay off when every
+    process puts to few peers: on two 8-GPU hosts, a process putting to its one peer on the other host
+    beat staging, and one putting to all eight of them was slower than staging, which sends to all peers
+    at once. A put is also one-sided: an error after one is issued may leave its target shard partly
+    written, and NCCL treats it as fatal to the communicator rather than something a transfer can roll back.
     """
     ALIGNMENT = 512
 
-    def __init__(self, nbytes: int, group: Optional[object] = None, direction: str = 'pull'):
+    def __init__(self, nbytes: int, group: Optional[object] = None, direction: str = 'pull', puts: bool = False):
         import deepspeed.comm as dist
         if direction not in ('pull', 'push'):
             raise AffineTransferExecutionError("window direction must be 'pull' or 'push'")
         self.group = group
         self.direction = direction
+        self.puts = puts
         # Symmetric memory needs one size on every process, while shard sizes differ between processes.
         largest = torch.tensor([nbytes], dtype=torch.int64, device=get_accelerator().current_device_name())
         dist.all_reduce(largest, op=dist.ReduceOp.MAX, group=group)
         self.nbytes = -(-int(largest.item()) // self.ALIGNMENT) * self.ALIGNMENT
-        self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group)
+        if group is not None and callable(getattr(group, 'size', None)):
+            world_size = group.size()
+        else:
+            world_size = dist.get_world_size(group=group)
+        names = [None] * world_size
+        dist.all_gather_object(names, socket.gethostname(), group=group)
+        # Per process, the first process on its host: what every process must agree on to tell a put apart.
+        self.hosts = tuple(names.index(name) for name in names)
+        backend = None
+        if len(set(self.hosts)) > 1:
+            if get_accelerator().device_name() != 'cuda':
+                raise AffineTransferExecutionError('a window across hosts needs CUDA, whose NCCL puts reach them')
+            backend = 'NCCL'
+        self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group, backend)
         self._used = 0
         self._peers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
+        self._remotes: Dict[int, object] = {}
 
     def tensor(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
         """A new shard inside the window; never freed before the window."""
@@ -155,6 +185,25 @@ class TransferWindow:
             numel = self.nbytes // torch.empty((), dtype=dtype).element_size()
             self._peers[key] = dist.symm_mem_peer_tensor(self._handle, process, numel, dtype)
         return self._peers[key]
+
+    def remote(self, byte_offset: int):
+        """Where a ``put`` lands: ``byte_offset`` bytes into the destination process's window."""
+        if byte_offset not in self._remotes:
+            import deepspeed.comm as dist
+            self._remotes[byte_offset] = dist.symm_mem_handle_at(self.pool, byte_offset, self.nbytes - byte_offset,
+                                                                 self.group)
+        return self._remotes[byte_offset]
+
+    def put(self, source: torch.Tensor, target, process: int) -> None:
+        """Write ``source``, which lies in this window, at ``target`` of ``process``, which counts one signal."""
+        import deepspeed.comm as dist
+        dist.symm_mem_put_signal(source, target, process)
+
+    def wait(self, process: int, count: int) -> None:
+        """Hold the current stream until ``count`` puts from ``process`` have landed."""
+        import deepspeed.comm as dist
+        for _ in range(count):
+            dist.symm_mem_wait_signal(self._handle, process)
 
 
 @dataclass(frozen=True)
@@ -432,17 +481,29 @@ def _window_locations(requests: Sequence[TransferRequest], offsets: Mapping[Tupl
     return [sides[request.key] for request in requests]
 
 
-def _mapped_direction(item: int, operation: _Operation, window_locations: Optional[_WindowLocations],
-                      both: Optional[str]) -> Optional[str]:
-    """``'pull'``, ``'push'`` or None for a cross-process operation, identically on every process.
+def _mapped_direction(item: int,
+                      operation: _Operation,
+                      window_locations: Optional[_WindowLocations],
+                      both: Optional[str],
+                      hosts: Optional[Sequence[int]] = None,
+                      puts: bool = False) -> Optional[str]:
+    """``'pull'``, ``'push'``, ``'put'`` or None for a cross-process operation, identically on every process.
 
     ``both`` is the window's direction, for an operation whose source and target both lie in a window.
+    ``hosts`` names each process's host, when the window spans more than one, and ``puts`` whether
+    operations between hosts may be put.
     """
     if window_locations is None or operation.from_process == operation.to_process:
         return None
     sources, targets = window_locations[item]
-    pull = operation.segment.source_rank in sources
-    push = operation.segment.target_rank in targets
+    segment = operation.segment
+    pull = segment.source_rank in sources
+    push = segment.target_rank in targets
+    if hosts is not None and hosts[operation.from_process] != hosts[operation.to_process]:
+        # A put reads one packed run of a window and writes one; anything else between hosts is staged.
+        packed = (_is_packed(operation.chunk_shape, segment.source_strides)
+                  and _is_packed(operation.chunk_shape, segment.target_strides))
+        return 'put' if puts and pull and push and packed else None
     if pull and push:
         return both
     if pull:
@@ -483,8 +544,12 @@ class _Lane:
     send_arena: Dict[int, int]
 
 
-def _lanes(indexed: Sequence[Tuple[int, _Operation]], processes: Sequence[int], max_elements: int,
-           window_locations: Optional[_WindowLocations]) -> Dict[int, _Lane]:
+def _lanes(indexed: Sequence[Tuple[int, _Operation]],
+           processes: Sequence[int],
+           max_elements: int,
+           window_locations: Optional[_WindowLocations],
+           hosts: Optional[Sequence[int]] = None,
+           puts: bool = False) -> Dict[int, _Lane]:
     local = {process: [] for process in processes}
     incoming: Dict[int, Dict[int, List[Tuple[int, _Operation]]]] = {process: {} for process in processes}
     outgoing: Dict[int, Dict[int, List[Tuple[int, _Operation]]]] = {process: {} for process in processes}
@@ -493,8 +558,9 @@ def _lanes(indexed: Sequence[Tuple[int, _Operation]], processes: Sequence[int], 
             if operation.from_process in local:
                 local[operation.from_process].append((item, operation))
             continue
-        # Copied in place through the window, so it is neither a message nor staged; who copies does not matter.
-        if _mapped_direction(item, operation, window_locations, 'pull') is not None:
+        # Copied in place or put through the window, so it is neither a message nor staged; who copies does
+        # not matter.
+        if _mapped_direction(item, operation, window_locations, 'pull', hosts, puts) is not None:
             continue
         if operation.to_process in incoming:
             incoming[operation.to_process].setdefault(operation.from_process, []).append((item, operation))
@@ -571,7 +637,9 @@ def schedule_transfers(plans: Sequence[TransferPlan],
                        budget: StagingBudget,
                        element_size: int,
                        process: Optional[int] = None,
-                       window_locations: Optional[_WindowLocations] = None) -> Dict[int, ProcessSchedule]:
+                       window_locations: Optional[_WindowLocations] = None,
+                       window_hosts: Optional[Sequence[int]] = None,
+                       window_puts: bool = False) -> Dict[int, ProcessSchedule]:
     """The schedule ``execute_transfers`` would run for a batch, without buffers or communication.
 
     ``plans`` are the batch's plans in request order, since that order fixes how chunks are packed
@@ -583,7 +651,9 @@ def schedule_transfers(plans: Sequence[TransferPlan],
     buffers can tell. ``window_locations`` gives, per plan, the source and the target locations
     whose shards lie in the window on any process; operations between two processes that touch one
     are left out of the rounds, as the executor leaves them out. They are not messages, so this
-    schedule does not report them.
+    schedule does not report them. For a window across hosts, ``window_hosts`` and ``window_puts`` are
+    its ``hosts`` and ``puts``: an operation between two hosts is left out only when it is put, and
+    otherwise stays in the rounds.
     """
     if not isinstance(element_size, int) or isinstance(element_size, bool) or element_size <= 0:
         raise AffineTransferExecutionError('element_size must be a positive integer')
@@ -600,9 +670,13 @@ def schedule_transfers(plans: Sequence[TransferPlan],
     named = set(endpoints.source.values()) | set(endpoints.target.values())
     if process is not None and process not in named:
         raise AffineTransferExecutionError(f'process {process} is not named by the endpoints')
+    if window_hosts is not None and any(member >= len(window_hosts) for member in named):
+        raise AffineTransferExecutionError('window_hosts must name a host for every process')
     processes = sorted(named) if process is None else [process]
     schedules = {}
-    for member, lane in _lanes(indexed, processes, budget.bytes_per_peer // element_size, window_locations).items():
+    lanes = _lanes(indexed, processes, budget.bytes_per_peer // element_size, window_locations, window_hosts,
+                   window_puts)
+    for member, lane in lanes.items():
         queues = list(lane.recv_rounds.values()) + list(lane.send_rounds.values())
         schedules[member] = ProcessSchedule(process=member,
                                             sends=_scheduled_rounds(lane.send_rounds, lane.send_direct),
@@ -641,7 +715,8 @@ def execute_transfers(requests: Sequence[TransferRequest],
     mapped_copies = _mapped_copy_views(agreed.mapped, requests, agreed.offsets, window, dtype)
     sent, received, copied = _run_rounds(rounds, _round_count(lane), local_copies, group, agreed.element_size,
                                          agreed.stream_ordered)
-    _run_mapped(mapped_copies, None, agreed.mapped_total, group, agreed.stream_ordered)
+    _run_mapped(mapped_copies, None, agreed.mapped_total, group, agreed.stream_ordered, window, agreed.puts,
+                agreed.put_counts)
     return TransferStats(agreed.segments, agreed.chunks, _round_count(lane), copied, sent, received,
                          agreed.mapped_bytes)
 
@@ -693,6 +768,9 @@ class _Agreement:
     mapped_copies: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
     mapped_copy: Optional[Callable[[], None]]
     copier: Optional[Copier]
+    # ``(peer, landing handle, source run)`` for each put this process makes, and how many land here per peer.
+    puts: Tuple[Tuple[int, object, torch.Tensor], ...]
+    put_counts: Dict[int, int]
 
 
 # This process's preparations so far. Two batches prepared alike share a digest, so what tells their
@@ -733,7 +811,9 @@ def _agree(requests: Sequence[TransferRequest],
     element_size, digest, rejected = 0, 0, 0
     error = None
     mapped, mapped_bytes, mapped_total, mapped_copies, mapped_copy = (), 0, 0, (), None
+    puts, put_counts = (), {}
     offsets: Dict[Tuple, int] = {}
+    hosts = None if window is None or len(set(window.hosts)) == 1 else window.hosts
     if window is not None and world_size > 1:
         # Collective, so it runs before anything that may reject; a bad buffer simply publishes nothing.
         try:
@@ -774,7 +854,7 @@ def _agree(requests: Sequence[TransferRequest],
             if id(plan) not in digests:
                 digests[id(plan)] = plan_digest(plan, endpoints, budget, element_size)
         # Which shards lie in a window and who copies decide what each process does, so ranks must agree on them.
-        mapping = None if window is None else (window.direction, tuple(sorted(offsets.items())))
+        mapping = None if window is None else (window.direction, hosts, window.puts, tuple(sorted(offsets.items())))
         fingerprint = (3, str(dtype), budget.bytes_per_peer, tuple(sorted(endpoints.source.items())),
                        tuple(sorted(endpoints.target.items())),
                        tuple((request.key, digests[id(request.plan)]) for request in requests), mapping)
@@ -783,7 +863,8 @@ def _agree(requests: Sequence[TransferRequest],
         # The same computation as schedule_transfers, so what it reports is what runs here.
         paused = _collector_paused() if keep else contextlib.nullcontext()
         with paused:
-            lane = _lanes(indexed, [rank], budget.bytes_per_peer // element_size, window_locations)[rank]
+            lane = _lanes(indexed, [rank], budget.bytes_per_peer // element_size, window_locations, hosts,
+                          window is not None and window.puts)[rank]
             recv_arenas = {
                 peer: torch.empty(size, dtype=dtype, device=device)
                 for peer, size in lane.recv_arena.items()
@@ -792,7 +873,12 @@ def _agree(requests: Sequence[TransferRequest],
                 peer: torch.empty(size, dtype=dtype, device=device)
                 for peer, size in lane.send_arena.items()
             }
-            mapped, mapped_bytes, mapped_total = _mapped_share(indexed, window_locations, window, rank)
+            mapped, mapped_bytes, mapped_total = _mapped_share(indexed, window_locations, window, rank, hosts)
+            if hosts is not None and window.puts:
+                put_runs, put_counts = _put_share(indexed, window_locations, window, rank, hosts, requests, offsets,
+                                                  element_size)
+                puts = tuple(_put_views(put_runs, window, rank))
+                mapped_bytes += sum(source.numel() for _, _, source in puts)
             if keep:
                 rounds = list(_round_views(lane, recv_arenas, send_arenas, requests, dtype))
                 local_copies = tuple(_local_copy_views(lane, requests, dtype))
@@ -813,6 +899,7 @@ def _agree(requests: Sequence[TransferRequest],
         recv_arenas, send_arenas, rounds = {}, {}, []
         packs, unpacks, local_copy = [], [], None
         mapped, mapped_copies, mapped_copy = (), (), None
+        puts, put_counts = (), {}
         print(f'[transfer] rank {rank} rejected the batch: {caught}', file=sys.stderr, flush=True)
 
     preparations = [preparation]
@@ -854,7 +941,9 @@ def _agree(requests: Sequence[TransferRequest],
                       mapped_total=mapped_total,
                       mapped_copies=mapped_copies,
                       mapped_copy=mapped_copy,
-                      copier=copier)
+                      copier=copier,
+                      puts=puts,
+                      put_counts=put_counts)
 
 
 def _round_copiers(rounds, copier: Copier) -> Tuple[List[Callable[[], None]], List[Callable[[], None]]]:
@@ -864,21 +953,77 @@ def _round_copiers(rounds, copier: Copier) -> Tuple[List[Callable[[], None]], Li
     return packs, unpacks
 
 
-def _mapped_share(indexed, window_locations: Optional[_WindowLocations], window: Optional[TransferWindow],
-                  rank: int) -> Tuple[Tuple, int, int]:
-    """This process's window copies in the order it makes them, their bytes, and the group's count."""
+def _mapped_share(indexed,
+                  window_locations: Optional[_WindowLocations],
+                  window: Optional[TransferWindow],
+                  rank: int,
+                  hosts: Optional[Sequence[int]] = None) -> Tuple[Tuple, int, int]:
+    """This process's window copies in the order it makes them, their bytes, and the group's count.
+
+    The count includes puts, which ``_put_share`` lays out.
+    """
     if window is None:
         return (), 0, 0
     mine, total = [], 0
     for item, operation in indexed:
-        direction = _mapped_direction(item, operation, window_locations, window.direction)
+        direction = _mapped_direction(item, operation, window_locations, window.direction, hosts, window.puts)
         if direction is None:
             continue
         total += 1
+        if direction == 'put':
+            continue
         copier = operation.to_process if direction == 'pull' else operation.from_process
         if copier == rank:
             mine.append((item, operation, direction))
     return tuple(_staggered(mine, rank)), sum(operation.payload_bytes for _, operation, _ in mine), total
+
+
+def _put_share(indexed, window_locations: _WindowLocations, window: TransferWindow, rank: int, hosts: Sequence[int],
+               requests: Sequence[TransferRequest], offsets: Mapping[Tuple, int],
+               element_size: int) -> Tuple[Dict[int, List[Tuple[int, int, int]]], Dict[int, int]]:
+    """This process's puts by destination, as ``(source byte, target byte, bytes)`` runs of the two windows,
+    and how many puts land here from each process.
+
+    Chunks that sit next to each other on both sides, of one parameter or of neighbouring ones, become one
+    put: every put pays a fixed cost, and chunking only follows the staging budget, which a put does not use. The target
+    computes the same runs as the source, so it knows how many signals to wait for.
+    """
+    runs: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
+    for item, operation in indexed:
+        if rank not in (operation.from_process, operation.to_process) or not operation.elements:
+            continue
+        if _mapped_direction(item, operation, window_locations, window.direction, hosts, True) != 'put':
+            continue
+        key, segment = requests[item].key, operation.segment
+        source = (offsets[(key, 'source', segment.source_rank)] + operation.source_offset) * element_size
+        target = (offsets[(key, 'target', segment.target_rank)] + operation.target_offset) * element_size
+        pair = (operation.from_process, operation.to_process)
+        runs.setdefault(pair, []).append((source, target, operation.elements * element_size))
+    outgoing, incoming = {}, {}
+    for (from_process, to_process), pair_runs in runs.items():
+        merged = []
+        for source, target, nbytes in sorted(pair_runs):
+            if merged and merged[-1][0] + merged[-1][2] == source and merged[-1][1] + merged[-1][2] == target:
+                merged[-1] = (merged[-1][0], merged[-1][1], merged[-1][2] + nbytes)
+            else:
+                merged.append((source, target, nbytes))
+        if from_process == rank:
+            outgoing[to_process] = merged
+        else:
+            incoming[from_process] = len(merged)
+    return outgoing, incoming
+
+
+def _put_views(runs: Mapping[int, List[Tuple[int, int, int]]], window: TransferWindow, rank: int):
+    """Each put as ``(peer, landing handle, source)``, starting at a different peer than this process's
+    neighbours, for the reason ``_staggered`` gives."""
+    peers = sorted(runs)
+    if not peers:
+        return
+    start = rank % len(peers)
+    for peer in peers[start:] + peers[:start]:
+        for source, target, nbytes in runs[peer]:
+            yield peer, window.remote(target), window.pool[source:source + nbytes]
 
 
 def _identity(digest: int, preparations: Sequence[int]) -> int:
@@ -925,6 +1070,9 @@ def prepare_transfers(requests: Sequence[TransferRequest],
                             _mapped_copy=agreed.mapped_copy,
                             _mapped_bytes=agreed.mapped_bytes,
                             _mapped_total=agreed.mapped_total,
+                            _window=window,
+                            _puts=agreed.puts,
+                            _put_counts=agreed.put_counts,
                             _lane=agreed.lane,
                             _dtype=dtype,
                             _copier=agreed.copier,
@@ -965,6 +1113,10 @@ class PreparedTransfer:
     _mapped_bytes: int
     # Window copies over the whole group, so that every process decides the same about barriers.
     _mapped_total: int
+    _window: Optional[TransferWindow]
+    # ``(peer, landing handle, source run)`` for each put this process makes, and how many land here per peer.
+    _puts: Tuple[Tuple[int, object, torch.Tensor], ...]
+    _put_counts: Dict[int, int]
     # What rebuilding the staging after ``release_staging`` needs.
     _lane: '_Lane'
     _dtype: torch.dtype
@@ -1080,23 +1232,36 @@ class PreparedTransfer:
                                              packs=self._packs,
                                              unpacks=self._unpacks,
                                              local_copy=self._local_copy)
-        _run_mapped(self._mapped_copies, self._mapped_copy, self._mapped_total, self._group, self._stream_ordered)
+        _run_mapped(self._mapped_copies, self._mapped_copy, self._mapped_total, self._group, self._stream_ordered,
+                    self._window, self._puts, self._put_counts)
         self._runs += 1
         return TransferStats(self._segments, self._chunks, len(self._rounds), copied, sent, received,
                              self._mapped_bytes)
 
 
-def _run_mapped(mapped_copies, mapped_copy: Optional[Callable[[], None]], mapped_total: int, group: Optional[object],
-                stream_ordered: bool) -> None:
-    """This process's window copies, then the barrier that hands every window shard back to its owner."""
+def _run_mapped(mapped_copies,
+                mapped_copy: Optional[Callable[[], None]],
+                mapped_total: int,
+                group: Optional[object],
+                stream_ordered: bool,
+                window: Optional[TransferWindow] = None,
+                puts: Sequence[Tuple[int, object, torch.Tensor]] = (),
+                put_counts: Optional[Mapping[int, int]] = None) -> None:
+    """This process's puts and window copies, then the barrier that hands every window shard back to its owner."""
     if not mapped_total:
         return
     import deepspeed.comm as dist
+    # Puts first: the network carries them while the copies below use the links inside the host.
+    for peer, target, source in puts:
+        window.put(source, target, peer)
     if mapped_copy is not None:
         mapped_copy()
     else:
         for target, source in mapped_copies:
             target.copy_(source)
+    # A put's source is free and its target written only once the target has seen its signal.
+    for peer, landing in (put_counts or {}).items():
+        window.wait(peer, landing)
     if stream_ordered:
         get_accelerator().current_stream().synchronize()
     # A pulled source or pushed target belongs to another process: neither may be reused until every

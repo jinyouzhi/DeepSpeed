@@ -106,6 +106,23 @@ copied. ``schedule_transfers`` cannot see buffers, so pass the window's
 locations per plan as ``window_locations`` to leave those operations out of the
 rounds it reports.
 
+A window whose group spans hosts needs CUDA; it is registered with torch's NCCL
+symmetric-memory backend, which is process-wide, so create it before any other
+symmetric memory in the process. Processes on one host still copy in place,
+and operations between hosts are staged. With ``TransferWindow(..., puts=True)``,
+an operation between hosts whose source and target are both packed regions of
+window shards is instead a one-sided NCCL put from the source; chunks adjacent
+on both sides are coalesced into one put, and the target waits for one signal
+per put before the closing barrier. Each put is a separate NCCL operation, so
+puts pay off when each process puts to few peers. On two 8-GPU H20 hosts over
+RoCE, every process sending 256 MiB to its one peer on the other host took
+14.1-14.5 ms put against 16.1-17.1 ms staged, and as 2048 parameters of 128 KiB
+15.0-15.3 ms against 24.8-28.8 ms; sending the same 256 MiB spread over all
+eight peers there took 23-30 ms put against 15.2-17.0 ms staged. A put cannot be rolled back: an error
+after one is issued may leave its target partly written, and NCCL treats it as
+fatal to the communicator. Pass the window's ``hosts`` and ``puts`` to
+``schedule_transfers`` as ``window_hosts`` and ``window_puts``.
+
 Planning a sync with replica policies
 -------------------------------------
 

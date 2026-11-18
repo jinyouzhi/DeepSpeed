@@ -8,6 +8,7 @@ import gc
 import math
 import os
 from dataclasses import replace
+from unittest import mock
 
 import pytest
 import torch
@@ -528,6 +529,66 @@ class TestWindowTransfer(DistributedTest):
             assert buffer.isnan().all(), 'a refused batch must not write'
 
 
+class TestWindowAcrossHosts(DistributedTest):
+    world_size = 4
+
+    @pytest.mark.parametrize('puts', [True, False])
+    def test_puts_and_staged_rounds_cross_hosts(self, puts):
+        if get_accelerator().device_name() != 'cuda':
+            pytest.skip('puts between hosts need CUDA')
+        _join_transfer_group()
+        dtype = torch.bfloat16
+        rank = dist.get_rank()
+        # Two processes per host; NCCL reaches a peer on the same machine just as it reaches one elsewhere.
+        with mock.patch('deepspeed.checkpoint.affine_transfer_executor.socket.gethostname',
+                        return_value=f'host{rank // 2}'):
+            try:
+                window = TransferWindow(1 << 20, puts=puts)
+            except RuntimeError as error:
+                if 'newer torch' in str(error):
+                    pytest.skip(str(error))
+                raise
+        assert window.hosts == (0, 0, 2, 2)
+        # Row to column: same-host chunks are pulled, while chunks between hosts are strided and staged.
+        endpoints, strided, source, target, _ = _window_batch(window, 'both_pull', dtype)
+        # Rows to rows on the other host: packed on both sides, so put if the window allows. A small budget
+        # cuts them into chunks adjacent on both sides, which land only if they are put whole or each counted.
+        rows = contiguous_split_map((16, 16), [4] * 4, 0)
+        shifted = TransferEndpoints({location: location
+                                     for location in range(4)},
+                                    {location: (location + 2) % 4
+                                     for location in range(4)})
+        row_sources = {rank: window.tensor((4, 16), dtype)}
+        row_targets = {(rank + 2) % 4: window.tensor((4, 16), dtype).fill_(UNWRITTEN)}
+        packed = TransferRequest('rows', plan_transfer(rows, rows, PlanBudget()), row_sources, row_targets)
+        # Every request in a batch shares its endpoints, so the two run as separate batches over one window.
+        budget = StagingBudget(16)
+        prepared = [
+            prepare_transfers([strided], endpoints, dtype, budget, window=window),
+            prepare_transfers([packed], shifted, dtype, budget, window=window)
+        ]
+
+        full = _full(16, 16, dtype)
+        for run, values in enumerate((full, full.flip(0), full.flip(1))):
+            for location, buffer in strided.source_buffers.items():
+                buffer.copy_(source.extract(values, location))
+            row_sources[rank].copy_(rows.extract(values, rank))
+            stats = [handle.run(check=run == 0) for handle in prepared]
+            _assert_matches(strided.target_buffers, target, values)
+            _assert_matches(row_targets, rows, values)
+        for buffer in list(strided.target_buffers.values()) + list(row_targets.values()):
+            buffer.fill_(UNWRITTEN)
+        assert execute_transfers([packed], shifted, dtype, budget, window=window) == stats[1]
+        _assert_matches(row_targets, rows, values)
+
+        element_size = full.element_size()
+        moved = torch.tensor([stats[0].sent_bytes, stats[1].sent_bytes, stats[1].mapped_bytes], device=_device())
+        dist.all_reduce(moved)
+        # The sources are the rows on host 0, and host 1 holds half of the columns.
+        rows_bytes = full.numel() * element_size
+        assert moved.tolist() == [rows_bytes // 2, 0 if puts else rows_bytes, rows_bytes if puts else 0]
+
+
 class TestB2DisjointEndpoints(DistributedTest):
     """Every process is either a reader or a writer, never both.
 
@@ -620,6 +681,30 @@ class TestB2TransferCPU:
             assert windowed[process].local_copy_elements == staged[process].local_copy_elements
         with pytest.raises(AffineTransferExecutionError, match='window_locations'):
             schedule_transfers([plan, plan], endpoints, StagingBudget(8), 4, window_locations=locations[:1])
+
+    def test_schedule_keeps_only_strided_operations_between_hosts_in_the_rounds(self):
+        rows = plan_transfer(contiguous_split_map((6, 4), [2, 4], 0), contiguous_split_map((6, 4), [3, 3], 0))
+        columns = plan_transfer(contiguous_split_map((6, 4), [2, 2], 1), contiguous_split_map((6, 4), [3, 3], 0))
+        endpoints = TransferEndpoints({0: 0, 1: 1}, {0: 0, 1: 1})
+        everywhere = [({0, 1}, {0, 1})] * 2
+        # Whole regions per chunk: a budget of one row would make every column chunk packed too.
+        budget = StagingBudget(1024)
+        # One host maps every window, so nothing is staged.
+        one_host = schedule_transfers([rows, columns], endpoints, budget, 4, None, everywhere, (0, 0))
+        assert all(not schedule.sends and not schedule.receives for schedule in one_host.values())
+        # Between hosts a packed row is one put, while a column is strided and must be staged.
+        two_hosts = schedule_transfers([rows, columns], endpoints, budget, 4, None, everywhere, (0, 1), True)
+        columns_only = schedule_transfers([columns], endpoints, budget, 4)
+        # A window that does not put stages everything between hosts.
+        no_puts = schedule_transfers([rows, columns], endpoints, budget, 4, None, everywhere, (0, 1))
+        staged = schedule_transfers([rows, columns], endpoints, budget, 4)
+        for process in (0, 1):
+            assert two_hosts[process].sends == columns_only[process].sends
+            assert two_hosts[process].receives == columns_only[process].receives
+            assert no_puts[process].sends == staged[process].sends
+            assert no_puts[process].receives == staged[process].receives
+        with pytest.raises(AffineTransferExecutionError, match='window_hosts'):
+            schedule_transfers([rows], endpoints, budget, 4, None, everywhere[:1], (0, ))
 
     def test_shared_plan_uses_each_buffer_and_rechecks_each_call(self):
         map_ = replicated_map((3, 4), 1)
