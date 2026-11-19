@@ -41,10 +41,10 @@ to change when such a path lands.
 PCIe, NVLink or Xe Link). Buffers carved from a window are published to the group, and an operation whose
 source or target lies in a window is copied in place by one process -- the target pulls, or the source
 pushes -- with no staging, no peer message and no budget. Everything else keeps the protocol above.
-Processes on different hosts cannot map each other's windows. A window whose group spans hosts is
-registered with NCCL instead: processes on one host still copy in place, and operations between hosts
-are staged -- or, if the window allows puts, an operation whose source and target are both packed
-regions of window shards is a one-sided put from the source, adjacent ones coalesced into one.
+Processes on different hosts may not map each other's windows. A window whose group spans hosts is
+registered with NCCL instead: processes that map each other still copy in place, and operations between
+them and the rest are staged -- or, if the window allows puts, an operation whose source and target are
+both packed regions of window shards is a one-sided put from the source, adjacent ones coalesced.
 
 One device per process, with explicit transport-group rank bindings, synchronous on return. No CUDA graphs, no overlap with compute,
 and ``copy_`` for every region by default: graphs and overlap change the schedule, which is the last thing
@@ -62,7 +62,7 @@ import sys
 import zlib
 from dataclasses import dataclass
 from itertools import count, product
-from typing import AbstractSet, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import AbstractSet, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from deepspeed.accelerator import get_accelerator
@@ -119,12 +119,13 @@ class TransferWindow:
 
     A group whose processes are on more than one host needs CUDA: the window is then allocated with torch's
     NCCL symmetric-memory backend, which is process-wide, so it must be the first symmetric memory the
-    process allocates. Processes on different hosts cannot map each other's windows, so ``direction`` does
-    not apply between them: their operations are staged, unless ``puts`` lets the source put packed regions
-    straight into the target's window. Each put is a separate NCCL operation, so puts pay off when every
-    process puts to few peers: on two 8-GPU hosts, a process putting to its one peer on the other host
-    beat staging, and one putting to all eight of them was slower than staging, which sends to all peers
-    at once. A put is also one-sided: an error after one is issued may leave its target shard partly
+    process allocates. NCCL then reports which windows each process maps, which may span hosts that share
+    an NVLink domain; ``hosts`` names, per process, the first process of its domain. ``direction`` does not
+    apply between domains: their operations are staged, unless ``puts`` lets the source put packed regions
+    straight into the target's window. A process's puts go out as one NCCL group, yet staging, which sends
+    to all peers at once too, still won on two 8-GPU hosts when every process sent to all eight of the
+    other host; puts won when each process sent to one peer or many small parameters. A put is also
+    one-sided: an error after one is issued may leave its target shard partly
     written, and NCCL treats it as fatal to the communicator rather than something a transfer can roll back.
     """
     ALIGNMENT = 512
@@ -146,7 +147,9 @@ class TransferWindow:
             world_size = dist.get_world_size(group=group)
         names = [None] * world_size
         dist.all_gather_object(names, socket.gethostname(), group=group)
-        # Per process, the first process on its host: what every process must agree on to tell a put apart.
+        # Per process, the first process that can map its window: what every process must agree on to tell
+        # a put apart. Hostnames only pick the backend; NCCL then says which windows are mapped, which
+        # also covers hosts that share an NVLink domain.
         self.hosts = tuple(names.index(name) for name in names)
         backend = None
         if len(set(self.hosts)) > 1:
@@ -154,6 +157,13 @@ class TransferWindow:
                 raise AffineTransferExecutionError('a window across hosts needs CUDA, whose NCCL puts reach them')
             backend = 'NCCL'
         self.pool, self._handle = dist.symm_mem_rendezvous(self.nbytes, torch.uint8, group, backend)
+        if backend is not None:
+            mapped = [None] * world_size
+            dist.all_gather_object(mapped, tuple(dist.symm_mem_mapped_peers(self._handle)), group=group)
+            if any(mapped[peer] != reach for reach in mapped for peer in reach):
+                raise AffineTransferExecutionError(
+                    f'processes that map each other disagree on whom they map: {mapped}')
+            self.hosts = tuple(reach[0] for reach in mapped)
         self._used = 0
         self._peers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
         self._remotes: Dict[int, object] = {}
@@ -194,10 +204,11 @@ class TransferWindow:
                                                                  self.group)
         return self._remotes[byte_offset]
 
-    def put(self, source: torch.Tensor, target, process: int) -> None:
-        """Write ``source``, which lies in this window, at ``target`` of ``process``, which counts one signal."""
+    def put_all(self, puts: Iterable[Tuple[int, object, torch.Tensor]]) -> None:
+        """For each ``(process, target, source)``, write ``source``, which lies in this window, at ``target``
+        of ``process``, which counts one signal; all of them as one NCCL group."""
         import deepspeed.comm as dist
-        dist.symm_mem_put_signal(source, target, process)
+        dist.symm_mem_put_signals(((source, target, process) for process, target, source in puts), self.group)
 
     def wait(self, process: int, count: int) -> None:
         """Hold the current stream until ``count`` puts from ``process`` have landed."""
@@ -985,8 +996,9 @@ def _put_share(indexed, window_locations: _WindowLocations, window: TransferWind
     and how many puts land here from each process.
 
     Chunks that sit next to each other on both sides, of one parameter or of neighbouring ones, become one
-    put: every put pays a fixed cost, and chunking only follows the staging budget, which a put does not use. The target
-    computes the same runs as the source, so it knows how many signals to wait for.
+    put: every put pays a fixed cost, and chunking only follows the staging budget, which a put does not use.
+    On two 8-GPU H20 hosts, capping a put at a staging chunk was no faster. The target computes the same runs as the
+    source, so it knows how many signals to wait for.
     """
     runs: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
     for item, operation in indexed:
@@ -1252,8 +1264,8 @@ def _run_mapped(mapped_copies,
         return
     import deepspeed.comm as dist
     # Puts first: the network carries them while the copies below use the links inside the host.
-    for peer, target, source in puts:
-        window.put(source, target, peer)
+    if puts:
+        window.put_all(puts)
     if mapped_copy is not None:
         mapped_copy()
     else:

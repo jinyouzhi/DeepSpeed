@@ -704,16 +704,31 @@ class TorchBackend(Backend):
         region = torch.empty(0, dtype=torch.uint8, device=buffer.device).set_(storage, 0, (nbytes, ))
         return symm_mem.rendezvous(region, group.group_name)
 
-    def symm_mem_put_signal(self, source, handle, peer):
-        """Write ``source``, which lies in a rendezvoused buffer, to ``peer`` at ``handle``'s offset, then
-        raise one signal at ``peer``; ordered on the current stream."""
+    def symm_mem_put_signals(self, puts, group=None):
+        """For each ``(source, handle, peer)``, write ``source``, which lies in a rendezvoused buffer, to
+        ``peer`` at ``handle``'s offset, then raise one signal at ``peer``; ordered on the current stream.
+
+        The puts are issued as one NCCL group, so NCCL drives them to all peers at once instead of one
+        after another.
+        """
         import torch.distributed._symmetric_memory as symm_mem
-        symm_mem.put_signal(source, handle, peer)
+        group = group if group is not None else torch.distributed.group.WORLD
+        nccl = group._get_backend(torch.device(get_accelerator().current_device_name()))
+        nccl._group_start()
+        try:
+            for source, handle, peer in puts:
+                symm_mem.put_signal(source, handle, peer)
+        finally:
+            nccl._group_end()
 
     def symm_mem_wait_signal(self, handle, peer):
         """Hold the current stream until one signal from ``peer`` arrives, and consume it."""
         import torch.distributed._symmetric_memory as symm_mem
         symm_mem.wait_signal(handle, peer)
+
+    def symm_mem_mapped_peers(self, handle):
+        """The group ranks, this process included, whose buffer of ``handle`` this process has mapped."""
+        return [peer for peer, address in enumerate(handle.buffer_ptrs) if address]
 
     def symm_mem_peer_tensor(self, handle, peer, numel, dtype):
         """``peer``'s symmetric buffer as a tensor on this process's device."""

@@ -540,8 +540,10 @@ class TestWindowAcrossHosts(DistributedTest):
         dtype = torch.bfloat16
         rank = dist.get_rank()
         # Two processes per host; NCCL reaches a peer on the same machine just as it reaches one elsewhere.
+        # NCCL maps every window on one machine, so map only the fake host's.
         with mock.patch('deepspeed.checkpoint.affine_transfer_executor.socket.gethostname',
-                        return_value=f'host{rank // 2}'):
+                        return_value=f'host{rank // 2}'), \
+                mock.patch('deepspeed.comm.symm_mem_mapped_peers', return_value=[rank // 2 * 2, rank // 2 * 2 + 1]):
             try:
                 window = TransferWindow(1 << 20, puts=puts)
             except RuntimeError as error:
@@ -549,6 +551,7 @@ class TestWindowAcrossHosts(DistributedTest):
                     pytest.skip(str(error))
                 raise
         assert window.hosts == (0, 0, 2, 2)
+        assert dist.symm_mem_mapped_peers(window._handle) == [0, 1, 2, 3]
         # Row to column: same-host chunks are pulled, while chunks between hosts are strided and staged.
         endpoints, strided, source, target, _ = _window_batch(window, 'both_pull', dtype)
         # Rows to rows on the other host: packed on both sides, so put if the window allows. A small budget
@@ -587,6 +590,42 @@ class TestWindowAcrossHosts(DistributedTest):
         # The sources are the rows on host 0, and host 1 holds half of the columns.
         rows_bytes = full.numel() * element_size
         assert moved.tolist() == [rows_bytes // 2, 0 if puts else rows_bytes, rows_bytes if puts else 0]
+
+    def test_hosts_that_map_each_other_copy_in_place(self):
+        if get_accelerator().device_name() != 'cuda':
+            pytest.skip('a window across hosts needs CUDA')
+        _join_transfer_group()
+        dtype = torch.bfloat16
+        rank = dist.get_rank()
+        # Four hostnames on one machine, as hosts sharing an NVLink domain: NCCL maps every window, so
+        # nothing is put or staged.
+        with mock.patch('deepspeed.checkpoint.affine_transfer_executor.socket.gethostname',
+                        return_value=f'host{rank}'):
+            try:
+                window = TransferWindow(1 << 20, puts=True)
+            except RuntimeError as error:
+                if 'newer torch' in str(error):
+                    pytest.skip(str(error))
+                raise
+        assert window.hosts == (0, 0, 0, 0)
+        rows = contiguous_split_map((16, 16), [4] * 4, 0)
+        shifted = TransferEndpoints({location: location
+                                     for location in range(4)},
+                                    {location: (location + 2) % 4
+                                     for location in range(4)})
+        plan = plan_transfer(rows, rows, PlanBudget())
+        logical = torch.arange(256, dtype=torch.float32).view(16, 16).to(dtype).to(get_accelerator().device_name())
+        source = {rank: window.tensor((4, 16), dtype)}
+        source[rank].copy_(rows.extract(logical, rank))
+        target = {(rank + 2) % 4: window.tensor((4, 16), dtype)}
+        stats = execute_transfers([TransferRequest('rows', plan, source, target)],
+                                  shifted,
+                                  dtype,
+                                  StagingBudget(16),
+                                  window=window)
+        assert stats.sent_bytes == 0 and stats.mapped_bytes == 4 * 16 * 2
+        for location, tensor in target.items():
+            assert torch.equal(tensor, rows.extract(logical, location))
 
 
 class TestB2DisjointEndpoints(DistributedTest):

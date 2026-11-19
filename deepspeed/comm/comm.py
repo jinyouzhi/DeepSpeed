@@ -845,11 +845,11 @@ def symm_mem_handle_at(buffer, byte_offset: int, nbytes: int, group=None):
     return cdb.symm_mem_handle_at(buffer, byte_offset, nbytes, group)
 
 
-def symm_mem_put_signal(source, handle, peer: int):
+def symm_mem_put_signals(puts, group=None):
     global cdb
-    if not hasattr(cdb, 'symm_mem_put_signal'):
+    if not hasattr(cdb, 'symm_mem_put_signals'):
         raise RuntimeError(f"Backend {cdb.name} does not support symmetric-memory puts")
-    return cdb.symm_mem_put_signal(source, handle, peer)
+    return cdb.symm_mem_put_signals(puts, group)
 
 
 def symm_mem_wait_signal(handle, peer: int):
@@ -857,6 +857,13 @@ def symm_mem_wait_signal(handle, peer: int):
     if not hasattr(cdb, 'symm_mem_wait_signal'):
         raise RuntimeError(f"Backend {cdb.name} does not support symmetric-memory puts")
     return cdb.symm_mem_wait_signal(handle, peer)
+
+
+def symm_mem_mapped_peers(handle):
+    global cdb
+    if not hasattr(cdb, 'symm_mem_mapped_peers'):
+        raise RuntimeError(f"Backend {cdb.name} does not support symmetric memory")
+    return cdb.symm_mem_mapped_peers(handle)
 
 
 def symm_mem_peer_tensor(handle, peer: int, numel: int, dtype):
