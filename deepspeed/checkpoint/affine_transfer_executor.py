@@ -1001,17 +1001,23 @@ def _agree(requests: Sequence[TransferRequest],
         for plan in plans:
             if id(plan) not in digests:
                 digests[id(plan)] = plan_digest(plan, endpoints, budget, element_size)
-        # Which shards lie in a window and who copies decide what each process does, so ranks must agree on them.
+        window_locations = None if window is None else _window_locations(requests, offsets)
+        if window is not None:
+            # Options changed after the window was made are checked here, where a refusal is collective.
+            _check_window_options(window.puts, window.pack_bytes)
+        senders = _put_senders(indexed, window_locations, hosts, False if window is None else window.puts)
+        packed = _pack_layout(indexed, window_locations, hosts, senders, 0 if window is None else window.pack_bytes,
+                              element_size)
+        # Which shards lie in a window and who copies decide what each process does, so ranks must agree on them,
+        # including the senders and the reserve layout each derived from settings it read locally.
         mapping = None if window is None else (window.direction, hosts, window.puts, window.pack_bytes,
-                                               tuple(sorted(offsets.items())))
+                                               tuple(sorted(offsets.items())),
+                                               senders if isinstance(senders, bool) else tuple(sorted(senders)),
+                                               tuple(sorted(packed.items())))
         fingerprint = (3, str(dtype), budget.bytes_per_peer, tuple(sorted(endpoints.source.items())),
                        tuple(sorted(endpoints.target.items())),
                        tuple((request.key, digests[id(request.plan)]) for request in requests), mapping)
         digest = zlib.crc32(repr(fingerprint).encode())
-        window_locations = None if window is None else _window_locations(requests, offsets)
-        senders = _put_senders(indexed, window_locations, hosts, False if window is None else window.puts)
-        packed = _pack_layout(indexed, window_locations, hosts, senders, 0 if window is None else window.pack_bytes,
-                              element_size)
         # The same computation as schedule_transfers, so what it reports is what runs here.
         paused = _collector_paused() if keep else contextlib.nullcontext()
         with paused:
@@ -1243,6 +1249,7 @@ def prepare_transfers(requests: Sequence[TransferRequest],
                             _mapped_bytes=agreed.mapped_bytes,
                             _mapped_total=agreed.mapped_total,
                             _window=window,
+                            _window_options=None if window is None else (window.puts, window.pack_bytes),
                             _puts=agreed.puts,
                             _put_counts=agreed.put_counts,
                             _pack_copy=agreed.pack_copy,
@@ -1288,6 +1295,8 @@ class PreparedTransfer:
     # Window copies over the whole group, so that every process decides the same about barriers.
     _mapped_total: int
     _window: Optional[TransferWindow]
+    # The window's ``puts`` and ``pack_bytes`` when prepared, which decided what is put and what is staged.
+    _window_options: Optional[Tuple]
     # ``(peer, landing handle, source run)`` for each put this process makes, and how many land here per peer.
     _puts: Tuple[Tuple[int, object, torch.Tensor], ...]
     _put_counts: Dict[int, int]
@@ -1318,7 +1327,7 @@ class PreparedTransfer:
         ``requests``, rebuilt from the live state such as fresh ``zero_param_storage_shard`` views, or
         else the tensors the handle holds, which catches a buffer re-pointed in place (``.data = ...``).
         One small all-gather then refuses, on every process and before any data moves, if a buffer
-        moved or changed shape on any process, or if the processes are not running the same handle for
+        moved or changed shape, or the window's ``puts`` or ``pack_bytes`` changed, on any process, or if the processes are not running the same handle for
         the same time. Prepare the batch again after a refusal. ``check=False`` skips that collective,
         for a caller that already guarantees all three; every process must pass the same ``check``.
 
@@ -1377,6 +1386,8 @@ class PreparedTransfer:
         import deepspeed.comm as dist
         try:
             moved = int(_buffer_layout(self._requests if requests is None else requests) != self._layout)
+            if self._window is not None and (self._window.puts, self._window.pack_bytes) != self._window_options:
+                moved = 1
         except (AttributeError, TypeError, RuntimeError):
             moved = 1
         if self._world_size > 1:
@@ -1396,8 +1407,9 @@ class PreparedTransfer:
             raise AffineTransferExecutionError('a process could not allocate the released staging again; '
                                                'no data moved')
         if moved:
-            raise AffineTransferExecutionError('a buffer of the prepared transfer moved or changed since '
-                                               'prepare_transfers; prepare the batch again. No data moved.')
+            raise AffineTransferExecutionError('a buffer or the window options of the prepared transfer moved or '
+                                               'changed since prepare_transfers; prepare the batch again. No data '
+                                               'moved.')
 
     def _move(self) -> TransferStats:
         sent, received, copied = _run_rounds(self._rounds,

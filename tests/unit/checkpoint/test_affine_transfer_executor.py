@@ -587,8 +587,19 @@ class TestWindowAcrossHosts(DistributedTest):
             buffer.fill_(UNWRITTEN)
         with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 4 * 16 * 2):
             assert execute_transfers([packed], shifted, dtype, budget, window=window) == stats[1]
+            assert execute_transfers([strided], endpoints, dtype, budget, window=window) == stats[0]
         _assert_matches(row_targets, rows, values)
+        _assert_matches(strided.target_buffers, target, values)
         packs = puts == 'pack'
+        if packs:
+            # A handle prepared with the reserve refuses once it is gone, and a reserve without puts is refused.
+            window.pack_bytes, reserve = 0, window.pack_bytes
+            with pytest.raises(AffineTransferExecutionError, match='moved or changed'):
+                prepared[0].run()
+            window.puts, window.pack_bytes = False, reserve
+            with pytest.raises(AffineTransferExecutionError):
+                execute_transfers([strided], endpoints, dtype, budget, window=window)
+            window.puts = True
         puts = bool(puts)
 
         element_size = full.element_size()
