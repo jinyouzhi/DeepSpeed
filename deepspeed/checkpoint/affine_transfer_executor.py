@@ -62,7 +62,7 @@ import sys
 import zlib
 from dataclasses import dataclass
 from itertools import count, product
-from typing import AbstractSet, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import AbstractSet, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from deepspeed.accelerator import get_accelerator
@@ -124,16 +124,26 @@ class TransferWindow:
     apply between domains: their operations are staged, unless ``puts`` lets the source put packed regions
     straight into the target's window. A process's puts go out as one NCCL group, yet staging, which sends
     to all peers at once too, still won on two 8-GPU hosts when every process sent to all eight of the
-    other host; puts won when each process sent to one peer or many small parameters. A put is also
+    other host; puts won when each process sent to one peer or many small parameters. ``puts='auto'``
+    puts only from a process whose operations between hosts all go to one peer and carry at least
+    ``AUTO_PUT_BYTES`` or ``AUTO_PUT_PARAMETERS`` parameters, and stages the rest. A put is also
     one-sided: an error after one is issued may leave its target shard partly
     written, and NCCL treats it as fatal to the communicator rather than something a transfer can roll back.
     """
     ALIGNMENT = 512
+    AUTO_PUT_BYTES = 256 << 20
+    AUTO_PUT_PARAMETERS = 64
 
-    def __init__(self, nbytes: int, group: Optional[object] = None, direction: str = 'pull', puts: bool = False):
+    def __init__(self,
+                 nbytes: int,
+                 group: Optional[object] = None,
+                 direction: str = 'pull',
+                 puts: Union[bool, str] = False):
         import deepspeed.comm as dist
         if direction not in ('pull', 'push'):
             raise AffineTransferExecutionError("window direction must be 'pull' or 'push'")
+        if puts not in (True, False, 'auto') or not isinstance(puts, (bool, str)):
+            raise AffineTransferExecutionError("window puts must be True, False or 'auto'")
         self.group = group
         self.direction = direction
         self.puts = puts
@@ -497,12 +507,12 @@ def _mapped_direction(item: int,
                       window_locations: Optional[_WindowLocations],
                       both: Optional[str],
                       hosts: Optional[Sequence[int]] = None,
-                      puts: bool = False) -> Optional[str]:
+                      puts: Union[bool, FrozenSet[int]] = False) -> Optional[str]:
     """``'pull'``, ``'push'``, ``'put'`` or None for a cross-process operation, identically on every process.
 
     ``both`` is the window's direction, for an operation whose source and target both lie in a window.
     ``hosts`` names each process's host, when the window spans more than one, and ``puts`` whether
-    operations between hosts may be put.
+    operations between hosts may be put: True, False, or the processes that put theirs, from ``_put_senders``.
     """
     if window_locations is None or operation.from_process == operation.to_process:
         return None
@@ -514,12 +524,40 @@ def _mapped_direction(item: int,
         # A put reads one packed run of a window and writes one; anything else between hosts is staged.
         packed = (_is_packed(operation.chunk_shape, segment.source_strides)
                   and _is_packed(operation.chunk_shape, segment.target_strides))
-        return 'put' if puts and pull and push and packed else None
+        allowed = puts is True or (not isinstance(puts, bool) and operation.from_process in puts)
+        return 'put' if allowed and pull and push and packed else None
     if pull and push:
         return both
     if pull:
         return 'pull'
     return 'push' if push else None
+
+
+def _put_senders(indexed, window_locations: Optional[_WindowLocations], hosts: Optional[Sequence[int]],
+                 puts: Union[bool, str]) -> Union[bool, FrozenSet[int]]:
+    """A window's ``puts`` with ``'auto'`` resolved, from the whole batch, so identically on every process.
+
+    On two 8-GPU H20 hosts over RoCE, a put beat staging when a process sent to one peer on the other host
+    either at least 256 MiB or many small parameters, which one put covers when they lie next to each other
+    in both windows while staging packs each; to two or more peers, or one peer with fewer and smaller
+    parameters, staging was as fast or faster, and its closing barrier is cheaper.
+    """
+    if puts != 'auto':
+        return puts
+    if hosts is None or window_locations is None:
+        return frozenset()
+    peers: Dict[int, set] = {}
+    payload: Dict[int, int] = {}
+    items: Dict[int, set] = {}
+    for item, operation in indexed:
+        if _mapped_direction(item, operation, window_locations, 'pull', hosts, True) != 'put':
+            continue
+        sender = operation.from_process
+        peers.setdefault(sender, set()).add(operation.to_process)
+        payload[sender] = payload.get(sender, 0) + operation.payload_bytes
+        items.setdefault(sender, set()).add(item)
+    return frozenset(sender for sender, reached in peers.items() if len(reached) == 1 and (
+        payload[sender] >= TransferWindow.AUTO_PUT_BYTES or len(items[sender]) >= TransferWindow.AUTO_PUT_PARAMETERS))
 
 
 def _staggered(mapped_copies, rank: int):
@@ -560,7 +598,7 @@ def _lanes(indexed: Sequence[Tuple[int, _Operation]],
            max_elements: int,
            window_locations: Optional[_WindowLocations],
            hosts: Optional[Sequence[int]] = None,
-           puts: bool = False) -> Dict[int, _Lane]:
+           puts: Union[bool, FrozenSet[int]] = False) -> Dict[int, _Lane]:
     local = {process: [] for process in processes}
     incoming: Dict[int, Dict[int, List[Tuple[int, _Operation]]]] = {process: {} for process in processes}
     outgoing: Dict[int, Dict[int, List[Tuple[int, _Operation]]]] = {process: {} for process in processes}
@@ -650,7 +688,7 @@ def schedule_transfers(plans: Sequence[TransferPlan],
                        process: Optional[int] = None,
                        window_locations: Optional[_WindowLocations] = None,
                        window_hosts: Optional[Sequence[int]] = None,
-                       window_puts: bool = False) -> Dict[int, ProcessSchedule]:
+                       window_puts: Union[bool, str] = False) -> Dict[int, ProcessSchedule]:
     """The schedule ``execute_transfers`` would run for a batch, without buffers or communication.
 
     ``plans`` are the batch's plans in request order, since that order fixes how chunks are packed
@@ -686,7 +724,7 @@ def schedule_transfers(plans: Sequence[TransferPlan],
     processes = sorted(named) if process is None else [process]
     schedules = {}
     lanes = _lanes(indexed, processes, budget.bytes_per_peer // element_size, window_locations, window_hosts,
-                   window_puts)
+                   _put_senders(indexed, window_locations, window_hosts, window_puts))
     for member, lane in lanes.items():
         queues = list(lane.recv_rounds.values()) + list(lane.send_rounds.values())
         schedules[member] = ProcessSchedule(process=member,
@@ -871,11 +909,12 @@ def _agree(requests: Sequence[TransferRequest],
                        tuple((request.key, digests[id(request.plan)]) for request in requests), mapping)
         digest = zlib.crc32(repr(fingerprint).encode())
         window_locations = None if window is None else _window_locations(requests, offsets)
+        senders = _put_senders(indexed, window_locations, hosts, False if window is None else window.puts)
         # The same computation as schedule_transfers, so what it reports is what runs here.
         paused = _collector_paused() if keep else contextlib.nullcontext()
         with paused:
             lane = _lanes(indexed, [rank], budget.bytes_per_peer // element_size, window_locations, hosts,
-                          window is not None and window.puts)[rank]
+                          senders)[rank]
             recv_arenas = {
                 peer: torch.empty(size, dtype=dtype, device=device)
                 for peer, size in lane.recv_arena.items()
@@ -884,10 +923,10 @@ def _agree(requests: Sequence[TransferRequest],
                 peer: torch.empty(size, dtype=dtype, device=device)
                 for peer, size in lane.send_arena.items()
             }
-            mapped, mapped_bytes, mapped_total = _mapped_share(indexed, window_locations, window, rank, hosts)
-            if hosts is not None and window.puts:
+            mapped, mapped_bytes, mapped_total = _mapped_share(indexed, window_locations, window, rank, hosts, senders)
+            if hosts is not None and senders:
                 put_runs, put_counts = _put_share(indexed, window_locations, window, rank, hosts, requests, offsets,
-                                                  element_size)
+                                                  element_size, senders)
                 puts = tuple(_put_views(put_runs, window, rank))
                 mapped_bytes += sum(source.numel() for _, _, source in puts)
             if keep:
@@ -968,7 +1007,8 @@ def _mapped_share(indexed,
                   window_locations: Optional[_WindowLocations],
                   window: Optional[TransferWindow],
                   rank: int,
-                  hosts: Optional[Sequence[int]] = None) -> Tuple[Tuple, int, int]:
+                  hosts: Optional[Sequence[int]] = None,
+                  puts: Union[bool, FrozenSet[int]] = False) -> Tuple[Tuple, int, int]:
     """This process's window copies in the order it makes them, their bytes, and the group's count.
 
     The count includes puts, which ``_put_share`` lays out.
@@ -977,7 +1017,7 @@ def _mapped_share(indexed,
         return (), 0, 0
     mine, total = [], 0
     for item, operation in indexed:
-        direction = _mapped_direction(item, operation, window_locations, window.direction, hosts, window.puts)
+        direction = _mapped_direction(item, operation, window_locations, window.direction, hosts, puts)
         if direction is None:
             continue
         total += 1
@@ -990,8 +1030,8 @@ def _mapped_share(indexed,
 
 
 def _put_share(indexed, window_locations: _WindowLocations, window: TransferWindow, rank: int, hosts: Sequence[int],
-               requests: Sequence[TransferRequest], offsets: Mapping[Tuple, int],
-               element_size: int) -> Tuple[Dict[int, List[Tuple[int, int, int]]], Dict[int, int]]:
+               requests: Sequence[TransferRequest], offsets: Mapping[Tuple, int], element_size: int,
+               puts: Union[bool, FrozenSet[int]]) -> Tuple[Dict[int, List[Tuple[int, int, int]]], Dict[int, int]]:
     """This process's puts by destination, as ``(source byte, target byte, bytes)`` runs of the two windows,
     and how many puts land here from each process.
 
@@ -1004,7 +1044,7 @@ def _put_share(indexed, window_locations: _WindowLocations, window: TransferWind
     for item, operation in indexed:
         if rank not in (operation.from_process, operation.to_process) or not operation.elements:
             continue
-        if _mapped_direction(item, operation, window_locations, window.direction, hosts, True) != 'put':
+        if _mapped_direction(item, operation, window_locations, window.direction, hosts, puts) != 'put':
             continue
         key, segment = requests[item].key, operation.segment
         source = (offsets[(key, 'source', segment.source_rank)] + operation.source_offset) * element_size

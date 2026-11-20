@@ -123,9 +123,15 @@ host took about 12 ms put against 15.3 ms staged, and as 2048 parameters of
 128 KiB 13.7-14.2 ms against 24.7 ms; sending the same 256 MiB spread over all
 eight peers there took 15.4-15.8 ms put against 13.3 ms staged, which is why
 puts are opt-in. Issuing the puts one by one instead of as a group made that
-last case 35 ms. A put cannot be rolled back: an error after one is issued
-may leave its target partly written, and NCCL treats it as fatal to the
-communicator. Pass the window's ``hosts`` and ``puts`` to ``schedule_transfers``
+last case 35 ms. Below 128 MiB per peer, staging one large parameter was
+faster (2.0 ms against 2.8 ms at 32 MiB), since a run with puts pays the group
+barriers that a staged run does not. ``puts='auto'`` therefore puts only from
+a process whose operations between domains all go to one peer and carry at
+least ``TransferWindow.AUTO_PUT_BYTES`` (256 MiB) or
+``TransferWindow.AUTO_PUT_PARAMETERS`` (64) parameters, and stages everything
+else; every process decides from the whole batch, so they agree. A put cannot
+be rolled back: an error after one is issued may leave its target partly
+written, and NCCL treats it as fatal to the communicator. Pass the window's ``hosts`` and ``puts`` to ``schedule_transfers``
 as ``window_hosts`` and ``window_puts``.
 
 Planning a sync with replica policies

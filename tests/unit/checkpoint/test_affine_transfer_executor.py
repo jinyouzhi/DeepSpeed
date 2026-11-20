@@ -532,7 +532,7 @@ class TestWindowTransfer(DistributedTest):
 class TestWindowAcrossHosts(DistributedTest):
     world_size = 4
 
-    @pytest.mark.parametrize('puts', [True, False])
+    @pytest.mark.parametrize('puts', [True, False, 'auto'])
     def test_puts_and_staged_rounds_cross_hosts(self, puts):
         if get_accelerator().device_name() != 'cuda':
             pytest.skip('puts between hosts need CUDA')
@@ -566,10 +566,12 @@ class TestWindowAcrossHosts(DistributedTest):
         packed = TransferRequest('rows', plan_transfer(rows, rows, PlanBudget()), row_sources, row_targets)
         # Every request in a batch shares its endpoints, so the two run as separate batches over one window.
         budget = StagingBudget(16)
-        prepared = [
-            prepare_transfers([strided], endpoints, dtype, budget, window=window),
-            prepare_transfers([packed], shifted, dtype, budget, window=window)
-        ]
+        # Small enough that 'auto' puts the rows, as the row batch carries one parameter to one peer.
+        with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 4 * 16 * 2):
+            prepared = [
+                prepare_transfers([strided], endpoints, dtype, budget, window=window),
+                prepare_transfers([packed], shifted, dtype, budget, window=window)
+            ]
 
         full = _full(16, 16, dtype)
         for run, values in enumerate((full, full.flip(0), full.flip(1))):
@@ -581,8 +583,10 @@ class TestWindowAcrossHosts(DistributedTest):
             _assert_matches(row_targets, rows, values)
         for buffer in list(strided.target_buffers.values()) + list(row_targets.values()):
             buffer.fill_(UNWRITTEN)
-        assert execute_transfers([packed], shifted, dtype, budget, window=window) == stats[1]
+        with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 4 * 16 * 2):
+            assert execute_transfers([packed], shifted, dtype, budget, window=window) == stats[1]
         _assert_matches(row_targets, rows, values)
+        puts = bool(puts)
 
         element_size = full.element_size()
         moved = torch.tensor([stats[0].sent_bytes, stats[1].sent_bytes, stats[1].mapped_bytes], device=_device())
@@ -744,6 +748,34 @@ class TestB2TransferCPU:
             assert no_puts[process].receives == staged[process].receives
         with pytest.raises(AffineTransferExecutionError, match='window_hosts'):
             schedule_transfers([rows], endpoints, budget, 4, None, everywhere[:1], (0, ))
+
+    def test_auto_puts_only_from_a_process_that_sends_one_peer_enough(self):
+        rows = contiguous_split_map((8, 4), [2] * 4, 0)
+        mirror = plan_transfer(rows, rows)
+        shifted = TransferEndpoints({location: location for location in range(4)}, {l: (l + 2) % 4 for l in range(4)})
+        # Each source block split between both processes of the other host.
+        halves = plan_transfer(contiguous_split_map((8, 4), [1] * 8, 0), rows)
+        fanned = TransferEndpoints({location: location
+                                    for location in range(4)}, {t: (2 if t < 4 else 0) + t % 2
+                                                                for t in range(8)})
+        hosts, budget = (0, 0, 2, 2), StagingBudget(1024)
+
+        def staged_peers(plans, endpoints):
+            locations = [({0, 1, 2, 3}, set(range(8)))] * len(plans)
+            schedule = schedule_transfers(plans, endpoints, budget, 4, None, locations, hosts, 'auto')
+            return [sorted(schedule[process].sends) for process in range(4)]
+
+        many = TransferWindow.AUTO_PUT_PARAMETERS
+        assert staged_peers([mirror] * many, shifted) == [[]] * 4
+        assert staged_peers([mirror] * (many - 1), shifted) == [[2], [3], [0], [1]]
+        assert staged_peers([halves] * many, fanned) == [[2, 3]] * 2 + [[0, 1]] * 2
+        # Two rows of four float32 elements per process.
+        with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 32):
+            assert staged_peers([mirror], shifted) == [[]] * 4
+        with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 33):
+            assert staged_peers([mirror], shifted) == [[2], [3], [0], [1]]
+        with pytest.raises(AffineTransferExecutionError, match="'auto'"):
+            TransferWindow(1 << 20, puts='always')
 
     def test_shared_plan_uses_each_buffer_and_rechecks_each_call(self):
         map_ = replicated_map((3, 4), 1)
