@@ -147,12 +147,7 @@ class TransferWindow:
         import deepspeed.comm as dist
         if direction not in ('pull', 'push'):
             raise AffineTransferExecutionError("window direction must be 'pull' or 'push'")
-        if puts not in (True, False, 'auto') or not isinstance(puts, (bool, str)):
-            raise AffineTransferExecutionError("window puts must be True, False or 'auto'")
-        if not isinstance(pack_bytes, int) or isinstance(pack_bytes, bool) or pack_bytes < 0:
-            raise AffineTransferExecutionError('pack_bytes must be a non-negative integer')
-        if pack_bytes and puts is not True:
-            raise AffineTransferExecutionError('pack_bytes needs puts=True')
+        _check_window_options(puts, pack_bytes)
         self.group = group
         self.direction = direction
         self.puts = puts
@@ -515,6 +510,15 @@ def _window_locations(requests: Sequence[TransferRequest], offsets: Mapping[Tupl
     return [sides[request.key] for request in requests]
 
 
+def _check_window_options(puts, pack_bytes) -> None:
+    if puts not in (True, False, 'auto') or not isinstance(puts, (bool, str)):
+        raise AffineTransferExecutionError("window puts must be True, False or 'auto'")
+    if not isinstance(pack_bytes, int) or isinstance(pack_bytes, bool) or pack_bytes < 0:
+        raise AffineTransferExecutionError('pack_bytes must be a non-negative integer')
+    if pack_bytes and puts is not True:
+        raise AffineTransferExecutionError('pack_bytes needs puts=True')
+
+
 def _mapped_direction(item: int,
                       operation: _Operation,
                       window_locations: Optional[_WindowLocations],
@@ -563,13 +567,16 @@ def _put_senders(indexed, window_locations: Optional[_WindowLocations], hosts: O
     payload: Dict[int, int] = {}
     items: Dict[int, set] = {}
     for item, operation in indexed:
+        sender = operation.from_process
+        if hosts[sender] == hosts[operation.to_process] or not operation.elements:
+            continue
+        # Every peer on another host counts, staged or not, since a put to one would compete with the others.
+        peers.setdefault(sender, set()).add(operation.to_process)
         if _mapped_direction(item, operation, window_locations, 'pull', hosts, True) != 'put':
             continue
-        sender = operation.from_process
-        peers.setdefault(sender, set()).add(operation.to_process)
         payload[sender] = payload.get(sender, 0) + operation.payload_bytes
         items.setdefault(sender, set()).add(item)
-    return frozenset(sender for sender, reached in peers.items() if len(reached) == 1 and (
+    return frozenset(sender for sender, reached in peers.items() if len(reached) == 1 and sender in payload and (
         payload[sender] >= TransferWindow.AUTO_PUT_BYTES or len(items[sender]) >= TransferWindow.AUTO_PUT_PARAMETERS))
 
 
@@ -797,6 +804,7 @@ def schedule_transfers(plans: Sequence[TransferPlan],
                 raise AffineTransferExecutionError(f'{segment!r} names a location with no endpoint binding')
     if window_locations is not None and len(window_locations) != len(plans):
         raise AffineTransferExecutionError('window_locations must name one pair of location sets per plan')
+    _check_window_options(window_puts, window_pack_bytes)
     indexed = _indexed_operations(plans, endpoints, budget, element_size)
     named = set(endpoints.source.values()) | set(endpoints.target.values())
     if process is not None and process not in named:

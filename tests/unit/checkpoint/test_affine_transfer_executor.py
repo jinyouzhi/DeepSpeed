@@ -779,6 +779,13 @@ class TestB2TransferCPU:
             assert staged_peers([mirror], shifted) == [[]] * 4
         with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 33):
             assert staged_peers([mirror], shifted) == [[2], [3], [0], [1]]
+        # A strided column to a second peer on the other host counts as fanning out, so nothing is put.
+        columns = plan_transfer(contiguous_split_map((8, 4), [1] * 4, 1), rows)
+        plans = [mirror] * many + [columns]
+        locations = [({0, 1, 2, 3}, set(range(8)))] * len(plans)
+        auto = schedule_transfers(plans, shifted, budget, 4, None, locations, hosts, 'auto')
+        staged = schedule_transfers(plans, shifted, budget, 4, None, locations, hosts, False)
+        assert auto == staged
         with pytest.raises(AffineTransferExecutionError, match="'auto'"):
             TransferWindow(1 << 20, puts='always')
         with pytest.raises(AffineTransferExecutionError, match='puts=True'):
@@ -801,6 +808,10 @@ class TestB2TransferCPU:
         # Two slots per process: pairs are laid out in order, so what 0 and 1 send fills every reserve and what
         # 2 and 3 send back is staged.
         assert staged_peers(2 * 512) == [[], [], [0, 1], [0, 1]]
+        # The schedule refuses a reserve that no window could have.
+        for puts, pack_bytes in ((False, 512), ('auto', 512), (True, -1), ('always', 0)):
+            with pytest.raises(AffineTransferExecutionError):
+                schedule_transfers([columns], endpoints, budget, 4, None, everywhere, hosts, puts, pack_bytes)
 
     def test_shared_plan_uses_each_buffer_and_rechecks_each_call(self):
         map_ = replicated_map((3, 4), 1)
