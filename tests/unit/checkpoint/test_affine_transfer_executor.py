@@ -532,7 +532,7 @@ class TestWindowTransfer(DistributedTest):
 class TestWindowAcrossHosts(DistributedTest):
     world_size = 4
 
-    @pytest.mark.parametrize('puts', [True, False, 'auto'])
+    @pytest.mark.parametrize('puts', [True, False, 'auto', 'pack'])
     def test_puts_and_staged_rounds_cross_hosts(self, puts):
         if get_accelerator().device_name() != 'cuda':
             pytest.skip('puts between hosts need CUDA')
@@ -545,7 +545,9 @@ class TestWindowAcrossHosts(DistributedTest):
                         return_value=f'host{rank // 2}'), \
                 mock.patch('deepspeed.comm.symm_mem_mapped_peers', return_value=[rank // 2 * 2, rank // 2 * 2 + 1]):
             try:
-                window = TransferWindow(1 << 20, puts=puts)
+                # Each process packs for, or unpacks from, two processes of the other host.
+                window = TransferWindow(1 << 20, puts=True, pack_bytes=4096) if puts == 'pack' else TransferWindow(
+                    1 << 20, puts=puts)
             except RuntimeError as error:
                 if 'newer torch' in str(error):
                     pytest.skip(str(error))
@@ -586,6 +588,7 @@ class TestWindowAcrossHosts(DistributedTest):
         with mock.patch.object(TransferWindow, 'AUTO_PUT_BYTES', 4 * 16 * 2):
             assert execute_transfers([packed], shifted, dtype, budget, window=window) == stats[1]
         _assert_matches(row_targets, rows, values)
+        packs = puts == 'pack'
         puts = bool(puts)
 
         element_size = full.element_size()
@@ -593,7 +596,9 @@ class TestWindowAcrossHosts(DistributedTest):
         dist.all_reduce(moved)
         # The sources are the rows on host 0, and host 1 holds half of the columns.
         rows_bytes = full.numel() * element_size
-        assert moved.tolist() == [rows_bytes // 2, 0 if puts else rows_bytes, rows_bytes if puts else 0]
+        assert moved.tolist() == [
+            0 if packs else rows_bytes // 2, 0 if puts else rows_bytes, rows_bytes if puts else 0
+        ]
 
     def test_hosts_that_map_each_other_copy_in_place(self):
         if get_accelerator().device_name() != 'cuda':
@@ -776,6 +781,26 @@ class TestB2TransferCPU:
             assert staged_peers([mirror], shifted) == [[2], [3], [0], [1]]
         with pytest.raises(AffineTransferExecutionError, match="'auto'"):
             TransferWindow(1 << 20, puts='always')
+        with pytest.raises(AffineTransferExecutionError, match='puts=True'):
+            TransferWindow(1 << 20, puts='auto', pack_bytes=512)
+
+    def test_pack_takes_pairs_between_hosts_out_of_the_rounds_while_they_fit(self):
+        # Rows to columns: every chunk between the two hosts is strided, so it can only be staged or packed.
+        columns = plan_transfer(contiguous_split_map((8, 8), [2] * 4, 1), contiguous_split_map((8, 8), [2] * 4, 0))
+        endpoints = TransferEndpoints({l: l for l in range(4)}, {l: l for l in range(4)})
+        hosts, budget = (0, 0, 2, 2), StagingBudget(1024)
+        everywhere = [({0, 1, 2, 3}, {0, 1, 2, 3})]
+
+        def staged_peers(pack_bytes):
+            schedule = schedule_transfers([columns], endpoints, budget, 4, None, everywhere, hosts, True, pack_bytes)
+            return [sorted(schedule[process].sends) for process in range(4)]
+
+        # Each pair carries a 2x2 block of 16 bytes, which takes one 512-byte slot of each end's reserve.
+        assert staged_peers(0) == [[2, 3], [2, 3], [0, 1], [0, 1]]
+        assert staged_peers(4 * 512) == [[]] * 4
+        # Two slots per process: pairs are laid out in order, so what 0 and 1 send fills every reserve and what
+        # 2 and 3 send back is staged.
+        assert staged_peers(2 * 512) == [[], [], [0, 1], [0, 1]]
 
     def test_shared_plan_uses_each_buffer_and_rechecks_each_call(self):
         map_ = replicated_map((3, 4), 1)

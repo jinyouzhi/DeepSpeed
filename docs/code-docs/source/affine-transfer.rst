@@ -131,8 +131,21 @@ least ``TransferWindow.AUTO_PUT_BYTES`` (256 MiB) or
 ``TransferWindow.AUTO_PUT_PARAMETERS`` (64) parameters, and stages everything
 else; every process decides from the whole batch, so they agree. A put cannot
 be rolled back: an error after one is issued may leave its target partly
-written, and NCCL treats it as fatal to the communicator. Pass the window's ``hosts`` and ``puts`` to ``schedule_transfers``
-as ``window_hosts`` and ``window_puts``.
+written, and NCCL treats it as fatal to the communicator.
+
+Operations between domains that are not direct puts -- typically a strided
+region such as rows sent to a column split -- can also skip the staged rounds
+with ``TransferWindow(..., puts=True, pack_bytes=N)``. Every window then keeps
+an ``N``-byte reserve after its shard at the same offset. Each pair of
+processes on different domains gets one slot in both reserves while they fit:
+the sender packs all its operations to that peer into its slot, puts the slot
+in one piece into the receiver's slot, and the receiver unpacks it after the
+signal. Pairs that do not fit are staged. On the same H20 hosts, sending rows
+to columns of 128 MiB per process took 4.0 ms packed against 4.9-5.2 ms
+staged, and 512 MiB 15.3 ms against 15.6-16.4 ms, where putting only the
+packed pieces and staging the rest took 18.6 ms. Pass the window's ``hosts``,
+``puts`` and ``pack_bytes`` to ``schedule_transfers`` as ``window_hosts``,
+``window_puts`` and ``window_pack_bytes``.
 
 Planning a sync with replica policies
 -------------------------------------
